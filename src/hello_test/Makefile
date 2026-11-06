@@ -18,7 +18,7 @@ LIBMODULES  := $(wildcard sce_module/*)
 
 # Root vars
 TOOLCHAIN   := $(OO_PS4_TOOLCHAIN)
-PROJDIR     := $(shell basename $(CURDIR))
+PROJDIR     := hello_world
 COMMONDIR   := $(TOOLCHAIN)/samples/_common
 INTDIR      := $(PROJDIR)/x64/Debug
 

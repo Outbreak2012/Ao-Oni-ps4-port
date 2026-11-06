@@ -188,8 +188,8 @@ void HUD::Update(SDL_Renderer* renderer, int deltaFrameTicks, int totalFrameCoun
 
     if (totalFrameCount % 10 == 0)
     {
-        // Calculate FPS and ms/frame
-        int fps = 1000 / (deltaFrameTicks);
+        // Calculate FPS and ms/frame (avoid division by zero)
+        int fps = (deltaFrameTicks > 0) ? (1000 / deltaFrameTicks) : 0;
         int mspf = deltaFrameTicks;
 
         // Probe for memory usage

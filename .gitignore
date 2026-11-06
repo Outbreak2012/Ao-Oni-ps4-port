@@ -1,4 +1,4 @@
-﻿game/
+game/
 *.pkg
 *.exe
 *.dll
@@ -14,3 +14,10 @@ src/sdl2_test/*.pkg
 src/sdl2_test/eboot.bin
 src/sdl2_test/pkg.gp4
 src/sdl2_test/SDL2/x64/
+src/aooni_ps4/*.pkg
+src/aooni_ps4/eboot.bin
+src/aooni_ps4/pkg.gp4
+src/aooni_ps4/aooni/x64/
+src/aooni_ps4/assets/
+src/aooni_ps4/sce_module/
+src/aooni_ps4/sce_sys/

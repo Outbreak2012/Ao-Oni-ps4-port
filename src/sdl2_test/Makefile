@@ -18,7 +18,7 @@ LIBMODULES  := $(wildcard sce_module/*)
 
 # Root vars
 TOOLCHAIN   := $(OO_PS4_TOOLCHAIN)
-PROJDIR     := $(shell basename $(CURDIR))
+PROJDIR     := SDL2
 COMMONDIR   := $(TOOLCHAIN)/samples/_common
 INTDIR      := $(PROJDIR)/x64/Debug
 
@@ -29,7 +29,7 @@ COMMONFILES := $(wildcard $(COMMONDIR)/*.cpp)
 OBJS        := $(patsubst $(PROJDIR)/%.c, $(INTDIR)/%.o, $(CFILES)) $(patsubst $(PROJDIR)/%.cpp, $(INTDIR)/%.o, $(CPPFILES)) $(patsubst $(COMMONDIR)/%.cpp, $(INTDIR)/%.o, $(COMMONFILES))
 
 # Define final C/C++ flags
-CFLAGS      := --target=x86_64-pc-freebsd12-elf -fPIC -funwind-tables -c $(EXTRAFLAGS) -isysroot $(TOOLCHAIN) -isystem $(TOOLCHAIN)/include
+CFLAGS      := --target=x86_64-pc-freebsd12-elf -fPIC -funwind-tables -c $(EXTRAFLAGS) -isysroot $(TOOLCHAIN) -isystem $(TOOLCHAIN)/include -I$(COMMONDIR)
 CXXFLAGS    := $(CFLAGS) -isystem $(TOOLCHAIN)/include/c++/v1
 LDFLAGS     := -m elf_x86_64 -pie --script $(TOOLCHAIN)/link.x --eh-frame-hdr -L$(TOOLCHAIN)/lib $(LIBS) $(TOOLCHAIN)/lib/crt1.o
 

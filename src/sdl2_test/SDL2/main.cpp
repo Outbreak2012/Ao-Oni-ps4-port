@@ -4,7 +4,7 @@
 
 #include "Game.h"
 
-#include "../../_common/log.h"
+#include "log.h"
 
 #define FRAME_WIDTH     1920
 #define FRAME_HEIGHT    1080
@@ -143,19 +143,15 @@ int main(int argc, char* args[])
         for (;;);
     }
 
-    // Initialize input / joystick
-    if (SDL_NumJoysticks() < 1)
+    // Initialize input / joystick (optional so it runs in shadPS4 without a pad)
+    if (SDL_NumJoysticks() >= 1)
     {
-        DEBUGLOG << "No controllers available!";
-        for (;;);
+        controller = SDL_JoystickOpen(0);
     }
-
-    controller = SDL_JoystickOpen(0);
-
-    if (controller == NULL)
+    else
     {
-        DEBUGLOG << "Couldn't open controller handle: " << SDL_GetError();
-        for (;;);
+        DEBUGLOG << "No controllers available, running without pad";
+        controller = NULL;
     }
 
     initGame(renderer);

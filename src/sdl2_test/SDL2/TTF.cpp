@@ -100,6 +100,9 @@ int SetText(SDL_Surface* surface, char* txt, FT_Face face, Color fgColor, Color 
 
 SDL_Texture* CreateText(SDL_Renderer *renderer, char* txt, FT_Face fontFace, Color fgColor, Color bgColor)
 {
+    if (fontFace == nullptr || fontFace->size == nullptr)
+        return nullptr;
+
     SDL_Surface* tempSurface;
     SDL_Texture* finalTexture;
 
