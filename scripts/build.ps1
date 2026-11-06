@@ -2,13 +2,13 @@
 #      .\scripts\build.ps1 -Project sdl2_test
 # Compila src/<Project> en WSL (Ubuntu) y empaqueta el .pkg con PkgTool de Windows.
 # Requisitos: WSL Ubuntu con clang, lld y make; PS4Toolchain/ en la raiz del proyecto.
-param([Parameter(Mandatory=$true)][string]$Project)
+param([Parameter(Mandatory = $true)][string]$Project)
 
 $root = Split-Path -Parent $PSScriptRoot
-$tc   = Join-Path $root "PS4Toolchain"
-$src  = Join-Path $root "src\$Project"
+$tc = Join-Path $root "PS4Toolchain"
+$src = Join-Path $root "src\$Project"
 if (-not (Test-Path $src)) { throw "No existe $src" }
-$wslRoot = "/mnt/" + $root.Substring(0,1).ToLower() + ($root.Substring(2) -replace '\\','/')
+$wslRoot = "/mnt/" + $root.Substring(0, 1).ToLower() + ($root.Substring(2) -replace '\\', '/')
 
 # Si el proyecto es aooni_ps4, asegurar que sce_module, sce_sys y assets esten preparados
 if ($Project -eq "aooni_ps4") {

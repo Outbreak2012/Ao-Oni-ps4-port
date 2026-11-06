@@ -145,3 +145,4 @@ if __name__ == '__main__':
           "Start X/Y:", sys_obj.get("@start_x"), sys_obj.get("@start_y"))
     m1 = load_rxdata(os.path.join(game_dir, "Data", "Map001.rxdata"))
     print("Map001 size:", m1.get("@width"), "x", m1.get("@height"), "tileset_id:", m1.get("@tileset_id"), "events:", len(m1.get("@events", {})))
+
