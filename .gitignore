@@ -10,3 +10,7 @@ src/hello_test/*.pkg
 src/hello_test/eboot.bin
 src/hello_test/pkg.gp4
 src/hello_test/hello_world/x64/
+src/sdl2_test/*.pkg
+src/sdl2_test/eboot.bin
+src/sdl2_test/pkg.gp4
+src/sdl2_test/SDL2/x64/
