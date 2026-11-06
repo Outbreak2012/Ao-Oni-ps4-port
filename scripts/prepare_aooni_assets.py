@@ -1,17 +1,114 @@
 #!/usr/bin/env python3
 """
 Exporta el juego completo de Ao Oni (Data/*.rxdata, Graphics/*, Audio/*)
-al formato binario /app0/assets/misc/game_db.bin y map_XXX.bin para el
-interprete nativo de RPG Maker XP en PS4 (src/aooni_ps4).
+al formato nativo de PS4 (/app0/assets/misc/game_db.json, map_XXX.bin, map_XXX.json,
+imagenes PNG/JPG y audio PCM 48000 Hz 16-bit estereo para sceAudioOut).
 """
 import os
 import sys
 import glob
 import json
+import math
 import shutil
 import struct
 import wave
+import zlib
 from extract_rxdata import load_rxdata
+
+def write_rgba_png(path, width, height, rgba_bytes):
+    def chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+    raw = bytearray()
+    stride = width * 4
+    for y in range(height):
+        raw.append(0)
+        raw.extend(rgba_bytes[y * stride:(y + 1) * stride])
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+    png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(bytes(raw), 6)) + chunk(b"IEND", b"")
+    with open(path, "wb") as f:
+        f.write(png)
+
+def make_solid_autotile(path, r, g, b, r2=None, g2=None, b2=None, alpha=255):
+    if os.path.exists(path):
+        return
+    if r2 is None:
+        r2, g2, b2 = max(0, r - 12), max(0, g - 12), max(0, b - 12)
+    w, h = 96, 128
+    buf = bytearray(w * h * 4)
+    for y in range(h):
+        for x in range(w):
+            c = ((x // 8) + (y // 8)) & 1
+            cr = r if c == 0 else r2
+            cg = g if c == 0 else g2
+            cb = b if c == 0 else b2
+            idx = (y * w + x) * 4
+            buf[idx:idx + 4] = bytes((cr, cg, cb, alpha))
+    write_rgba_png(path, w, h, buf)
+
+def make_bird_charset(path):
+    """Genera el sprite de cuervos (165-Small07) para la intro exterior de Map003."""
+    if os.path.exists(path):
+        return
+    w, h = 128, 128
+    buf = bytearray(w * h * 4)
+    for row in range(4):
+        for col in range(4):
+            cx = col * 32 + 16
+            cy = row * 32 + 16
+            wing_dy = -4 if (col % 2 == 0) else 3
+            for dy in range(-6, 7):
+                for dx in range(-10, 11):
+                    px, py = cx + dx, cy + dy
+                    if abs(dx) <= 4 and abs(dy) <= 3:
+                        idx = (py * w + px) * 4
+                        buf[idx:idx + 4] = bytes((25, 25, 35, 255))
+                    elif 4 < abs(dx) <= 10 and abs(dy - (wing_dy * abs(dx) // 8)) <= 2:
+                        idx = (py * w + px) * 4
+                        buf[idx:idx + 4] = bytes((40, 40, 55, 255))
+    write_rgba_png(path, w, h, buf)
+
+def make_fallback_rtp_images(out_img):
+    """Crea texturas equivalentes para recursos RTP de RPG Maker XP no incluidos en Ao Oni/Graphics."""
+    make_solid_autotile(os.path.join(out_img, "at_009-G2_Water01.png"), 18, 36, 58, 14, 28, 48)
+    make_solid_autotile(os.path.join(out_img, "at_010-G2_Ground01.png"), 22, 34, 24, 18, 28, 20)
+    make_solid_autotile(os.path.join(out_img, "at_011-G2_Ground02.png"), 28, 38, 28, 22, 30, 22)
+    make_solid_autotile(os.path.join(out_img, "at_038-Tree03.png"), 16, 28, 18, 12, 22, 14)
+    make_solid_autotile(os.path.join(out_img, "at_039-Tree04.png"), 14, 24, 16, 10, 18, 12)
+    make_solid_autotile(os.path.join(out_img, "at_042-Ground02.png"), 38, 36, 34, 32, 30, 28)
+    make_solid_autotile(os.path.join(out_img, "at_062-CF_Lava01.png"), 45, 20, 20, 35, 15, 15)
+    make_solid_autotile(os.path.join(out_img, "at_063-CF_Shadow01.png"), 0, 0, 0, 0, 0, 0, 120)
+    make_solid_autotile(os.path.join(out_img, "at_064-CF_Ground01.png"), 48, 44, 40, 42, 38, 34)
+    make_solid_autotile(os.path.join(out_img, "at_065-CF_Ground02.png"), 42, 38, 34, 36, 32, 28)
+    make_solid_autotile(os.path.join(out_img, "at_066-CF_Ground03.png"), 36, 32, 28, 30, 26, 22)
+    make_solid_autotile(os.path.join(out_img, "at_067-CF_Ground04.png"), 30, 28, 26, 24, 22, 20)
+    make_bird_charset(os.path.join(out_img, "char_165-Small07.png"))
+    make_bird_charset(os.path.join(out_img, "char_166-Small08.png"))
+
+    # Copiar equivalentes del propio juego para puertas/switches/cuevas RTP
+    door_src = os.path.join(out_img, "char_172-Door03a.png")
+    if os.path.exists(door_src):
+        shutil.copy2(door_src, os.path.join(out_img, "char_173-Door04.png"))
+    sw_src = os.path.join(out_img, "char_akari_switch2.png")
+    if os.path.exists(sw_src):
+        shutil.copy2(sw_src, os.path.join(out_img, "char_179-Switch02.png"))
+    npc_src = os.path.join(out_img, "char_hirosi.png")
+    if os.path.exists(npc_src):
+        shutil.copy2(npc_src, os.path.join(out_img, "char_148-Storekeeper02.png"))
+    ts_src = os.path.join(out_img, "ts_room-03-ud.png")
+    if os.path.exists(ts_src) and not os.path.exists(os.path.join(out_img, "ts_044-Cave02.png")):
+        shutil.copy2(ts_src, os.path.join(out_img, "ts_044-Cave02.png"))
+
+def synth_pcm(path, duration_sec, fn_sample):
+    if os.path.exists(path):
+        return
+    nframes = int(duration_sec * 48000)
+    buf = bytearray(nframes * 4)
+    for i in range(nframes):
+        t = i / 48000.0
+        val = int(max(-32000, min(32000, fn_sample(t, duration_sec))))
+        struct.pack_into("<hh", buf, i * 4, val, val)
+    with open(path, "wb") as f:
+        f.write(buf)
 
 def clean_obj(obj):
     if isinstance(obj, dict):
@@ -124,7 +221,9 @@ def main():
             items[int(it["@id"])] = {
                 "name": str(it.get("@name", "")),
                 "icon": str(it.get("@icon_name", "")),
-                "desc": str(it.get("@description", ""))
+                "desc": str(it.get("@description", "")),
+                "common_event_id": int(it.get("@common_event_id", 0)),
+                "consumable": bool(it.get("@consumable", False))
             }
 
     common_events = []
@@ -180,7 +279,6 @@ def main():
         if len(tbl) < w * h * 3:
             tbl = list(tbl) + [0] * (w * h * 3 - len(tbl))
 
-        # Guardar geometria y pasabilidad en map_XXX.bin
         bin_path = os.path.join(out_data, f"map_{mid:03d}.bin")
         with open(bin_path, "wb") as f:
             ts_bytes = ts_name.encode("utf-8")[:63].ljust(64, b"\x00")
@@ -196,7 +294,6 @@ def main():
             f.write(struct.pack("<I", len(prio_bytes)))
             f.write(prio_bytes)
 
-        # Guardar todos los eventos y paginas completas en map_XXX.json
         ev_list = []
         ev_dict = m.get("@events", {})
         for k, ev in sorted(ev_dict.items(), key=lambda x: int(x[0])):
@@ -220,7 +317,7 @@ def main():
             json.dump(map_meta, f, ensure_ascii=False, separators=(",", ":"))
         converted += 1
 
-    # 3) Copiar todos los Graphics a assets/images/ (con prefijo de categoria)
+    # 3) Copiar todos los Graphics a assets/images/ y generar RTP faltantes
     out_img = os.path.join(out_assets, "images")
     cats = (
         ("Titles", "title_"),
@@ -240,8 +337,9 @@ def main():
             for fn in os.listdir(src_sub):
                 if fn.lower().endswith((".png", ".jpg", ".jpeg")):
                     shutil.copy2(os.path.join(src_sub, fn), os.path.join(out_img, prefix + fn))
+    make_fallback_rtp_images(out_img)
 
-    # 4) Convertir Audio WAV (BGM y SE) a PCM 48000 Hz 16-bit estereo para sceAudioOut
+    # 4) Convertir Audio WAV (8-bit y 16-bit) a PCM 48000 Hz 16-bit estereo
     out_aud = os.path.join(out_assets, "audio")
     for sub, prefix in (("BGM", "bgm_"), ("SE", "se_")):
         src_sub = os.path.join(game_dir, "Audio", sub)
@@ -257,9 +355,15 @@ def main():
                             fr = w.getframerate()
                             nfr = w.getnframes()
                             raw = w.readframes(nfr)
-                        if sw != 2 or nfr <= 0:
+                        if nfr <= 0:
                             continue
-                        samples = struct.unpack(f"<{nfr * nch}h", raw)
+                        if sw == 2:
+                            samples = struct.unpack(f"<{nfr * nch}h", raw)
+                        elif sw == 1:
+                            # 8-bit unsigned PCM (0..255 -> -32768..32767)
+                            samples = [((b - 128) << 8) for b in raw]
+                        else:
+                            continue
                         out_frames = int(nfr * 48000 / fr)
                         out_buf = bytearray(out_frames * 4)
                         for i in range(out_frames):
@@ -275,7 +379,45 @@ def main():
                     except Exception as e:
                         print("Warn audio:", fn, e)
 
-    print(f"Exportados {converted} mapas completos, game_db.json, imagenes y audio a {out_assets}")
+    # Mapear y sintetizar los efectos de sonido RTP estandar que usa Ao Oni
+    rtp_map = {
+        "se_024-door01.pcm": "se_a5_05142.pcm",
+        "se_025-door02.pcm": "se_a5_04107.pcm",
+        "se_027-door04.pcm": "se_kachi19.pcm",
+        "se_028-door05.pcm": "se_kachi19.pcm",
+        "se_032-switch01.pcm": "se_kachi19.pcm",
+        "se_033-switch02.pcm": "se_kachi19.pcm",
+        "se_034-switch03.pcm": "se_kachi19.pcm",
+        "se_035-switch04.pcm": "se_kachi19.pcm",
+        "se_045-push01.pcm": "se_sha02.pcm",
+        "se_046-book01.pcm": "se_swing18.pcm",
+        "se_047-book02.pcm": "se_swing40_a.pcm",
+        "se_052-cannon01.pcm": "se_bosu14.pcm",
+        "se_061-thunderclap01.pcm": "se_explosiond@11st.pcm",
+        "se_067-animal02.pcm": "se_insect00.pcm",
+        "se_090-attack02.pcm": "se_bosu02.pcm",
+        "se_093-attack05.pcm": "se_bosu14.pcm",
+        "se_104-attack16.pcm": "se_crash23.pcm",
+        "se_129-earth01.pcm": "se_pailc@11.pcm",
+        "bgs_017-creature01.pcm": "se_semaru.pcm",
+    }
+    for dst_name, src_name in rtp_map.items():
+        src_p = os.path.join(out_aud, src_name)
+        dst_p = os.path.join(out_aud, dst_name)
+        if os.path.exists(src_p) and not os.path.exists(dst_p):
+            shutil.copy2(src_p, dst_p)
+
+    # Sonidos del sistema de menu (cursor, confirmar, cancelar, buzzer)
+    synth_pcm(os.path.join(out_aud, "se_001-system01.pcm"), 0.055,
+              lambda t, d: 9000 * math.sin(2 * math.pi * 880 * t) * (1.0 - t / d))
+    synth_pcm(os.path.join(out_aud, "se_002-system02.pcm"), 0.095,
+              lambda t, d: 11000 * math.sin(2 * math.pi * (1046 if t < 0.04 else 1318) * t) * (1.0 - t / d))
+    synth_pcm(os.path.join(out_aud, "se_003-system03.pcm"), 0.085,
+              lambda t, d: 10000 * math.sin(2 * math.pi * (784 if t < 0.04 else 587) * t) * (1.0 - t / d))
+    synth_pcm(os.path.join(out_aud, "se_004-system04.pcm"), 0.14,
+              lambda t, d: 12000 * (1 if math.sin(2 * math.pi * 160 * t) >= 0 else -1) * (1.0 - t / d))
+
+    print(f"Exportados {converted} mapas completos, game_db.json, imagenes (+RTP) y audio completo a {out_assets}")
 
 if __name__ == "__main__":
     main()

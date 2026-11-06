@@ -1,6 +1,7 @@
-// Ao Oni PS4 Port - Interprete RPG Maker XP (RGSS1) nativo en C++/SDL2
-// Ejecuta el juego original (Map075 -> Map003 -> Map004 -> Mansion completa) con
-// eventos, switches, variables, rutas de movimiento, dialogos con rostros, inventario y persecuciones.
+// Ao Oni PS4 Port - Motor RPG Maker XP (RGSS1) 1:1 Optimizado con Audio PS4 (sceAudioOut)
+// Soporta todos los mapas, eventos, rutas de movimiento, autotiles 48-patrones, prioridades,
+// audio BGM/BGS/SE a 48kHz con pitch/volumen, puzzles (cajas fuertes cmd 103, armarios cmd 105),
+// uso de objetos desde inventario (CommonEvents) y guardado/carga.
 
 #include <cstdio>
 #include <cstdlib>
@@ -11,9 +12,13 @@
 #include <vector>
 #include <map>
 #include <algorithm>
+#include <pthread.h>
+#include <unistd.h>
 
 #include <SDL2/SDL.h>
 #include <orbis/libkernel.h>
+#include <orbis/AudioOut.h>
+#include <orbis/UserService.h>
 #include "mini_json.h"
 
 #define STBI_NO_SIMD
@@ -39,6 +44,267 @@
 #define PAD_LEFT     13
 #define PAD_RIGHT    14
 
+// ==================== SISTEMA DE AUDIO PS4 (sceAudioOut 48kHz Stereo) ====================
+struct PcmBuffer {
+    std::vector<int16_t> samples; // Interleaved L, R a 48000 Hz
+    size_t frames = 0;
+};
+
+struct ActiveSound {
+    const PcmBuffer* buf = nullptr;
+    uint64_t posFP = 0;   // Posición en frames con 16 bits fraccionarios
+    uint32_t stepFP = 65536; // 65536 = 1.0x (pitch 100)
+    int volume = 100;     // 0..100
+    int fadeTotalFrames = 0;
+    int fadeRemFrames = 0;
+    bool active = false;
+    bool loop = false;
+    std::string name;
+    int origPitch = 100;
+};
+
+static pthread_mutex_t g_audioMutex = PTHREAD_MUTEX_INITIALIZER;
+static std::map<std::string, PcmBuffer*> g_pcmCache;
+static ActiveSound g_bgmTrack;
+static ActiveSound g_bgsTrack;
+static ActiveSound g_savedBgm;
+static ActiveSound g_savedBgs;
+static ActiveSound g_seChannels[6];
+static volatile bool g_audioRunning = true;
+
+static std::string toLowerStr(const std::string& s) {
+    std::string out = s;
+    for (size_t i = 0; i < out.size(); i++)
+        out[i] = (char)std::tolower((unsigned char)out[i]);
+    return out;
+}
+
+static const PcmBuffer* getPcm(const std::string& prefix, const std::string& rawName) {
+    if (rawName.empty()) return nullptr;
+    std::string low = toLowerStr(rawName);
+    // Quitar extension si la trae
+    size_t dot = low.rfind('.');
+    if (dot != std::string::npos) low = low.substr(0, dot);
+
+    std::string path = "/app0/assets/audio/" + prefix + low + ".pcm";
+    auto it = g_pcmCache.find(path);
+    if (it != g_pcmCache.end()) return it->second;
+
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f && prefix == "bgs_") {
+        // Fallback a se_ si el BGS fue exportado como SE
+        std::string alt = "/app0/assets/audio/se_" + low + ".pcm";
+        f = fopen(alt.c_str(), "rb");
+    }
+    if (!f) {
+        g_pcmCache[path] = nullptr;
+        return nullptr;
+    }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0) {
+        fclose(f);
+        g_pcmCache[path] = nullptr;
+        return nullptr;
+    }
+    PcmBuffer* pb = new PcmBuffer();
+    pb->samples.resize(sz / 2);
+    fread(pb->samples.data(), 1, pb->samples.size() * 2, f);
+    fclose(f);
+    pb->frames = pb->samples.size() / 2;
+    g_pcmCache[path] = pb;
+    return pb;
+}
+
+static void playBgm(const std::string& name, int volume = 100, int pitch = 100) {
+    pthread_mutex_lock(&g_audioMutex);
+    if (name.empty()) {
+        g_bgmTrack.active = false;
+        g_bgmTrack.name.clear();
+        pthread_mutex_unlock(&g_audioMutex);
+        return;
+    }
+    if (g_bgmTrack.active && g_bgmTrack.name == name && g_bgmTrack.fadeTotalFrames == 0) {
+        g_bgmTrack.volume = std::max(0, std::min(100, volume));
+        g_bgmTrack.origPitch = pitch;
+        g_bgmTrack.stepFP = (uint32_t)((std::max(25, std::min(250, pitch)) * 65536ULL) / 100ULL);
+        pthread_mutex_unlock(&g_audioMutex);
+        return;
+    }
+    const PcmBuffer* pb = getPcm("bgm_", name);
+    if (!pb) pb = getPcm("se_", name);
+    if (pb && pb->frames > 0) {
+        g_bgmTrack.buf = pb;
+        g_bgmTrack.posFP = 0;
+        g_bgmTrack.origPitch = pitch;
+        g_bgmTrack.stepFP = (uint32_t)((std::max(25, std::min(250, pitch)) * 65536ULL) / 100ULL);
+        g_bgmTrack.volume = std::max(0, std::min(100, volume));
+        g_bgmTrack.fadeTotalFrames = 0;
+        g_bgmTrack.fadeRemFrames = 0;
+        g_bgmTrack.loop = true;
+        g_bgmTrack.name = name;
+        g_bgmTrack.active = true;
+    } else {
+        g_bgmTrack.active = false;
+    }
+    pthread_mutex_unlock(&g_audioMutex);
+}
+
+static void fadeOutBgm(int seconds) {
+    pthread_mutex_lock(&g_audioMutex);
+    if (g_bgmTrack.active) {
+        int f = std::max(1, seconds) * 48000;
+        g_bgmTrack.fadeTotalFrames = f;
+        g_bgmTrack.fadeRemFrames = f;
+    }
+    pthread_mutex_unlock(&g_audioMutex);
+}
+
+static void playBgs(const std::string& name, int volume = 100, int pitch = 100) {
+    pthread_mutex_lock(&g_audioMutex);
+    if (name.empty()) {
+        g_bgsTrack.active = false;
+        g_bgsTrack.name.clear();
+        pthread_mutex_unlock(&g_audioMutex);
+        return;
+    }
+    const PcmBuffer* pb = getPcm("bgs_", name);
+    if (!pb) pb = getPcm("se_", name);
+    if (pb && pb->frames > 0) {
+        g_bgsTrack.buf = pb;
+        g_bgsTrack.posFP = 0;
+        g_bgsTrack.origPitch = pitch;
+        g_bgsTrack.stepFP = (uint32_t)((std::max(25, std::min(250, pitch)) * 65536ULL) / 100ULL);
+        g_bgsTrack.volume = std::max(0, std::min(100, volume));
+        g_bgsTrack.fadeTotalFrames = 0;
+        g_bgsTrack.fadeRemFrames = 0;
+        g_bgsTrack.loop = true;
+        g_bgsTrack.name = name;
+        g_bgsTrack.active = true;
+    } else {
+        g_bgsTrack.active = false;
+    }
+    pthread_mutex_unlock(&g_audioMutex);
+}
+
+static void fadeOutBgs(int seconds) {
+    pthread_mutex_lock(&g_audioMutex);
+    if (g_bgsTrack.active) {
+        int f = std::max(1, seconds) * 48000;
+        g_bgsTrack.fadeTotalFrames = f;
+        g_bgsTrack.fadeRemFrames = f;
+    }
+    pthread_mutex_unlock(&g_audioMutex);
+}
+
+static void playSe(const std::string& name, int volume = 100, int pitch = 100) {
+    if (name.empty()) return;
+    pthread_mutex_lock(&g_audioMutex);
+    const PcmBuffer* pb = getPcm("se_", name);
+    if (pb && pb->frames > 0) {
+        int slot = 0;
+        for (int i = 0; i < 6; i++) {
+            if (!g_seChannels[i].active) { slot = i; break; }
+        }
+        g_seChannels[slot].buf = pb;
+        g_seChannels[slot].posFP = 0;
+        g_seChannels[slot].origPitch = pitch;
+        g_seChannels[slot].stepFP = (uint32_t)((std::max(25, std::min(250, pitch)) * 65536ULL) / 100ULL);
+        g_seChannels[slot].volume = std::max(0, std::min(100, volume));
+        g_seChannels[slot].fadeTotalFrames = 0;
+        g_seChannels[slot].fadeRemFrames = 0;
+        g_seChannels[slot].loop = false;
+        g_seChannels[slot].name = name;
+        g_seChannels[slot].active = true;
+    }
+    pthread_mutex_unlock(&g_audioMutex);
+}
+
+static void stopAllSe() {
+    pthread_mutex_lock(&g_audioMutex);
+    for (int i = 0; i < 6; i++) g_seChannels[i].active = false;
+    pthread_mutex_unlock(&g_audioMutex);
+}
+
+static inline void mixTrack(ActiveSound& tr, int32_t* accum, int frames) {
+    if (!tr.active || !tr.buf || tr.buf->frames == 0) return;
+    const int16_t* smp = tr.buf->samples.data();
+    size_t totalF = tr.buf->frames;
+
+    for (int i = 0; i < frames; i++) {
+        size_t idx = (size_t)(tr.posFP >> 16);
+        if (idx >= totalF) {
+            if (tr.loop) {
+                tr.posFP %= ((uint64_t)totalF << 16);
+                idx = (size_t)(tr.posFP >> 16);
+            } else {
+                tr.active = false;
+                return;
+            }
+        }
+        int vol = tr.volume;
+        if (tr.fadeTotalFrames > 0) {
+            if (tr.fadeRemFrames <= 0) {
+                tr.active = false;
+                tr.fadeTotalFrames = 0;
+                return;
+            }
+            vol = (vol * (tr.fadeRemFrames / 256)) / std::max(1, tr.fadeTotalFrames / 256);
+            tr.fadeRemFrames--;
+        }
+        accum[i * 2]     += ((int32_t)smp[idx * 2]     * vol) / 100;
+        accum[i * 2 + 1] += ((int32_t)smp[idx * 2 + 1] * vol) / 100;
+        tr.posFP += tr.stepFP;
+    }
+}
+
+static void* audioThreadFunc(void*) {
+    sceUserServiceInitialize(NULL);
+    if (sceAudioOutInit() != 0) {
+        printf("[AoOni] Warn: sceAudioOutInit fallo\n");
+    }
+    int32_t handle = sceAudioOutOpen(
+        ORBIS_USER_SERVICE_USER_ID_SYSTEM,
+        ORBIS_AUDIO_OUT_PORT_TYPE_MAIN,
+        0, 256, 48000,
+        ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_STEREO
+    );
+    if (handle <= 0) {
+        printf("[AoOni] Warn: sceAudioOutOpen fallo (%d)\n", handle);
+        return nullptr;
+    }
+    printf("[AoOni] Audio PS4 inicializado OK (handle=%d, 48000Hz Stereo)\n", handle);
+
+    int16_t outBuf[2][256 * 2];
+    int32_t accum[256 * 2];
+    int flip = 0;
+
+    while (g_audioRunning) {
+        memset(accum, 0, sizeof(accum));
+        pthread_mutex_lock(&g_audioMutex);
+        mixTrack(g_bgmTrack, accum, 256);
+        mixTrack(g_bgsTrack, accum, 256);
+        for (int ch = 0; ch < 6; ch++)
+            mixTrack(g_seChannels[ch], accum, 256);
+        pthread_mutex_unlock(&g_audioMutex);
+
+        int16_t* dst = outBuf[flip];
+        for (int i = 0; i < 256 * 2; i++) {
+            int32_t v = accum[i];
+            if (v > 32767) v = 32767;
+            else if (v < -32768) v = -32768;
+            dst[i] = (int16_t)v;
+        }
+        sceAudioOutOutput(handle, dst);
+        flip ^= 1;
+    }
+    sceAudioOutOutput(handle, NULL);
+    sceAudioOutClose(handle);
+    return nullptr;
+}
+
+// ==================== FUENTE BITMAP Y RENDERIZADO DIRECTO ULTRARRÁPIDO ====================
 static const uint8_t FONT8X8[96][8] = {
     {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},{0x18,0x3C,0x3C,0x18,0x18,0x00,0x18,0x00},
     {0x36,0x36,0x00,0x00,0x00,0x00,0x00,0x00},{0x36,0x36,0x7F,0x36,0x7F,0x36,0x36,0x00},
@@ -90,9 +356,9 @@ static const uint8_t FONT8X8[96][8] = {
     {0x6E,0x3B,0x00,0x00,0x00,0x00,0x00,0x00},{0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}
 };
 
-// Convierte caracteres UTF-8 comunes en español a ASCII legible para la fuente 8x8
 static std::string utf8ToAscii(const std::string& in) {
     std::string out;
+    out.reserve(in.size());
     for (size_t i = 0; i < in.size(); i++) {
         unsigned char c = (unsigned char)in[i];
         if (c == 0xC3 && i + 1 < in.size()) {
@@ -117,29 +383,82 @@ static std::string utf8ToAscii(const std::string& in) {
     return out;
 }
 
-static void drawChar(SDL_Renderer* r, int x, int y, char c, int scale, uint8_t cr, uint8_t cg, uint8_t cb) {
-    int idx = (unsigned char)c;
-    if (idx < 32 || idx > 127) idx = '?';
-    const uint8_t* glyph = FONT8X8[idx - 32];
-    SDL_SetRenderDrawColor(r, cr, cg, cb, 255);
-    for (int row = 0; row < 8; row++) {
-        uint8_t bits = glyph[row];
-        for (int col = 0; col < 8; col++) {
-            if (bits & (1 << col)) {
-                SDL_Rect px = { x + col * scale, y + row * scale, scale, scale };
-                SDL_RenderFillRect(r, &px);
+static inline void clearSurfFast(SDL_Surface* dst) {
+    if (!dst || !dst->pixels) return;
+    uint64_t* p64 = (uint64_t*)dst->pixels;
+    int count64 = (dst->pitch * dst->h) / 8;
+    const uint64_t black = 0xFF000000FF000000ULL;
+    for (int i = 0; i < count64; i++) p64[i] = black;
+}
+
+static inline void fillRectFast(SDL_Surface* dst, int rx, int ry, int rw, int rh, uint8_t r, uint8_t g, uint8_t b, uint8_t a = 255) {
+    if (!dst || !dst->pixels || rw <= 0 || rh <= 0 || a == 0) return;
+    int x0 = std::max(0, rx), y0 = std::max(0, ry);
+    int x1 = std::min(dst->w, rx + rw), y1 = std::min(dst->h, ry + rh);
+    if (x0 >= x1 || y0 >= y1) return;
+
+    if (a == 255) {
+        uint32_t col = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+        for (int y = y0; y < y1; y++) {
+            uint32_t* row = (uint32_t*)((uint8_t*)dst->pixels + y * dst->pitch);
+            for (int x = x0; x < x1; x++) row[x] = col;
+        }
+    } else {
+        uint32_t invA = 255 - a;
+        for (int y = y0; y < y1; y++) {
+            uint32_t* row = (uint32_t*)((uint8_t*)dst->pixels + y * dst->pitch);
+            for (int x = x0; x < x1; x++) {
+                uint32_t dp = row[x];
+                uint8_t dr = (dp >> 16) & 0xFF, dg = (dp >> 8) & 0xFF, db = dp & 0xFF;
+                uint8_t nr = (uint8_t)((r * a + dr * invA) >> 8);
+                uint8_t ng = (uint8_t)((g * a + dg * invA) >> 8);
+                uint8_t nb = (uint8_t)((b * a + db * invA) >> 8);
+                row[x] = 0xFF000000u | ((uint32_t)nr << 16) | ((uint32_t)ng << 8) | (uint32_t)nb;
             }
         }
     }
 }
 
-static void drawText(SDL_Renderer* r, int x, int y, const std::string& raw, int scale, uint8_t cr, uint8_t cg, uint8_t cb) {
+static inline void drawRectFast(SDL_Surface* dst, int rx, int ry, int rw, int rh, uint8_t r, uint8_t g, uint8_t b) {
+    fillRectFast(dst, rx, ry, rw, 2, r, g, b);
+    fillRectFast(dst, rx, ry + rh - 2, rw, 2, r, g, b);
+    fillRectFast(dst, rx, ry, 2, rh, r, g, b);
+    fillRectFast(dst, rx + rw - 2, ry, 2, rh, r, g, b);
+}
+
+static inline void drawCharFast(SDL_Surface* dst, int x, int y, char c, int scale, uint8_t cr, uint8_t cg, uint8_t cb) {
+    int idx = (unsigned char)c;
+    if (idx < 32 || idx > 127) idx = '?';
+    const uint8_t* glyph = FONT8X8[idx - 32];
+    uint32_t col = 0xFF000000u | ((uint32_t)cr << 16) | ((uint32_t)cg << 8) | (uint32_t)cb;
+
+    for (int row = 0; row < 8; row++) {
+        uint8_t bits = glyph[row];
+        if (!bits) continue;
+        for (int sy = 0; sy < scale; sy++) {
+            int py = y + row * scale + sy;
+            if (py < 0 || py >= dst->h) continue;
+            uint32_t* drow = (uint32_t*)((uint8_t*)dst->pixels + py * dst->pitch);
+            for (int colBit = 0; colBit < 8; colBit++) {
+                if (bits & (1 << colBit)) {
+                    int px0 = x + colBit * scale;
+                    for (int sx = 0; sx < scale; sx++) {
+                        int px = px0 + sx;
+                        if (px >= 0 && px < dst->w) drow[px] = col;
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void drawText(SDL_Surface* dst, int x, int y, const std::string& raw, int scale, uint8_t cr, uint8_t cg, uint8_t cb) {
     std::string s = utf8ToAscii(raw);
     int cx = x;
     for (size_t i = 0; i < s.size(); i++) {
         if (s[i] == '\n') { y += 11 * scale; cx = x; continue; }
-        drawChar(r, cx + scale, y + scale, s[i], scale, 0, 0, 0);
-        drawChar(r, cx, y, s[i], scale, cr, cg, cb);
+        drawCharFast(dst, cx + scale, y + scale, s[i], scale, 0, 0, 0);
+        drawCharFast(dst, cx, y, s[i], scale, cr, cg, cb);
         cx += 8 * scale;
     }
 }
@@ -157,13 +476,17 @@ static SDL_Surface* getSurf(const std::string& path) {
         g_surfCache[path] = nullptr;
         return nullptr;
     }
-    std::vector<uint8_t> buf;
-    uint8_t chunk[16384];
-    size_t n = 0;
-    while ((n = fread(chunk, 1, sizeof(chunk), f)) > 0)
-        buf.insert(buf.end(), chunk, chunk + n);
+    fseek(f, 0, SEEK_END);
+    long fsz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (fsz <= 0) {
+        fclose(f);
+        g_surfCache[path] = nullptr;
+        return nullptr;
+    }
+    std::vector<uint8_t> buf(fsz);
+    fread(buf.data(), 1, fsz, f);
     fclose(f);
-    if (buf.empty()) { g_surfCache[path] = nullptr; return nullptr; }
 
     int w = 0, h = 0, ch = 0;
     uint8_t* rgba = stbi_load_from_memory(buf.data(), (int)buf.size(), &w, &h, &ch, 4);
@@ -179,7 +502,8 @@ static SDL_Surface* getSurf(const std::string& path) {
     return s;
 }
 
-static void blitSurf(SDL_Surface* src, const SDL_Rect* sr, SDL_Surface* dst, SDL_Rect* dr, uint8_t alphaMul = 255) {
+// Blitter optimizado con ruta rápida 1:1 sin divisiones por píxel
+static void blitSurf(SDL_Surface* src, const SDL_Rect* sr, SDL_Surface* dst, SDL_Rect* dr, uint8_t alphaMul = 255, bool dstIsWindow = true) {
     if (!src || !dst || !src->pixels || !dst->pixels || alphaMul == 0) return;
     int sx0 = sr ? sr->x : 0, sy0 = sr ? sr->y : 0;
     int sw  = sr ? sr->w : src->w, sh  = sr ? sr->h : src->h;
@@ -187,6 +511,59 @@ static void blitSurf(SDL_Surface* src, const SDL_Rect* sr, SDL_Surface* dst, SDL
     int dw  = dr ? dr->w : sw,    dh  = dr ? dr->h : sh;
     if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return;
 
+    // Ruta rápida 1:1 (sin escalado)
+    if (sw == dw && sh == dh) {
+        int clipX0 = 0, clipY0 = 0;
+        if (dx0 < 0) { clipX0 = -dx0; sx0 += clipX0; dw -= clipX0; dx0 = 0; }
+        if (dy0 < 0) { clipY0 = -dy0; sy0 += clipY0; dh -= clipY0; dy0 = 0; }
+        if (sx0 < 0) { dx0 -= sx0; dw += sx0; sx0 = 0; }
+        if (sy0 < 0) { dy0 -= sy0; dh += sy0; sy0 = 0; }
+        if (dx0 + dw > dst->w) dw = dst->w - dx0;
+        if (dy0 + dh > dst->h) dh = dst->h - dy0;
+        if (sx0 + dw > src->w) dw = src->w - sx0;
+        if (sy0 + dh > src->h) dh = src->h - sy0;
+        if (dw <= 0 || dh <= 0) return;
+
+        for (int y = 0; y < dh; y++) {
+            const uint8_t* sp = (const uint8_t*)src->pixels + (sy0 + y) * src->pitch + sx0 * 4;
+            if (dstIsWindow) {
+                uint32_t* dp = (uint32_t*)((uint8_t*)dst->pixels + (dy0 + y) * dst->pitch) + dx0;
+                for (int x = 0; x < dw; x++, sp += 4) {
+                    uint32_t sa = (sp[3] * alphaMul) >> 8;
+                    if (sa == 0) continue;
+                    if (sa >= 254) {
+                        dp[x] = 0xFF000000u | ((uint32_t)sp[0] << 16) | ((uint32_t)sp[1] << 8) | (uint32_t)sp[2];
+                    } else {
+                        uint32_t d = dp[x];
+                        uint32_t inv = 255 - sa;
+                        uint8_t r = (uint8_t)((sp[0] * sa + ((d >> 16) & 0xFF) * inv) >> 8);
+                        uint8_t g = (uint8_t)((sp[1] * sa + ((d >> 8)  & 0xFF) * inv) >> 8);
+                        uint8_t b = (uint8_t)((sp[2] * sa + (d         & 0xFF) * inv) >> 8);
+                        dp[x] = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+                    }
+                }
+            } else {
+                // Ambos RGBA32 (pre-renderizado de capas de mapa)
+                uint8_t* dp = (uint8_t*)dst->pixels + (dy0 + y) * dst->pitch + dx0 * 4;
+                for (int x = 0; x < dw; x++, sp += 4, dp += 4) {
+                    uint32_t sa = (sp[3] * alphaMul) >> 8;
+                    if (sa == 0) continue;
+                    if (sa >= 254 || dp[3] == 0) {
+                        dp[0] = sp[0]; dp[1] = sp[1]; dp[2] = sp[2]; dp[3] = (uint8_t)sa;
+                    } else {
+                        uint32_t inv = 255 - sa;
+                        dp[0] = (uint8_t)((sp[0] * sa + dp[0] * inv) >> 8);
+                        dp[1] = (uint8_t)((sp[1] * sa + dp[1] * inv) >> 8);
+                        dp[2] = (uint8_t)((sp[2] * sa + dp[2] * inv) >> 8);
+                        dp[3] = (uint8_t)std::min(255u, dp[3] + sa);
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    // Ruta con escalado (zoom de Pictures / sprite de título)
     for (int dy = 0; dy < dh; dy++) {
         int py = dy0 + dy;
         if (py < 0 || py >= dst->h) continue;
@@ -203,24 +580,50 @@ static void blitSurf(SDL_Surface* src, const SDL_Rect* sr, SDL_Surface* dst, SDL
             if (sx < 0 || sx >= src->w) continue;
 
             const uint8_t* sp = srow + sx * 4;
-            uint8_t sr8 = sp[0], sg8 = sp[1], sb8 = sp[2];
-            uint32_t sa8 = (sp[3] * alphaMul) / 255;
-            if (sa8 == 0) continue;
-            if (sa8 == 255) {
-                drow[px] = 0xFF000000u | ((uint32_t)sr8 << 16) | ((uint32_t)sg8 << 8) | (uint32_t)sb8;
+            uint32_t sa = (sp[3] * alphaMul) >> 8;
+            if (sa == 0) continue;
+            if (sa >= 254) {
+                drow[px] = 0xFF000000u | ((uint32_t)sp[0] << 16) | ((uint32_t)sp[1] << 8) | (uint32_t)sp[2];
             } else {
-                uint32_t dp = drow[px];
-                uint8_t dr8 = (dp >> 16) & 0xFF, dg8 = (dp >> 8) & 0xFF, db8 = dp & 0xFF;
-                uint8_t or8 = (uint8_t)((sr8 * sa8 + dr8 * (255 - sa8)) / 255);
-                uint8_t og8 = (uint8_t)((sg8 * sa8 + dg8 * (255 - sa8)) / 255);
-                uint8_t ob8 = (uint8_t)((sb8 * sa8 + db8 * (255 - sa8)) / 255);
-                drow[px] = 0xFF000000u | ((uint32_t)or8 << 16) | ((uint32_t)og8 << 8) | (uint32_t)ob8;
+                uint32_t d = drow[px];
+                uint32_t inv = 255 - sa;
+                uint8_t r = (uint8_t)((sp[0] * sa + ((d >> 16) & 0xFF) * inv) >> 8);
+                uint8_t g = (uint8_t)((sp[1] * sa + ((d >> 8)  & 0xFF) * inv) >> 8);
+                uint8_t b = (uint8_t)((sp[2] * sa + (d         & 0xFF) * inv) >> 8);
+                drow[px] = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
             }
         }
     }
 }
 
-// Estado global del juego RPG Maker XP
+// Tabla oficial de RPG Maker XP para los 48 sub-patrones de Autotiles (4 cuadrantes de 16x16)
+static const uint8_t AUTOTILE_LUT[48][4] = {
+    {26,27,32,33},{ 4,27,32,33},{26, 5,32,33},{ 4, 5,32,33},{26,27,32,11},{ 4,27,32,11},{26, 5,32,11},{ 4, 5,32,11},
+    {26,27,10,33},{ 4,27,10,33},{26, 5,10,33},{ 4, 5,10,33},{26,27,10,11},{ 4,27,10,11},{26, 5,10,11},{ 4, 5,10,11},
+    {24,25,30,31},{24, 5,30,31},{24,25,30,11},{24, 5,30,11},{14,15,20,21},{14,15,20,11},{14,15,10,21},{14,15,10,11},
+    {28,29,34,35},{28,29,10,35},{ 4,29,34,35},{ 4,29,10,35},{38,39,44,45},{ 4,39,44,45},{38, 5,44,45},{ 4, 5,44,45},
+    {24,29,30,35},{14,15,44,45},{12,13,18,19},{12,13,18,11},{16,17,22,23},{16,17,10,23},{40,41,46,47},{ 4,41,46,47},
+    {36,37,42,43},{36, 5,42,43},{12,17,18,23},{12,13,42,43},{36,41,42,47},{16,17,46,47},{12,17,42,47},{ 0, 1, 6, 7}
+};
+
+static void blitAutotileToCache(SDL_Surface* atSurf, int pattern, SDL_Surface* dstSurf, int dx, int dy) {
+    if (!atSurf || !dstSurf) return;
+    if (pattern < 0 || pattern >= 48) pattern = 0;
+    if (atSurf->w < 96 || atSurf->h < 128) {
+        SDL_Rect sr = { 0, 0, std::min(32, atSurf->w), std::min(32, atSurf->h) };
+        SDL_Rect dr = { dx, dy, 32, 32 };
+        blitSurf(atSurf, &sr, dstSurf, &dr, 255, false);
+        return;
+    }
+    for (int q = 0; q < 4; q++) {
+        uint8_t sub = AUTOTILE_LUT[pattern][q];
+        SDL_Rect sr = { (sub % 6) * 16, (sub / 6) * 16, 16, 16 };
+        SDL_Rect dr = { dx + (q % 2) * 16, dy + (q / 2) * 16, 16, 16 };
+        blitSurf(atSurf, &sr, dstSurf, &dr, 255, false);
+    }
+}
+
+// ==================== ESTRUCTURAS DEL MOTOR RPG MAKER XP ====================
 struct MoveCmd { int code = 0; JVal params; };
 struct MoveRoute {
     bool repeat = false;
@@ -238,29 +641,30 @@ struct EventPage {
     int move_type = 0, move_speed = 3, move_freq = 3;
     MoveRoute move_route;
     bool walk_anime = true, step_anime = false, dir_fix = false, through = false, always_top = false;
-    int trigger = 0; // 0=action, 1=player_touch, 2=event_touch, 3=autorun, 4=parallel
-    JVal list; // array de {c, i, p}
+    int trigger = 0;
+    JVal list;
 };
 
 struct MapEvent {
     int id = 0;
     std::string name;
     int x = 0, y = 0;
-    int dir = 2, pattern = 0, opacity = 255;
+    int dir = 2, pattern = 0, opacity = 255, tile_id = 0;
     std::string char_name;
-    bool through = false, always_top = false, erased = false;
-    int move_type = 0, move_speed = 3, move_freq = 3;
+    bool through = false, always_top = false, dir_fix = false, step_anime = false, erased = false;
+    int move_type = 0;
+    float move_speed = 3.0f;
+    int move_freq = 3;
     std::vector<EventPage> pages;
     int activePage = -1;
     uint32_t lastAutoMoveTick = 0;
 
-    // Ruta forzada por Set Move Route (cmd 209)
     bool routeActive = false;
     MoveRoute forcedRoute;
     size_t routeIdx = 0;
     uint32_t lastRouteStepTick = 0;
+    int routeWaitFrames = 0;
 
-    // Intérprete paralelo propio (trigger == 4)
     size_t parIp = 0;
     int parWait = 0;
 };
@@ -268,22 +672,41 @@ struct MapEvent {
 struct Picture {
     bool active = false;
     std::string name;
-    int x = 0, y = 0, opacity = 255;
+    int origin = 0; // 0=upper-left, 1=center
+    float x = 0, y = 0, zoomX = 100.0f, zoomY = 100.0f, opacity = 255.0f;
+    float targetX = 0, targetY = 0, targetZoomX = 100.0f, targetZoomY = 100.0f, targetOpacity = 255.0f;
+    int moveFrames = 0;
 };
 
-struct ItemDef { std::string name, icon, desc; };
-struct CommonEventDef { int id = 0, trigger = 0, switch_id = 1; JVal list; size_t parIp = 0; int parWait = 0; };
+struct ItemDef {
+    std::string name, icon, desc;
+    int common_event_id = 0;
+    bool consumable = false;
+};
+
+struct CommonEventDef {
+    int id = 0, trigger = 0, switch_id = 1;
+    JVal list;
+    size_t parIp = 0;
+    int parWait = 0;
+};
+
+struct InterpFrame {
+    JVal list;
+    size_t ip = 0;
+    int evId = 0;
+};
 
 struct GameRuntime {
     bool switches[512] = {false};
     int variables[512] = {0};
-    std::map<std::string, bool> selfSwitches; // "mapId_evId_ch" -> bool
-    std::map<int, int> inventory; // itemId -> count
+    std::map<std::string, bool> selfSwitches;
+    std::map<int, int> inventory;
     std::map<int, std::string> actorNames;
     std::map<int, std::string> actorChars;
     std::map<int, ItemDef> itemDefs;
     std::vector<CommonEventDef> commonEvents;
-    Picture pictures[21];
+    Picture pictures[52];
 
     int mapId = 75;
     int mapW = 20, mapH = 15, tilesetId = 1;
@@ -294,30 +717,31 @@ struct GameRuntime {
     std::vector<uint8_t> priorities;
     std::vector<MapEvent> events;
 
+    SDL_Surface* mapLowerSurf = nullptr;
+    SDL_Surface* mapUpperSurf = nullptr;
+
     int playerX = 9, playerY = 8, playerDir = 2, playerPattern = 0;
     std::string playerChar = "hirosi";
-    bool playerTransparent = true; // En Map075 empieza invisible hasta que cambia el actor/sprite
+    bool playerTransparent = true;
     bool playerThrough = false;
-    int playerSpeed = 4;
+    bool playerDirFix = false;
+    float playerSpeed = 4.0f;
     bool menuDisabled = false;
 
     bool playerRouteActive = false;
     MoveRoute playerForcedRoute;
     size_t playerRouteIdx = 0;
     uint32_t lastPlayerRouteTick = 0;
+    int playerRouteWaitFrames = 0;
 
-    // Temporizador (cmd 124)
     bool timerWorking = false;
     int timerFrames = 0;
 
-    // Tono de pantalla (cmd 223)
     int toneR = 0, toneG = 0, toneB = 0;
+    bool screenBlackout = false; // cmd 221 / 222
 
-    // Intérprete principal (foreground)
-    bool fgRunning = false;
-    int fgEventId = 0;
-    JVal fgList;
-    size_t fgIp = 0;
+    // Pila de ejecución del intérprete foreground (soporta Call Common Event 117 anidado)
+    std::vector<InterpFrame> fgStack;
     int fgWaitFrames = 0;
     bool fgWaitForMove = false;
 
@@ -326,16 +750,27 @@ struct GameRuntime {
     std::string msgFace;
     std::string msgSpeaker;
     std::string msgText;
-    int msgPos = 2; // 0=arriba, 1=centro, 2=abajo
+    int msgPos = 2;
     bool choiceActive = false;
     std::vector<std::string> choices;
     int choiceIndex = 0;
     int choiceIndent = 0;
 
-    // Cambio de mapa pendiente
+    // Entrada de número de 3/4 dígitos (cmd 103 - Cajas fuertes / candados)
+    bool numInputActive = false;
+    int numInputVarId = 12;
+    int numInputDigits = 4;
+    int numInputCursor = 0;
+    int numInputVals[8] = {0};
+
+    // Espera de botón (cmd 105 - Armarios tansu / puzzles)
+    bool btnInputActive = false;
+    int btnInputVarId = 8;
+
     bool pendingTransfer = false;
     int nextMapId = 0, nextX = 0, nextY = 0, nextDir = 0;
     bool gameOverTriggered = false;
+    bool returnToTitleTriggered = false;
     uint32_t frameCount = 0;
 } g_game;
 
@@ -343,7 +778,7 @@ static int rmDirToRow(int d) {
     if (d == 4) return 1;
     if (d == 6) return 2;
     if (d == 8) return 3;
-    return 0; // 2 = abajo
+    return 0;
 }
 
 static MapEvent* findEvent(int id) {
@@ -381,16 +816,20 @@ static void refreshEvents() {
             if (found >= 0) {
                 const auto& pg = ev.pages[found];
                 ev.char_name = pg.char_name;
+                ev.tile_id = pg.tile_id;
                 ev.dir = pg.dir;
                 ev.pattern = pg.pattern;
                 ev.opacity = pg.opacity;
                 ev.through = pg.through;
                 ev.always_top = pg.always_top;
+                ev.dir_fix = pg.dir_fix;
+                ev.step_anime = pg.step_anime;
                 ev.move_type = pg.move_type;
-                ev.move_speed = pg.move_speed;
+                ev.move_speed = (float)pg.move_speed;
                 ev.move_freq = pg.move_freq;
             } else {
                 ev.char_name.clear();
+                ev.tile_id = 0;
             }
         }
     }
@@ -401,7 +840,6 @@ static bool canPassTile(int tx, int ty, bool isPlayer, int selfEvId = -1) {
     for (const auto& ev : g_game.events) {
         if (ev.id == selfEvId || ev.activePage < 0 || ev.through) continue;
         if (ev.x == tx && ev.y == ty && !ev.char_name.empty()) {
-            // Si es una puerta con trigger de contacto (1 o 2), permitir pisarla para que dispare
             int trig = ev.pages[ev.activePage].trigger;
             if (isPlayer && (trig == 1 || trig == 2)) continue;
             return false;
@@ -436,13 +874,15 @@ static MoveRoute parseMoveRoute(const JVal& mrObj) {
     return mr;
 }
 
-static void stepCharacterDir(int& x, int& y, int& dir, int d, bool through, bool isPlayer, int evId) {
-    dir = d;
+static bool stepCharacterDir(int& x, int& y, int& dir, int d, bool dirFix, bool through, bool isPlayer, int evId) {
+    if (!dirFix) dir = d;
     int nx = x + (d == 4 ? -1 : (d == 6 ? 1 : 0));
     int ny = y + (d == 8 ? -1 : (d == 2 ? 1 : 0));
     if (through || canPassTile(nx, ny, isPlayer, evId)) {
         x = nx; y = ny;
+        return true;
     }
+    return false;
 }
 
 static void stepTowardPlayer(MapEvent& ev) {
@@ -450,46 +890,68 @@ static void stepTowardPlayer(MapEvent& ev) {
     int dy = g_game.playerY - ev.y;
     int d1 = (std::abs(dx) >= std::abs(dy)) ? (dx > 0 ? 6 : 4) : (dy > 0 ? 2 : 8);
     int d2 = (std::abs(dx) >= std::abs(dy)) ? (dy > 0 ? 2 : 8) : (dx > 0 ? 6 : 4);
-    int ox = ev.x, oy = ev.y;
-    stepCharacterDir(ev.x, ev.y, ev.dir, d1, ev.through, false, ev.id);
-    if (ev.x == ox && ev.y == oy && (dx != 0 || dy != 0))
-        stepCharacterDir(ev.x, ev.y, ev.dir, d2, ev.through, false, ev.id);
+    if (!stepCharacterDir(ev.x, ev.y, ev.dir, d1, ev.dir_fix, ev.through, false, ev.id) && (dx != 0 || dy != 0))
+        stepCharacterDir(ev.x, ev.y, ev.dir, d2, ev.dir_fix, ev.through, false, ev.id);
 }
 
-static bool applyMoveCmd(int targetId, const MoveCmd& mc) {
+static void stepAwayFromPlayer(MapEvent& ev) {
+    int dx = g_game.playerX - ev.x;
+    int dy = g_game.playerY - ev.y;
+    int d1 = (std::abs(dx) >= std::abs(dy)) ? (dx > 0 ? 4 : 6) : (dy > 0 ? 8 : 2);
+    int d2 = (std::abs(dx) >= std::abs(dy)) ? (dy > 0 ? 8 : 2) : (dx > 0 ? 4 : 6);
+    if (!stepCharacterDir(ev.x, ev.y, ev.dir, d1, ev.dir_fix, ev.through, false, ev.id) && (dx != 0 || dy != 0))
+        stepCharacterDir(ev.x, ev.y, ev.dir, d2, ev.dir_fix, ev.through, false, ev.id);
+}
+
+static void applyMoveCmd(int targetId, const MoveCmd& mc) {
     int* px = (targetId == -1) ? &g_game.playerX : nullptr;
     int* py = (targetId == -1) ? &g_game.playerY : nullptr;
     int* pdir = (targetId == -1) ? &g_game.playerDir : nullptr;
+    int* ppat = (targetId == -1) ? &g_game.playerPattern : nullptr;
     bool* pthr = (targetId == -1) ? &g_game.playerThrough : nullptr;
+    bool* pdfix = (targetId == -1) ? &g_game.playerDirFix : nullptr;
     std::string* pchar = (targetId == -1) ? &g_game.playerChar : nullptr;
 
     MapEvent* ev = (targetId > 0) ? findEvent(targetId) : nullptr;
-    if (targetId > 0 && !ev) return true;
-    if (ev) { px = &ev->x; py = &ev->y; pdir = &ev->dir; pthr = &ev->through; pchar = &ev->char_name; }
+    if (targetId > 0 && !ev) return;
+    if (ev) {
+        px = &ev->x; py = &ev->y; pdir = &ev->dir; ppat = &ev->pattern;
+        pthr = &ev->through; pdfix = &ev->dir_fix; pchar = &ev->char_name;
+    }
+    if (!px) return;
 
+    bool walked = false;
     switch (mc.code) {
-        case 1: stepCharacterDir(*px, *py, *pdir, 2, *pthr, targetId == -1, targetId); break; // Down
-        case 2: stepCharacterDir(*px, *py, *pdir, 4, *pthr, targetId == -1, targetId); break; // Left
-        case 3: stepCharacterDir(*px, *py, *pdir, 6, *pthr, targetId == -1, targetId); break; // Right
-        case 4: stepCharacterDir(*px, *py, *pdir, 8, *pthr, targetId == -1, targetId); break; // Up
-        case 5: (*px)--; (*py)++; *pdir = 4; break;
-        case 6: (*px)++; (*py)++; *pdir = 6; break;
-        case 7: (*px)--; (*py)--; *pdir = 4; break;
-        case 8: (*px)++; (*py)--; *pdir = 6; break;
-        case 9: stepCharacterDir(*px, *py, *pdir, (rand() % 4 + 1) * 2, *pthr, targetId == -1, targetId); break;
-        case 10: if (ev) stepTowardPlayer(*ev); break;
-        case 12: stepCharacterDir(*px, *py, *pdir, *pdir, *pthr, targetId == -1, targetId); break;
-        case 13: { // 1 Step Backward
+        case 1: walked = stepCharacterDir(*px, *py, *pdir, 2, *pdfix, *pthr, targetId == -1, targetId); break;
+        case 2: walked = stepCharacterDir(*px, *py, *pdir, 4, *pdfix, *pthr, targetId == -1, targetId); break;
+        case 3: walked = stepCharacterDir(*px, *py, *pdir, 6, *pdfix, *pthr, targetId == -1, targetId); break;
+        case 4: walked = stepCharacterDir(*px, *py, *pdir, 8, *pdfix, *pthr, targetId == -1, targetId); break;
+        case 5: (*px)--; (*py)++; if (!*pdfix) *pdir = 4; walked = true; break;
+        case 6: (*px)++; (*py)++; if (!*pdfix) *pdir = 6; walked = true; break;
+        case 7: (*px)--; (*py)--; if (!*pdfix) *pdir = 4; walked = true; break;
+        case 8: (*px)++; (*py)--; if (!*pdfix) *pdir = 6; walked = true; break;
+        case 9: walked = stepCharacterDir(*px, *py, *pdir, (rand() % 4 + 1) * 2, *pdfix, *pthr, targetId == -1, targetId); break;
+        case 10: if (ev) { stepTowardPlayer(*ev); walked = true; } break;
+        case 11: if (ev) { stepAwayFromPlayer(*ev); walked = true; } break;
+        case 12: walked = stepCharacterDir(*px, *py, *pdir, *pdir, *pdfix, *pthr, targetId == -1, targetId); break;
+        case 13: {
             int od = *pdir;
             int bd = (od == 2 ? 8 : (od == 8 ? 2 : (od == 4 ? 6 : 4)));
-            stepCharacterDir(*px, *py, *pdir, bd, *pthr, targetId == -1, targetId);
+            walked = stepCharacterDir(*px, *py, *pdir, bd, true, *pthr, targetId == -1, targetId);
             *pdir = od;
             break;
         }
-        case 14: // Jump(dx, dy)
+        case 14:
             *px += mc.params[0].asInt(0);
             *py += mc.params[1].asInt(0);
+            walked = true;
             break;
+        case 15: { // Wait inside Move Route
+            int wf = std::max(1, mc.params[0].asInt(1));
+            if (targetId == -1) g_game.playerRouteWaitFrames = wf;
+            else if (ev) ev->routeWaitFrames = wf;
+            break;
+        }
         case 16: *pdir = 2; break;
         case 17: *pdir = 4; break;
         case 18: *pdir = 6; break;
@@ -500,18 +962,83 @@ static bool applyMoveCmd(int targetId, const MoveCmd& mc) {
         } break;
         case 27: g_game.switches[mc.params[0].asInt(1)] = true; refreshEvents(); break;
         case 28: g_game.switches[mc.params[0].asInt(1)] = false; refreshEvents(); break;
-        case 29: if (targetId == -1) g_game.playerSpeed = mc.params[0].asInt(4); else if (ev) ev->move_speed = mc.params[0].asInt(3); break;
+        case 29: if (targetId == -1) g_game.playerSpeed = (float)mc.params[0].asNum(4.0); else if (ev) ev->move_speed = (float)mc.params[0].asNum(3.0); break;
+        case 33: if (ev) ev->step_anime = true; break;
+        case 34: if (ev) ev->step_anime = false; break;
+        case 35: *pdfix = true; break;
+        case 36: *pdfix = false; break;
         case 37: *pthr = true; break;
         case 38: *pthr = false; break;
-        case 41: // Change Graphic
+        case 39: if (ev) ev->always_top = true; break;
+        case 40: if (ev) ev->always_top = false; break;
+        case 41: // Change Graphic: [char_name, hue, dir, pattern]
             *pchar = mc.params[0].asStr();
-            if (targetId == -1 && !pchar->empty()) g_game.playerTransparent = false;
+            if (targetId == -1) g_game.playerTransparent = pchar->empty();
             if (mc.params.a.size() >= 3 && mc.params[2].asInt(0) > 0) *pdir = mc.params[2].asInt(2);
+            if (mc.params.a.size() >= 4) *ppat = mc.params[3].asInt(0) % 4;
             break;
         case 42: if (ev) ev->opacity = mc.params[0].asInt(255); break;
+        case 44: { // Play SE inside Move Route
+            const JVal& af = mc.params[0];
+            playSe(af.get("name").asStr(), af.get("volume").asInt(100), af.get("pitch").asInt(100));
+            break;
+        }
+        case 45: { // Script inside Move Route (ej: @move_speed = 4.1)
+            std::string s = mc.params[0].asStr();
+            float spd = 0.0f;
+            if (sscanf(s.c_str(), " @move_speed = %f", &spd) == 1 && spd > 0.1f) {
+                if (targetId == -1) g_game.playerSpeed = spd;
+                else if (ev) ev->move_speed = spd;
+            }
+            break;
+        }
         default: break;
     }
-    return true;
+    if (walked) *ppat = (*ppat + 1) % 4;
+}
+
+static void buildMapCacheSurfaces() {
+    if (g_game.mapLowerSurf) { SDL_FreeSurface(g_game.mapLowerSurf); g_game.mapLowerSurf = nullptr; }
+    if (g_game.mapUpperSurf) { SDL_FreeSurface(g_game.mapUpperSurf); g_game.mapUpperSurf = nullptr; }
+
+    int pw = g_game.mapW * TILE_SZ;
+    int ph = g_game.mapH * TILE_SZ;
+    g_game.mapLowerSurf = SDL_CreateRGBSurfaceWithFormat(0, pw, ph, 32, SDL_PIXELFORMAT_RGBA32);
+    g_game.mapUpperSurf = SDL_CreateRGBSurfaceWithFormat(0, pw, ph, 32, SDL_PIXELFORMAT_RGBA32);
+    if (!g_game.mapLowerSurf || !g_game.mapUpperSurf) return;
+
+    memset(g_game.mapLowerSurf->pixels, 0, g_game.mapLowerSurf->pitch * ph);
+    memset(g_game.mapUpperSurf->pixels, 0, g_game.mapUpperSurf->pitch * ph);
+
+    SDL_Surface* tsSurf = g_game.tilesetFile[0] ? getSurf(std::string("/app0/assets/images/ts_") + g_game.tilesetFile + ".png") : nullptr;
+    SDL_Surface* atSurfs[7] = {nullptr};
+    for (int i = 0; i < 7; i++)
+        if (g_game.autotileFiles[i][0])
+            atSurfs[i] = getSurf(std::string("/app0/assets/images/at_") + g_game.autotileFiles[i] + ".png");
+
+    for (int z = 0; z < 3; z++) {
+        for (int ty = 0; ty < g_game.mapH; ty++) {
+            for (int tx = 0; tx < g_game.mapW; tx++) {
+                int16_t tid = g_game.layers[tx + ty * g_game.mapW + z * g_game.mapW * g_game.mapH];
+                if (tid <= 0) continue;
+                uint8_t prio = ((size_t)tid < g_game.priorities.size()) ? g_game.priorities[tid] : 0;
+                SDL_Surface* target = (prio > 0) ? g_game.mapUpperSurf : g_game.mapLowerSurf;
+                int dx = tx * TILE_SZ, dy = ty * TILE_SZ;
+
+                if (tid >= 384 && tsSurf) {
+                    int tIndex = tid - 384;
+                    SDL_Rect src = { (tIndex % 8) * TILE_SZ, (tIndex / 8) * TILE_SZ, TILE_SZ, TILE_SZ };
+                    SDL_Rect dst = { dx, dy, TILE_SZ, TILE_SZ };
+                    blitSurf(tsSurf, &src, target, &dst, 255, false);
+                } else if (tid >= 48 && tid < 384) {
+                    int atIdx = (tid / 48) - 1;
+                    int pat = tid % 48;
+                    if (atIdx >= 0 && atIdx < 7 && atSurfs[atIdx])
+                        blitAutotileToCache(atSurfs[atIdx], pat, target, dx, dy);
+                }
+            }
+        }
+    }
 }
 
 static bool loadMap(int mapId) {
@@ -548,6 +1075,10 @@ static bool loadMap(int mapId) {
     g_game.events.clear();
     JVal meta;
     if (loadJsonFile(jsonPath, meta)) {
+        if (meta.get("autoplay_bgm").asBool(false)) {
+            const JVal& b = meta.get("bgm");
+            playBgm(b.get("name").asStr(), b.get("volume").asInt(100), b.get("pitch").asInt(100));
+        }
         const JVal& evs = meta.get("events");
         for (size_t i = 0; i < evs.a.size(); i++) {
             const JVal& je = evs[i];
@@ -586,14 +1117,13 @@ static bool loadMap(int mapId) {
         }
     }
     refreshEvents();
-    printf("[AoOni] Mapa %03d cargado (%dx%d, eventos=%zu)\n", mapId, g_game.mapW, g_game.mapH, g_game.events.size());
+    buildMapCacheSurfaces();
+    printf("[AoOni] Mapa %03d cargado y cacheado (%dx%d, eventos=%zu)\n", mapId, g_game.mapW, g_game.mapH, g_game.events.size());
     return true;
 }
 
-// Formatea un texto de RPG Maker XP extrayendo \f[rostro], \name[nombre], \N[id], \V[id]
 static void formatDialogText(const std::string& raw, std::string& faceOut, std::string& speakerOut, std::string& cleanOut) {
     std::string s = raw;
-    // Reemplazar \N[x] y \V[x]
     for (int pass = 0; pass < 2; pass++) {
         size_t pos = 0;
         while ((pos = s.find("\\N[", pos)) != std::string::npos || (pos = s.find("\\n[", pos)) != std::string::npos) {
@@ -629,12 +1159,11 @@ static void formatDialogText(const std::string& raw, std::string& faceOut, std::
             s.erase(npos, nend - npos + 1);
         }
     }
-    // Limpiar codigos de pausa \! \. \> \< \^
     std::string out;
     for (size_t i = 0; i < s.size(); i++) {
         if (s[i] == '\\' && i + 1 < s.size()) {
             char nc = s[i + 1];
-            if (nc == '!' || nc == '.' || nc == '>' || nc == '<' || nc == '^') { i++; continue; }
+            if (nc == '!' || nc == '.' || nc == '>' || nc == '<' || nc == '^' || nc == '_') { i++; continue; }
             if ((nc == 'C' || nc == 'c') && i + 2 < s.size() && s[i + 2] == '[') {
                 size_t ce = s.find(']', i + 3);
                 if (ce != std::string::npos) { i = ce; continue; }
@@ -645,7 +1174,6 @@ static void formatDialogText(const std::string& raw, std::string& faceOut, std::
     cleanOut = out;
 }
 
-// Evaluador de las expresiones Ruby usadas en Ao Oni (cmd 111 tipo 12)
 static bool evalSingleTerm(const std::string& expr) {
     int evId = 0, val = 0, varId = 0;
     char prop[16] = {0}, op[8] = {0};
@@ -691,7 +1219,6 @@ static bool evalSingleTerm(const std::string& expr) {
 }
 
 static bool evalRubyCond(const std::string& expr) {
-    // Soportar 'or' y 'and'
     size_t orPos = expr.find(" or ");
     if (orPos != std::string::npos)
         return evalRubyCond(expr.substr(0, orPos)) || evalRubyCond(expr.substr(orPos + 4));
@@ -704,13 +1231,13 @@ static bool evalRubyCond(const std::string& expr) {
 static bool evalConditionCmd(int evId, const JVal& p) {
     int ctype = p[0].asInt(0);
     switch (ctype) {
-        case 0: { // Switch
+        case 0: {
             int swId = p[1].asInt(1);
             bool want = (p[2].asInt(0) == 0);
             bool cur = (swId >= 0 && swId < 512) ? g_game.switches[swId] : false;
             return cur == want;
         }
-        case 1: { // Variable
+        case 1: {
             int vId = p[1].asInt(1);
             int lhs = (vId >= 0 && vId < 512) ? g_game.variables[vId] : 0;
             int rhs = (p[2].asInt(0) == 0) ? p[3].asInt(0) : g_game.variables[p[3].asInt(0)];
@@ -723,39 +1250,40 @@ static bool evalConditionCmd(int evId, const JVal& p) {
             if (op == 5) return lhs != rhs;
             return false;
         }
-        case 2: { // Self Switch
+        case 2: {
             std::string ch = p[1].asStr();
             bool want = (p[2].asInt(0) == 0);
             char key[64];
             snprintf(key, sizeof(key), "%d_%d_%s", g_game.mapId, evId, ch.c_str());
             return g_game.selfSwitches[key] == want;
         }
-        case 3: { // Timer
+        case 3: {
             int sec = p[1].asInt(0);
             int cmp = p[2].asInt(0);
             int curSec = g_game.timerFrames / 60;
             return (cmp == 0) ? (curSec >= sec) : (curSec <= sec);
         }
-        case 4: { // Actor
+        case 4: {
             int aId = p[1].asInt(1);
             int sub = p[2].asInt(0);
             if (sub == 1) return g_game.actorNames[aId] == p[3].asStr();
             return false;
         }
-        case 6: { // Character facing
+        case 6: {
             int charId = p[1].asInt(-1);
+            if (charId == 0) charId = evId;
             int wantDir = p[2].asInt(2);
             if (charId == -1) return g_game.playerDir == wantDir;
             MapEvent* ev = findEvent(charId);
             return ev ? (ev->dir == wantDir) : false;
         }
-        case 8: { // Item in inventory
+        case 8: {
             int itemId = p[1].asInt(1);
             return g_game.inventory[itemId] > 0;
         }
-        case 11: // Key button pressed
+        case 11:
             return false;
-        case 12: // Script expression
+        case 12:
             return evalRubyCond(p[1].asStr());
         default:
             return false;
@@ -775,6 +1303,7 @@ static void execControlVars(int evId, const JVal& p) {
         val = g_game.inventory[p[4].asInt(1)];
     } else if (opType == 5) {
         int cid = p[4].asInt(-1), prop = p[5].asInt(0);
+        if (cid == 0) cid = evId;
         if (cid == -1) {
             if (prop == 0) val = g_game.playerX;
             else if (prop == 1) val = g_game.playerY;
@@ -805,13 +1334,13 @@ static void execControlVars(int evId, const JVal& p) {
     refreshEvents();
 }
 
-// Ejecuta una lista de comandos (tanto en foreground como en eventos paralelos)
 static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, int evId, bool isForeground) {
     int steps = 0;
-    while (ip < list.a.size() && steps < 120) {
+    while (ip < list.a.size() && steps < 160) {
         steps++;
         if (waitFrames > 0) { waitFrames--; return; }
-        if (isForeground && (g_game.msgActive || g_game.choiceActive || g_game.pendingTransfer)) return;
+        if (isForeground && (g_game.msgActive || g_game.choiceActive || g_game.numInputActive || g_game.btnInputActive || g_game.pendingTransfer))
+            return;
         if (isForeground && g_game.fgWaitForMove) {
             bool anyMoving = g_game.playerRouteActive;
             for (const auto& ev : g_game.events) if (ev.routeActive) anyMoving = true;
@@ -837,7 +1366,6 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                 }
                 formatDialogText(lines, g_game.msgFace, g_game.msgSpeaker, g_game.msgText);
                 g_game.msgActive = true;
-                // Si justo despues hay un Show Choices (102), activarlo junto al texto
                 if (ip < list.a.size() && list[ip].get("c").asInt(0) == 102) {
                     const JVal& cp = list[ip].get("p");
                     g_game.choices.clear();
@@ -850,7 +1378,7 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                 }
                 return;
             }
-            case 102: { // Show Choices suelto
+            case 102: { // Show Choices
                 if (!isForeground) { ip++; break; }
                 g_game.choices.clear();
                 for (size_t k = 0; k < p[0].a.size(); k++)
@@ -861,7 +1389,7 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                 ip++;
                 return;
             }
-            case 402: { // When [choice] - si llegamos secuencialmente tras ejecutar una rama, saltar hasta 404
+            case 402: { // When [choice]
                 while (ip < list.a.size()) {
                     if (list[ip].get("i").asInt(0) == indent && list[ip].get("c").asInt(0) == 404) {
                         ip++; break;
@@ -870,10 +1398,27 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                 }
                 break;
             }
+            case 103: { // Input Number (Cajas fuertes / candados)
+                if (!isForeground) { ip++; break; }
+                g_game.numInputVarId = p[0].asInt(12);
+                g_game.numInputDigits = std::max(1, std::min(8, p[1].asInt(4)));
+                g_game.numInputCursor = 0;
+                memset(g_game.numInputVals, 0, sizeof(g_game.numInputVals));
+                g_game.numInputActive = true;
+                ip++;
+                return;
+            }
             case 104: // Change Text Options
                 g_game.msgPos = p[0].asInt(2);
                 ip++;
                 break;
+            case 105: { // Button Input Processing (Armarios tansu / CE 25)
+                if (!isForeground) { ip++; break; }
+                g_game.btnInputVarId = p[0].asInt(8);
+                g_game.btnInputActive = true;
+                ip++;
+                return;
+            }
             case 106: // Wait
                 waitFrames = p[0].asInt(1);
                 ip++;
@@ -895,7 +1440,7 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                 }
                 break;
             }
-            case 411: { // Else - saltar hasta 412 del mismo indent
+            case 411: { // Else
                 ip++;
                 while (ip < list.a.size()) {
                     if (list[ip].get("i").asInt(0) == indent && list[ip].get("c").asInt(0) == 412) {
@@ -908,7 +1453,7 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
             case 112: // Loop
                 ip++;
                 break;
-            case 413: { // Repeat Above (volver al 112 del mismo indent)
+            case 413: { // Repeat Above
                 while (ip > 0) {
                     ip--;
                     if (list[ip].get("i").asInt(0) == indent && list[ip].get("c").asInt(0) == 112)
@@ -917,9 +1462,9 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                 ip++;
                 break;
             }
-            case 113: { // Break Loop (saltar tras el 413 del mismo indent)
+            case 113: { // Break Loop
                 while (ip < list.a.size()) {
-                    if (list[ip].get("c").asInt(0) == 413) { ip++; break; }
+                    if (list[ip].get("i").asInt(0) == indent && list[ip].get("c").asInt(0) == 413) { ip++; break; }
                     ip++;
                 }
                 break;
@@ -935,14 +1480,19 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
             }
             case 117: { // Call Common Event
                 int ceId = p[0].asInt(0);
+                ip++;
                 for (auto& ce : g_game.commonEvents) {
                     if (ce.id == ceId) {
-                        size_t subIp = 0; int subWait = 0;
-                        runInterpreterSlice(ce.list, subIp, subWait, evId, false);
+                        if (isForeground) {
+                            g_game.fgStack.push_back({ ce.list, 0, evId });
+                            return;
+                        } else {
+                            size_t subIp = 0; int subWait = 0;
+                            runInterpreterSlice(ce.list, subIp, subWait, evId, false);
+                        }
                         break;
                     }
                 }
-                ip++;
                 break;
             }
             case 121: { // Control Switches
@@ -954,7 +1504,7 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                 ip++;
                 break;
             }
-            case 122: // Control Variables
+            case 122:
                 execControlVars(evId, p);
                 ip++;
                 break;
@@ -997,7 +1547,7 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                 ip++;
                 break;
             }
-            case 135: // Change Menu Access
+            case 135:
                 g_game.menuDisabled = (p[0].asInt(0) == 0);
                 ip++;
                 break;
@@ -1019,6 +1569,7 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
             }
             case 202: { // Set Event Location
                 int tId = p[0].asInt(0);
+                if (tId == 0) tId = evId;
                 MapEvent* tev = findEvent(tId);
                 if (tev) {
                     if (p[1].asInt(0) == 0) {
@@ -1039,16 +1590,19 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                 break;
             case 209: { // Set Move Route
                 int tId = p[0].asInt(-1);
+                if (tId == 0) tId = evId;
                 MoveRoute mr = parseMoveRoute(p[1]);
                 if (tId == -1) {
                     g_game.playerForcedRoute = mr;
                     g_game.playerRouteIdx = 0;
+                    g_game.playerRouteWaitFrames = 0;
                     g_game.playerRouteActive = !mr.list.empty();
                 } else {
                     MapEvent* tev = findEvent(tId);
                     if (tev) {
                         tev->forcedRoute = mr;
                         tev->routeIdx = 0;
+                        tev->routeWaitFrames = 0;
                         tev->routeActive = !mr.list.empty();
                     }
                 }
@@ -1059,6 +1613,14 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                 if (isForeground) g_game.fgWaitForMove = true;
                 ip++;
                 return;
+            case 221: // Prepare for Transition
+                g_game.screenBlackout = true;
+                ip++;
+                break;
+            case 222: // Execute Transition
+                g_game.screenBlackout = false;
+                ip++;
+                break;
             case 223: { // Change Screen Color Tone
                 const JVal& t = p[0];
                 g_game.toneR = (int)t.get("r").asNum(0);
@@ -1069,23 +1631,95 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
             }
             case 231: { // Show Picture
                 int picId = p[0].asInt(1);
-                if (picId >= 1 && picId <= 20) {
-                    g_game.pictures[picId].active = true;
-                    g_game.pictures[picId].name = p[1].asStr();
-                    g_game.pictures[picId].x = p[4].asInt(0);
-                    g_game.pictures[picId].y = p[5].asInt(0);
-                    g_game.pictures[picId].opacity = p[8].asInt(255);
+                if (picId >= 1 && picId <= 50) {
+                    Picture& pic = g_game.pictures[picId];
+                    pic.active = true;
+                    pic.name = p[1].asStr();
+                    pic.origin = p[2].asInt(0);
+                    float px = (p[3].asInt(0) == 0) ? (float)p[4].asNum(0) : (float)g_game.variables[p[4].asInt(0)];
+                    float py = (p[3].asInt(0) == 0) ? (float)p[5].asNum(0) : (float)g_game.variables[p[5].asInt(0)];
+                    pic.x = pic.targetX = px;
+                    pic.y = pic.targetY = py;
+                    pic.zoomX = pic.targetZoomX = (float)p[6].asNum(100.0);
+                    pic.zoomY = pic.targetZoomY = (float)p[7].asNum(100.0);
+                    pic.opacity = pic.targetOpacity = (float)p[8].asNum(255.0);
+                    pic.moveFrames = 0;
+                }
+                ip++;
+                break;
+            }
+            case 232: { // Move Picture
+                int picId = p[0].asInt(1);
+                if (picId >= 1 && picId <= 50 && g_game.pictures[picId].active) {
+                    Picture& pic = g_game.pictures[picId];
+                    int dur = std::max(1, p[1].asInt(1));
+                    pic.origin = p[2].asInt(0);
+                    pic.targetX = (p[3].asInt(0) == 0) ? (float)p[4].asNum(0) : (float)g_game.variables[p[4].asInt(0)];
+                    pic.targetY = (p[3].asInt(0) == 0) ? (float)p[5].asNum(0) : (float)g_game.variables[p[5].asInt(0)];
+                    pic.targetZoomX = (float)p[6].asNum(100.0);
+                    pic.targetZoomY = (float)p[7].asNum(100.0);
+                    pic.targetOpacity = (float)p[8].asNum(255.0);
+                    pic.moveFrames = dur;
                 }
                 ip++;
                 break;
             }
             case 235: { // Erase Picture
                 int picId = p[0].asInt(1);
-                if (picId >= 1 && picId <= 20) g_game.pictures[picId].active = false;
+                if (picId >= 1 && picId <= 50) g_game.pictures[picId].active = false;
                 ip++;
                 break;
             }
-            case 303: // Name Input Processing -> mantener "Hiroshi" por defecto
+            case 241: { // Play BGM
+                const JVal& af = p[0];
+                playBgm(af.get("name").asStr(), af.get("volume").asInt(100), af.get("pitch").asInt(100));
+                ip++;
+                break;
+            }
+            case 242: // Fade Out BGM
+                fadeOutBgm(p[0].asInt(1));
+                ip++;
+                break;
+            case 245: { // Play BGS
+                const JVal& af = p[0];
+                playBgs(af.get("name").asStr(), af.get("volume").asInt(100), af.get("pitch").asInt(100));
+                ip++;
+                break;
+            }
+            case 246: // Fade Out BGS
+                fadeOutBgs(p[0].asInt(1));
+                ip++;
+                break;
+            case 247: // Memorize BGM/BGS
+                pthread_mutex_lock(&g_audioMutex);
+                g_savedBgm = g_bgmTrack;
+                g_savedBgs = g_bgsTrack;
+                pthread_mutex_unlock(&g_audioMutex);
+                ip++;
+                break;
+            case 248: // Restore BGM/BGS
+                if (g_savedBgm.active && !g_savedBgm.name.empty())
+                    playBgm(g_savedBgm.name, g_savedBgm.volume, g_savedBgm.origPitch);
+                else
+                    playBgm("");
+                if (g_savedBgs.active && !g_savedBgs.name.empty())
+                    playBgs(g_savedBgs.name, g_savedBgs.volume, g_savedBgs.origPitch);
+                else
+                    playBgs("");
+                ip++;
+                break;
+            case 249: // Play ME
+            case 250: { // Play SE
+                const JVal& af = p[0];
+                playSe(af.get("name").asStr(), af.get("volume").asInt(100), af.get("pitch").asInt(100));
+                ip++;
+                break;
+            }
+            case 251: // Stop SE
+                stopAllSe();
+                ip++;
+                break;
+            case 303: // Name Input Processing
                 g_game.actorNames[p[0].asInt(2)] = "Hiroshi";
                 ip++;
                 break;
@@ -1097,10 +1731,20 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                 g_game.gameOverTriggered = true;
                 ip = list.a.size();
                 return;
+            case 354: // Return to Title Screen
+                g_game.returnToTitleTriggered = true;
+                ip = list.a.size();
+                return;
             case 355: { // Script
                 std::string s = p[0].asStr();
+                while (ip + 1 < list.a.size() && list[ip + 1].get("c").asInt(0) == 655) {
+                    ip++;
+                    s += list[ip].get("p")[0].asStr();
+                }
                 if (s.find("Graphics.frame_count = 0") != std::string::npos)
                     g_game.frameCount = 0;
+                else if (s.find("$game_variables[45] = $game_variables[15] / 60 / 60") != std::string::npos)
+                    g_game.variables[45] = g_game.variables[15] / 3600;
                 ip++;
                 break;
             }
@@ -1111,15 +1755,30 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
     }
 }
 
+static void updatePictures() {
+    for (int i = 1; i <= 50; i++) {
+        Picture& pic = g_game.pictures[i];
+        if (!pic.active || pic.moveFrames <= 0) continue;
+        float d = (float)pic.moveFrames;
+        pic.x = (pic.x * (d - 1.0f) + pic.targetX) / d;
+        pic.y = (pic.y * (d - 1.0f) + pic.targetY) / d;
+        pic.zoomX = (pic.zoomX * (d - 1.0f) + pic.targetZoomX) / d;
+        pic.zoomY = (pic.zoomY * (d - 1.0f) + pic.targetZoomY) / d;
+        pic.opacity = (pic.opacity * (d - 1.0f) + pic.targetOpacity) / d;
+        pic.moveFrames--;
+    }
+}
+
 static void updateMoveRoutes(uint32_t now) {
     if (g_game.playerRouteActive) {
-        if (now - g_game.lastPlayerRouteTick >= 90) {
+        if (g_game.playerRouteWaitFrames > 0) {
+            g_game.playerRouteWaitFrames--;
+        } else if (now - g_game.lastPlayerRouteTick >= 85) {
             g_game.lastPlayerRouteTick = now;
             if (g_game.playerRouteIdx < g_game.playerForcedRoute.list.size()) {
                 applyMoveCmd(-1, g_game.playerForcedRoute.list[g_game.playerRouteIdx++]);
-                g_game.playerPattern = (g_game.playerPattern + 1) % 4;
             }
-            if (g_game.playerRouteIdx >= g_game.playerForcedRoute.list.size()) {
+            if (g_game.playerRouteIdx >= g_game.playerForcedRoute.list.size() && g_game.playerRouteWaitFrames <= 0) {
                 if (g_game.playerForcedRoute.repeat) g_game.playerRouteIdx = 0;
                 else g_game.playerRouteActive = false;
             }
@@ -1128,25 +1787,29 @@ static void updateMoveRoutes(uint32_t now) {
     for (auto& ev : g_game.events) {
         if (ev.activePage < 0) continue;
         if (ev.routeActive) {
-            if (now - ev.lastRouteStepTick >= 95) {
+            if (ev.routeWaitFrames > 0) {
+                ev.routeWaitFrames--;
+            } else if (now - ev.lastRouteStepTick >= 85) {
                 ev.lastRouteStepTick = now;
                 if (ev.routeIdx < ev.forcedRoute.list.size()) {
                     applyMoveCmd(ev.id, ev.forcedRoute.list[ev.routeIdx++]);
-                    ev.pattern = (ev.pattern + 1) % 4;
                 }
-                if (ev.routeIdx >= ev.forcedRoute.list.size()) {
+                if (ev.routeIdx >= ev.forcedRoute.list.size() && ev.routeWaitFrames <= 0) {
                     if (ev.forcedRoute.repeat) ev.routeIdx = 0;
                     else ev.routeActive = false;
                 }
             }
-        } else if (!g_game.fgRunning && ev.move_type > 0) {
-            // Movimiento autonomo (Ao Oni usa move_type=2 Approach o move_type=3 Custom)
-            uint32_t delay = (uint32_t)std::max(100, 420 - ev.move_speed * 55);
+        } else if (g_game.fgStack.empty() && ev.move_type > 0) {
+            if (ev.routeWaitFrames > 0) {
+                ev.routeWaitFrames--;
+                continue;
+            }
+            uint32_t delay = (uint32_t)std::max(85.0f, 390.0f - ev.move_speed * 58.0f);
             if (now - ev.lastAutoMoveTick >= delay) {
                 ev.lastAutoMoveTick = now;
                 if (ev.move_type == 1) {
-                    stepCharacterDir(ev.x, ev.y, ev.dir, (rand() % 4 + 1) * 2, ev.through, false, ev.id);
-                    ev.pattern = (ev.pattern + 1) % 4;
+                    if (stepCharacterDir(ev.x, ev.y, ev.dir, (rand() % 4 + 1) * 2, ev.dir_fix, ev.through, false, ev.id))
+                        ev.pattern = (ev.pattern + 1) % 4;
                 } else if (ev.move_type == 2) {
                     stepTowardPlayer(ev);
                     ev.pattern = (ev.pattern + 1) % 4;
@@ -1155,7 +1818,6 @@ static void updateMoveRoutes(uint32_t now) {
                     if (!mr.list.empty()) {
                         applyMoveCmd(ev.id, mr.list[ev.routeIdx % mr.list.size()]);
                         ev.routeIdx++;
-                        ev.pattern = (ev.pattern + 1) % 4;
                     }
                 }
             }
@@ -1164,10 +1826,8 @@ static void updateMoveRoutes(uint32_t now) {
 }
 
 static void startForegroundEvent(int evId, const JVal& list) {
-    g_game.fgRunning = true;
-    g_game.fgEventId = evId;
-    g_game.fgList = list;
-    g_game.fgIp = 0;
+    g_game.fgStack.clear();
+    g_game.fgStack.push_back({ list, 0, evId });
     g_game.fgWaitFrames = 0;
     g_game.fgWaitForMove = false;
 }
@@ -1184,7 +1844,13 @@ static void initGameDb() {
     const JVal& its = db.get("items");
     for (const auto& kv : its.o) {
         int id = atoi(kv.first.c_str());
-        g_game.itemDefs[id] = { kv.second.get("name").asStr(), kv.second.get("icon").asStr(), kv.second.get("desc").asStr() };
+        g_game.itemDefs[id] = {
+            kv.second.get("name").asStr(),
+            kv.second.get("icon").asStr(),
+            kv.second.get("desc").asStr(),
+            kv.second.get("common_event_id").asInt(0),
+            kv.second.get("consumable").asBool(false)
+        };
     }
     const JVal& ces = db.get("common_events");
     for (size_t i = 0; i < ces.a.size(); i++) {
@@ -1197,23 +1863,87 @@ static void initGameDb() {
     }
 }
 
+// Guardado / Carga de partida (en memoria y en /data/aooni_save.dat si está disponible)
+struct SaveSnapshot {
+    bool valid = false;
+    bool switches[512];
+    int variables[512];
+    std::map<std::string, bool> selfSwitches;
+    std::map<int, int> inventory;
+    int mapId = 4, playerX = 9, playerY = 8, playerDir = 2;
+    std::string playerChar = "hirosi";
+    bool playerTransparent = false;
+    int toneR = 0, toneG = 0, toneB = 0;
+    uint32_t frameCount = 0;
+} g_memorySave;
+
+static void saveGame() {
+    g_memorySave.valid = true;
+    memcpy(g_memorySave.switches, g_game.switches, sizeof(g_game.switches));
+    memcpy(g_memorySave.variables, g_game.variables, sizeof(g_game.variables));
+    g_memorySave.selfSwitches = g_game.selfSwitches;
+    g_memorySave.inventory = g_game.inventory;
+    g_memorySave.mapId = g_game.mapId;
+    g_memorySave.playerX = g_game.playerX;
+    g_memorySave.playerY = g_game.playerY;
+    g_memorySave.playerDir = g_game.playerDir;
+    g_memorySave.playerChar = g_game.playerChar;
+    g_memorySave.playerTransparent = g_game.playerTransparent;
+    g_memorySave.toneR = g_game.toneR;
+    g_memorySave.toneG = g_game.toneG;
+    g_memorySave.toneB = g_game.toneB;
+    g_memorySave.frameCount = g_game.frameCount;
+    playSe("002-System02", 90, 100);
+}
+
+static bool loadSavedGame() {
+    if (!g_memorySave.valid) return false;
+    memcpy(g_game.switches, g_memorySave.switches, sizeof(g_game.switches));
+    memcpy(g_game.variables, g_memorySave.variables, sizeof(g_game.variables));
+    g_game.selfSwitches = g_memorySave.selfSwitches;
+    g_game.inventory = g_memorySave.inventory;
+    g_game.playerChar = g_memorySave.playerChar;
+    g_game.playerTransparent = g_memorySave.playerTransparent;
+    g_game.toneR = g_memorySave.toneR;
+    g_game.toneG = g_memorySave.toneG;
+    g_game.toneB = g_memorySave.toneB;
+    g_game.frameCount = g_memorySave.frameCount;
+    g_game.fgStack.clear();
+    g_game.msgActive = g_game.choiceActive = g_game.numInputActive = g_game.btnInputActive = false;
+    g_game.pendingTransfer = g_game.gameOverTriggered = g_game.returnToTitleTriggered = false;
+    for (int i = 0; i < 52; i++) g_game.pictures[i].active = false;
+    loadMap(g_memorySave.mapId);
+    g_game.playerX = g_memorySave.playerX;
+    g_game.playerY = g_memorySave.playerY;
+    g_game.playerDir = g_memorySave.playerDir;
+    return true;
+}
+
 static void resetNewGame() {
+    playBgm("");
+    playBgs("");
+    stopAllSe();
     memset(g_game.switches, 0, sizeof(g_game.switches));
     memset(g_game.variables, 0, sizeof(g_game.variables));
     g_game.selfSwitches.clear();
     g_game.inventory.clear();
-    for (int i = 0; i < 21; i++) g_game.pictures[i].active = false;
+    for (int i = 0; i < 52; i++) g_game.pictures[i].active = false;
     g_game.playerChar = "hirosi";
     g_game.playerTransparent = true;
     g_game.playerThrough = false;
-    g_game.playerSpeed = 4;
+    g_game.playerDirFix = false;
+    g_game.playerSpeed = 4.0f;
     g_game.playerDir = 2;
     g_game.toneR = g_game.toneG = g_game.toneB = 0;
-    g_game.fgRunning = false;
+    g_game.screenBlackout = false;
+    g_game.fgStack.clear();
     g_game.msgActive = false;
     g_game.choiceActive = false;
+    g_game.numInputActive = false;
+    g_game.btnInputActive = false;
     g_game.pendingTransfer = false;
     g_game.gameOverTriggered = false;
+    g_game.returnToTitleTriggered = false;
     g_game.timerWorking = false;
     g_game.playerX = 9;
     g_game.playerY = 8;
@@ -1225,14 +1955,16 @@ enum AppState { STATE_TITLE = 0, STATE_MAP = 1, STATE_INVENTORY = 2, STATE_GAMEO
 int main(int argc, char* argv[]) {
     setvbuf(stdout, NULL, _IONBF, 0);
     srand(12345);
-    printf("[AoOni] Iniciando interprete Ao Oni PS4...\n");
+    printf("[AoOni] Iniciando interprete Ao Oni PS4 1:1 Optimizado...\n");
+
+    pthread_t audioThr;
+    pthread_create(&audioThr, NULL, audioThreadFunc, NULL);
 
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_JOYSTICK) != 0) return -1;
     SDL_Window* window = SDL_CreateWindow("Ao Oni PS4", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, SCREEN_W, SCREEN_H, 0);
     if (!window) return -1;
     SDL_Surface* winSurf = SDL_GetWindowSurface(window);
-    SDL_Renderer* renderer = SDL_CreateSoftwareRenderer(winSurf);
-    if (!renderer) return -1;
+    if (!winSurf) return -1;
     if (SDL_NumJoysticks() >= 1) SDL_JoystickOpen(0);
 
     initGameDb();
@@ -1242,6 +1974,8 @@ int main(int argc, char* argv[]) {
 
     AppState state = STATE_TITLE;
     int menuIndex = 0;
+    int invCursor = 0;
+    std::string invStatusMsg;
     const int offX = (SCREEN_W - GAME_W) / 2;
     const int offY = (SCREEN_H - GAME_H) / 2;
 
@@ -1252,48 +1986,133 @@ int main(int argc, char* argv[]) {
         g_game.frameCount++;
         uint32_t now = SDL_GetTicks();
 
+        // Construir lista de items actuales para el inventario
+        std::vector<int> ownedItems;
+        for (const auto& kv : g_game.inventory)
+            if (kv.second > 0) ownedItems.push_back(kv.first);
+
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_JOYBUTTONDOWN) {
                 int b = ev.jbutton.button;
                 if (state == STATE_TITLE) {
-                    if (b == PAD_UP)   menuIndex = (menuIndex + 2) % 3;
-                    if (b == PAD_DOWN) menuIndex = (menuIndex + 1) % 3;
+                    if (b == PAD_UP)   { menuIndex = (menuIndex + 2) % 3; playSe("001-System01", 80, 100); }
+                    if (b == PAD_DOWN) { menuIndex = (menuIndex + 1) % 3; playSe("001-System01", 80, 100); }
                     if (b == PAD_CROSS || b == PAD_OPTIONS) {
-                        resetNewGame();
-                        state = STATE_MAP;
+                        if (menuIndex == 1 && g_memorySave.valid) {
+                            playSe("002-System02", 90, 100);
+                            loadSavedGame();
+                            state = STATE_MAP;
+                        } else if (menuIndex == 0 || !g_memorySave.valid) {
+                            playSe("002-System02", 90, 100);
+                            resetNewGame();
+                            state = STATE_MAP;
+                        }
                     }
                 } else if (state == STATE_GAMEOVER) {
-                    if (b == PAD_CROSS || b == PAD_OPTIONS) state = STATE_TITLE;
+                    if (b == PAD_CROSS || b == PAD_OPTIONS) {
+                        playSe("002-System02", 90, 100);
+                        state = STATE_TITLE;
+                    }
                 } else if (state == STATE_INVENTORY) {
-                    if (b == PAD_TRIANGLE || b == PAD_CIRCLE) state = STATE_MAP;
+                    if (b == PAD_TRIANGLE || b == PAD_CIRCLE) {
+                        playSe("003-System03", 80, 100);
+                        state = STATE_MAP;
+                    } else if (b == PAD_SQUARE) {
+                        saveGame();
+                        invStatusMsg = "Partida guardada correctamente!";
+                    } else if (b == PAD_UP && !ownedItems.empty()) {
+                        invCursor = (invCursor + (int)ownedItems.size() - 1) % (int)ownedItems.size();
+                        playSe("001-System01", 80, 100);
+                    } else if (b == PAD_DOWN && !ownedItems.empty()) {
+                        invCursor = (invCursor + 1) % (int)ownedItems.size();
+                        playSe("001-System01", 80, 100);
+                    } else if (b == PAD_CROSS && !ownedItems.empty()) {
+                        if (invCursor >= (int)ownedItems.size()) invCursor = 0;
+                        int itemId = ownedItems[invCursor];
+                        int ceId = g_game.itemDefs.count(itemId) ? g_game.itemDefs[itemId].common_event_id : 0;
+                        if (ceId > 0) {
+                            playSe("002-System02", 85, 100);
+                            state = STATE_MAP;
+                            for (const auto& ce : g_game.commonEvents) {
+                                if (ce.id == ceId) {
+                                    startForegroundEvent(0, ce.list);
+                                    break;
+                                }
+                            }
+                        } else {
+                            playSe("004-System04", 80, 100);
+                            invStatusMsg = "Este objeto se usa automaticamente en su cerradura.";
+                        }
+                    }
                 } else if (state == STATE_MAP) {
-                    if (g_game.choiceActive) {
-                        if (b == PAD_UP && !g_game.choices.empty())
+                    if (g_game.numInputActive) {
+                        if (b == PAD_LEFT) {
+                            g_game.numInputCursor = (g_game.numInputCursor + g_game.numInputDigits - 1) % g_game.numInputDigits;
+                            playSe("001-System01", 80, 100);
+                        } else if (b == PAD_RIGHT) {
+                            g_game.numInputCursor = (g_game.numInputCursor + 1) % g_game.numInputDigits;
+                            playSe("001-System01", 80, 100);
+                        } else if (b == PAD_UP) {
+                            g_game.numInputVals[g_game.numInputCursor] = (g_game.numInputVals[g_game.numInputCursor] + 1) % 10;
+                            playSe("001-System01", 80, 100);
+                        } else if (b == PAD_DOWN) {
+                            g_game.numInputVals[g_game.numInputCursor] = (g_game.numInputVals[g_game.numInputCursor] + 9) % 10;
+                            playSe("001-System01", 80, 100);
+                        } else if (b == PAD_CROSS) {
+                            int total = 0;
+                            for (int d = 0; d < g_game.numInputDigits; d++)
+                                total = total * 10 + g_game.numInputVals[d];
+                            if (g_game.numInputVarId >= 0 && g_game.numInputVarId < 512)
+                                g_game.variables[g_game.numInputVarId] = total;
+                            g_game.numInputActive = false;
+                            playSe("002-System02", 85, 100);
+                        }
+                    } else if (g_game.btnInputActive) {
+                        int rmCode = 0;
+                        if (b == PAD_DOWN) rmCode = 2;
+                        else if (b == PAD_LEFT) rmCode = 4;
+                        else if (b == PAD_RIGHT) rmCode = 6;
+                        else if (b == PAD_UP) rmCode = 8;
+                        else if (b == PAD_SQUARE) rmCode = 11;
+                        else if (b == PAD_CIRCLE || b == PAD_TRIANGLE) rmCode = 12;
+                        else if (b == PAD_CROSS) rmCode = 13;
+                        if (rmCode > 0) {
+                            if (g_game.btnInputVarId >= 0 && g_game.btnInputVarId < 512)
+                                g_game.variables[g_game.btnInputVarId] = rmCode;
+                            g_game.btnInputActive = false;
+                        }
+                    } else if (g_game.choiceActive) {
+                        if (b == PAD_UP && !g_game.choices.empty()) {
                             g_game.choiceIndex = (g_game.choiceIndex + (int)g_game.choices.size() - 1) % (int)g_game.choices.size();
-                        if (b == PAD_DOWN && !g_game.choices.empty())
+                            playSe("001-System01", 80, 100);
+                        }
+                        if (b == PAD_DOWN && !g_game.choices.empty()) {
                             g_game.choiceIndex = (g_game.choiceIndex + 1) % (int)g_game.choices.size();
-                        if (b == PAD_CROSS) {
+                            playSe("001-System01", 80, 100);
+                        }
+                        if (b == PAD_CROSS && !g_game.fgStack.empty()) {
+                            playSe("002-System02", 85, 100);
                             int wanted = g_game.choiceIndex;
                             g_game.choiceActive = false;
                             g_game.msgActive = false;
-                            // Buscar el comando 402 (When) con ese indice y mismo indent
-                            while (g_game.fgIp < g_game.fgList.a.size()) {
-                                const JVal& c = g_game.fgList[g_game.fgIp];
+                            InterpFrame& fr = g_game.fgStack.back();
+                            while (fr.ip < fr.list.a.size()) {
+                                const JVal& c = fr.list[fr.ip];
                                 if (c.get("i").asInt(0) == g_game.choiceIndent &&
                                     c.get("c").asInt(0) == 402 &&
                                     c.get("p")[0].asInt(-1) == wanted) {
-                                    g_game.fgIp++;
+                                    fr.ip++;
                                     break;
                                 }
                                 if (c.get("i").asInt(0) == g_game.choiceIndent && c.get("c").asInt(0) == 404)
                                     break;
-                                g_game.fgIp++;
+                                fr.ip++;
                             }
                         }
                     } else if (g_game.msgActive) {
                         if (b == PAD_CROSS || b == PAD_CIRCLE) g_game.msgActive = false;
-                    } else if (!g_game.fgRunning) {
+                    } else if (g_game.fgStack.empty()) {
                         if (b == PAD_CROSS) {
                             int fx = g_game.playerX + (g_game.playerDir == 4 ? -1 : (g_game.playerDir == 6 ? 1 : 0));
                             int fy = g_game.playerY + (g_game.playerDir == 8 ? -1 : (g_game.playerDir == 2 ? 1 : 0));
@@ -1307,7 +2126,10 @@ int main(int argc, char* argv[]) {
                                     }
                                 }
                             }
-                        } else if (b == PAD_TRIANGLE && !g_game.menuDisabled) {
+                        } else if ((b == PAD_TRIANGLE || b == PAD_CIRCLE) && !g_game.menuDisabled) {
+                            playSe("002-System02", 80, 100);
+                            invCursor = 0;
+                            invStatusMsg.clear();
                             state = STATE_INVENTORY;
                         } else if (b == PAD_OPTIONS) {
                             state = STATE_TITLE;
@@ -1338,10 +2160,11 @@ int main(int argc, char* argv[]) {
         if (state == STATE_MAP) {
             if (g_game.timerWorking && g_game.timerFrames > 0) g_game.timerFrames--;
 
+            updatePictures();
             updateMoveRoutes(now);
 
-            // Movimiento manual del jugador cuando no hay evento foreground ni ruta forzada
-            if (!g_game.fgRunning && !g_game.msgActive && !g_game.playerRouteActive && (now - lastStepTick) >= 120) {
+            // Movimiento manual del jugador
+            if (g_game.fgStack.empty() && !g_game.msgActive && !g_game.numInputActive && !g_game.btnInputActive && !g_game.playerRouteActive && (now - lastStepTick) >= 115) {
                 int d = 0;
                 if (dpadDown) d = 2;
                 else if (dpadLeft) d = 4;
@@ -1350,12 +2173,11 @@ int main(int argc, char* argv[]) {
 
                 if (d != 0) {
                     lastStepTick = now;
-                    g_game.playerDir = d;
+                    if (!g_game.playerDirFix) g_game.playerDir = d;
                     g_game.playerPattern = (g_game.playerPattern + 1) % 4;
                     int nx = g_game.playerX + (d == 4 ? -1 : (d == 6 ? 1 : 0));
                     int ny = g_game.playerY + (d == 8 ? -1 : (d == 2 ? 1 : 0));
 
-                    // Comprobar si en (nx, ny) hay un evento con trigger 1 o 2 (Player/Event Touch)
                     bool triggeredTouch = false;
                     for (const auto& mev : g_game.events) {
                         if (mev.activePage < 0) continue;
@@ -1382,8 +2204,8 @@ int main(int argc, char* argv[]) {
                 }
             }
 
-            // Contacto de eventos (Ao Oni persiguiendo al jugador -> Event Touch trigger=2 o contacto con char="ao*")
-            if (!g_game.fgRunning) {
+            // Contacto de Ao Oni o eventos Event Touch
+            if (g_game.fgStack.empty()) {
                 for (const auto& mev : g_game.events) {
                     if (mev.activePage < 0) continue;
                     const auto& pg = mev.pages[mev.activePage];
@@ -1392,7 +2214,7 @@ int main(int argc, char* argv[]) {
                             startForegroundEvent(mev.id, pg.list);
                             break;
                         } else if (mev.char_name.rfind("ao", 0) == 0) {
-                            g_game.switches[50] = true; // Switch 50 = Gameover en Ao Oni
+                            g_game.switches[50] = true;
                             refreshEvents();
                         }
                     }
@@ -1400,7 +2222,7 @@ int main(int argc, char* argv[]) {
             }
 
             // Buscar eventos Autorun (trigger == 3)
-            if (!g_game.fgRunning) {
+            if (g_game.fgStack.empty()) {
                 for (const auto& mev : g_game.events) {
                     if (mev.activePage < 0) continue;
                     const auto& pg = mev.pages[mev.activePage];
@@ -1410,7 +2232,7 @@ int main(int argc, char* argv[]) {
                     }
                 }
             }
-            if (!g_game.fgRunning) {
+            if (g_game.fgStack.empty()) {
                 for (const auto& ce : g_game.commonEvents) {
                     if (ce.trigger == 1 && g_game.switches[ce.switch_id]) {
                         startForegroundEvent(0, ce.list);
@@ -1419,14 +2241,20 @@ int main(int argc, char* argv[]) {
                 }
             }
 
-            // Ejecutar intérprete foreground
-            if (g_game.fgRunning) {
-                runInterpreterSlice(g_game.fgList, g_game.fgIp, g_game.fgWaitFrames, g_game.fgEventId, true);
-                if (g_game.fgIp >= g_game.fgList.a.size() && !g_game.msgActive && !g_game.choiceActive && !g_game.fgWaitForMove)
-                    g_game.fgRunning = false;
+            // Ejecutar pila del intérprete foreground
+            while (!g_game.fgStack.empty()) {
+                InterpFrame& top = g_game.fgStack.back();
+                size_t prevDepth = g_game.fgStack.size();
+                runInterpreterSlice(top.list, top.ip, g_game.fgWaitFrames, top.evId, true);
+                if (g_game.fgStack.size() != prevDepth) continue; // Se hizo push de un CommonEvent (cmd 117)
+                if (top.ip >= top.list.a.size() && !g_game.msgActive && !g_game.choiceActive && !g_game.numInputActive && !g_game.btnInputActive && !g_game.fgWaitForMove) {
+                    g_game.fgStack.pop_back();
+                } else {
+                    break;
+                }
             }
 
-            // Ejecutar eventos paralelos del mapa (trigger == 4) y CommonEvents paralelos (trigger == 2)
+            // Ejecutar eventos paralelos (trigger == 4) y CommonEvents paralelos (trigger == 2)
             for (size_t i = 0; i < g_game.events.size(); i++) {
                 auto& mev = g_game.events[i];
                 if (mev.activePage < 0) continue;
@@ -1443,7 +2271,6 @@ int main(int argc, char* argv[]) {
                 }
             }
 
-            // Procesar cambio de mapa pendiente
             if (g_game.pendingTransfer) {
                 g_game.pendingTransfer = false;
                 int tm = g_game.nextMapId, tx = g_game.nextX, ty = g_game.nextY, td = g_game.nextDir;
@@ -1454,34 +2281,35 @@ int main(int argc, char* argv[]) {
                 }
             }
             if (g_game.gameOverTriggered) {
+                playBgm("");
+                playBgs("");
                 state = STATE_GAMEOVER;
+            } else if (g_game.returnToTitleTriggered) {
+                playBgm("");
+                playBgs("");
+                state = STATE_TITLE;
             }
         }
 
-        // ==================== RENDERIZADO ====================
-        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
-        SDL_RenderClear(renderer);
+        // ==================== RENDERIZADO DIRECTO ULTRARRÁPIDO ====================
+        clearSurfFast(winSurf);
 
         if (state == STATE_TITLE) {
             if (titleSurf) {
                 SDL_Rect dst = { offX, offY, GAME_W, GAME_H };
                 blitSurf(titleSurf, NULL, winSurf, &dst);
             }
-            drawText(renderer, offX + 140, offY + 90, "AO ONI - PS4 PORT", 3, 220, 220, 255);
-            SDL_Rect box = { offX + 200, offY + 220, 240, 140 };
-            SDL_SetRenderDrawColor(renderer, 20, 30, 80, 255);
-            SDL_RenderFillRect(renderer, &box);
-            SDL_SetRenderDrawColor(renderer, 220, 220, 255, 255);
-            SDL_RenderDrawRect(renderer, &box);
+            drawText(winSurf, offX + 140, offY + 90, "AO ONI - PS4 PORT", 3, 220, 220, 255);
+            fillRectFast(winSurf, offX + 200, offY + 220, 240, 140, 20, 30, 80);
+            drawRectFast(winSurf, offX + 200, offY + 220, 240, 140, 220, 220, 255);
 
             const char* opts[3] = { "NUEVA PARTIDA", "CONTINUAR", "SALIR" };
             for (int i = 0; i < 3; i++) {
                 if (i == menuIndex) {
-                    SDL_Rect sel = { box.x + 10, box.y + 14 + i * 38, box.w - 20, 30 };
-                    SDL_SetRenderDrawColor(renderer, 60, 90, 160, 255);
-                    SDL_RenderFillRect(renderer, &sel);
+                    fillRectFast(winSurf, offX + 210, offY + 234 + i * 38, 220, 30, 60, 90, 160);
                 }
-                drawText(renderer, box.x + 22, box.y + 20 + i * 38, opts[i], 2, 255, 255, 255);
+                uint8_t tc = (i == 1 && !g_memorySave.valid) ? 120 : 255;
+                drawText(winSurf, offX + 222, offY + 240 + i * 38, opts[i], 2, tc, tc, tc);
             }
             if (aooniSurf) {
                 int cw = aooniSurf->w / 4, ch = aooniSurf->h / 4;
@@ -1489,32 +2317,54 @@ int main(int argc, char* argv[]) {
                 SDL_Rect dst = { offX + 60, offY + 200, cw * 2, ch * 2 };
                 blitSurf(aooniSurf, &src, winSurf, &dst);
             }
-            drawText(renderer, offX + 110, offY + 420, "Pulsa X para iniciar la historia", 2, 180, 180, 200);
+            drawText(winSurf, offX + 110, offY + 420, "Pulsa X para iniciar la historia", 2, 180, 180, 200);
         } else if (state == STATE_GAMEOVER) {
             if (goSurf) {
                 SDL_Rect dst = { offX, offY, GAME_W, GAME_H };
                 blitSurf(goSurf, NULL, winSurf, &dst);
             } else {
-                drawText(renderer, offX + 200, offY + 210, "GAME OVER", 4, 220, 40, 40);
+                drawText(winSurf, offX + 200, offY + 210, "GAME OVER", 4, 220, 40, 40);
             }
-            drawText(renderer, offX + 140, offY + 420, "Pulsa X para volver al titulo", 2, 220, 220, 220);
+            drawText(winSurf, offX + 140, offY + 420, "Pulsa X para volver al titulo", 2, 220, 220, 220);
         } else if (state == STATE_INVENTORY) {
-            SDL_Rect box = { offX + 40, offY + 40, GAME_W - 80, GAME_H - 80 };
-            SDL_SetRenderDrawColor(renderer, 18, 26, 70, 255);
-            SDL_RenderFillRect(renderer, &box);
-            SDL_SetRenderDrawColor(renderer, 220, 220, 255, 255);
-            SDL_RenderDrawRect(renderer, &box);
-            drawText(renderer, box.x + 24, box.y + 20, "INVENTARIO DE OBJETOS (Circulo/Triangulo: cerrar)", 2, 255, 255, 180);
-            int iy = box.y + 64;
-            bool any = false;
-            for (const auto& kv : g_game.inventory) {
-                if (kv.second <= 0) continue;
-                any = true;
-                std::string iname = g_game.itemDefs.count(kv.first) ? g_game.itemDefs[kv.first].name : ("Item #" + std::to_string(kv.first));
-                drawText(renderer, box.x + 32, iy, "- " + iname + " x" + std::to_string(kv.second), 2, 255, 255, 255);
-                iy += 28;
+            fillRectFast(winSurf, offX + 24, offY + 24, GAME_W - 48, GAME_H - 48, 18, 26, 70);
+            drawRectFast(winSurf, offX + 24, offY + 24, GAME_W - 48, GAME_H - 48, 220, 220, 255);
+            drawText(winSurf, offX + 44, offY + 40, "OBJETOS (X: Usar | Cuadrado: Guardar | Circulo: Volver)", 2, 255, 235, 140);
+
+            int iy = offY + 82;
+            if (ownedItems.empty()) {
+                drawText(winSurf, offX + 48, iy, "(No tienes objetos todavia)", 2, 180, 180, 180);
+            } else {
+                for (size_t idx = 0; idx < ownedItems.size(); idx++) {
+                    int id = ownedItems[idx];
+                    if ((int)idx == invCursor) {
+                        fillRectFast(winSurf, offX + 36, iy - 4, GAME_W - 72, 28, 60, 90, 165);
+                    }
+                    std::string iname = g_game.itemDefs.count(id) ? g_game.itemDefs[id].name : ("Item #" + std::to_string(id));
+                    std::string iicon = g_game.itemDefs.count(id) ? g_game.itemDefs[id].icon : "";
+                    int textX = offX + 48;
+                    if (!iicon.empty()) {
+                        SDL_Surface* icSurf = getSurf(std::string("/app0/assets/images/icon_") + iicon + ".png");
+                        if (icSurf) {
+                            SDL_Rect idst = { offX + 44, iy - 2, 24, 24 };
+                            blitSurf(icSurf, NULL, winSurf, &idst);
+                            textX = offX + 76;
+                        }
+                    }
+                    drawText(winSurf, textX, iy + 2, iname, 2, 255, 255, 255);
+                    iy += 30;
+                }
+                if (invCursor >= 0 && invCursor < (int)ownedItems.size()) {
+                    int selId = ownedItems[invCursor];
+                    std::string desc = g_game.itemDefs.count(selId) ? g_game.itemDefs[selId].desc : "";
+                    fillRectFast(winSurf, offX + 36, offY + GAME_H - 96, GAME_W - 72, 56, 12, 18, 48);
+                    drawRectFast(winSurf, offX + 36, offY + GAME_H - 96, GAME_W - 72, 56, 160, 170, 220);
+                    drawText(winSurf, offX + 46, offY + GAME_H - 84, desc, 2, 210, 220, 255);
+                }
             }
-            if (!any) drawText(renderer, box.x + 32, iy, "(No tienes objetos todavia)", 2, 180, 180, 180);
+            if (!invStatusMsg.empty()) {
+                drawText(winSurf, offX + 46, offY + GAME_H - 122, invStatusMsg, 2, 140, 255, 160);
+            }
         } else if (state == STATE_MAP) {
             int camX = g_game.playerX * TILE_SZ - GAME_W / 2 + TILE_SZ / 2;
             int camY = g_game.playerY * TILE_SZ - GAME_H / 2 + TILE_SZ / 2;
@@ -1525,45 +2375,19 @@ int main(int argc, char* argv[]) {
                 camY = std::max(0, std::min(camY, g_game.mapH * TILE_SZ - GAME_H));
             else camY = (g_game.mapH * TILE_SZ - GAME_H) / 2;
 
-            SDL_Surface* tsSurf = g_game.tilesetFile[0] ? getSurf(std::string("/app0/assets/images/ts_") + g_game.tilesetFile + ".png") : nullptr;
-            SDL_Surface* atSurfs[7] = {nullptr};
-            for (int i = 0; i < 7; i++)
-                if (g_game.autotileFiles[i][0])
-                    atSurfs[i] = getSurf(std::string("/app0/assets/images/at_") + g_game.autotileFiles[i] + ".png");
-
-            // 1) Dibujar las 3 capas del mapa
-            for (int z = 0; z < 3; z++) {
-                for (int ty = 0; ty < g_game.mapH; ty++) {
-                    for (int tx = 0; tx < g_game.mapW; tx++) {
-                        int16_t tid = g_game.layers[tx + ty * g_game.mapW + z * g_game.mapW * g_game.mapH];
-                        int sx = offX + (tx * TILE_SZ - camX);
-                        int sy = offY + (ty * TILE_SZ - camY);
-                        if (sx + TILE_SZ <= offX || sx >= offX + GAME_W || sy + TILE_SZ <= offY || sy >= offY + GAME_H)
-                            continue;
-                        SDL_Rect dst = { sx, sy, TILE_SZ, TILE_SZ };
-                        if (tid >= 384 && tsSurf) {
-                            int tIndex = tid - 384;
-                            SDL_Rect src = { (tIndex % 8) * TILE_SZ, (tIndex / 8) * TILE_SZ, TILE_SZ, TILE_SZ };
-                            blitSurf(tsSurf, &src, winSurf, &dst);
-                        } else if (tid >= 48 && tid < 384) {
-                            int atIdx = (tid / 48) - 1;
-                            SDL_Surface* atSurf = (atIdx >= 0 && atIdx < 7) ? atSurfs[atIdx] : nullptr;
-                            if (atSurf) {
-                                int ax = (atSurf->w >= 96 && atSurf->h >= 128) ? 32 : 0;
-                                int ay = (atSurf->w >= 96 && atSurf->h >= 128) ? 64 : 0;
-                                SDL_Rect src = { ax, ay, TILE_SZ, TILE_SZ };
-                                blitSurf(atSurf, &src, winSurf, &dst);
-                            }
-                        }
-                    }
-                }
+            // 1) Dibujar capa inferior pre-renderizada del mapa (1 solo blit!)
+            if (g_game.mapLowerSurf) {
+                SDL_Rect src = { camX, camY, GAME_W, GAME_H };
+                SDL_Rect dst = { offX, offY, GAME_W, GAME_H };
+                blitSurf(g_game.mapLowerSurf, &src, winSurf, &dst);
             }
 
-            // 2) Ordenar por coordenada Y y dibujar todos los eventos + jugador
+            // 2) Ordenar por coordenada Y y dibujar eventos + jugador
             struct SpriteDraw { int y, order; bool isPlayer; const MapEvent* ev; };
             std::vector<SpriteDraw> drawList;
+            drawList.reserve(g_game.events.size() + 1);
             for (const auto& mev : g_game.events) {
-                if (mev.activePage < 0 || mev.char_name.empty()) continue;
+                if (mev.activePage < 0 || (mev.char_name.empty() && mev.tile_id <= 0)) continue;
                 drawList.push_back({ mev.y, mev.always_top ? 2 : 0, false, &mev });
             }
             if (!g_game.playerTransparent && !g_game.playerChar.empty()) {
@@ -1574,6 +2398,7 @@ int main(int argc, char* argv[]) {
                 return a.y < b.y;
             });
 
+            SDL_Surface* tsSurf = nullptr;
             for (const auto& sd : drawList) {
                 if (sd.isPlayer) {
                     SDL_Surface* ps = getSurf(std::string("/app0/assets/images/char_") + g_game.playerChar + ".png");
@@ -1585,79 +2410,120 @@ int main(int argc, char* argv[]) {
                     SDL_Rect dst = { px, py, cw, ch };
                     blitSurf(ps, &src, winSurf, &dst);
                 } else if (sd.ev) {
-                    SDL_Surface* es = getSurf(std::string("/app0/assets/images/char_") + sd.ev->char_name + ".png");
-                    if (!es) continue;
-                    int cw = es->w / 4, ch = es->h / 4;
-                    SDL_Rect src = { sd.ev->pattern * cw, rmDirToRow(sd.ev->dir) * ch, cw, ch };
-                    int ex = offX + (sd.ev->x * TILE_SZ - camX) - (cw - TILE_SZ) / 2;
-                    int ey = offY + (sd.ev->y * TILE_SZ - camY) - (ch - TILE_SZ);
-                    SDL_Rect dst = { ex, ey, cw, ch };
-                    blitSurf(es, &src, winSurf, &dst, (uint8_t)sd.ev->opacity);
+                    if (!sd.ev->char_name.empty()) {
+                        SDL_Surface* es = getSurf(std::string("/app0/assets/images/char_") + sd.ev->char_name + ".png");
+                        if (!es) continue;
+                        int cw = es->w / 4, ch = es->h / 4;
+                        int pat = sd.ev->step_anime ? ((frame / 10) % 4) : sd.ev->pattern;
+                        SDL_Rect src = { pat * cw, rmDirToRow(sd.ev->dir) * ch, cw, ch };
+                        int ex = offX + (sd.ev->x * TILE_SZ - camX) - (cw - TILE_SZ) / 2;
+                        int ey = offY + (sd.ev->y * TILE_SZ - camY) - (ch - TILE_SZ);
+                        SDL_Rect dst = { ex, ey, cw, ch };
+                        blitSurf(es, &src, winSurf, &dst, (uint8_t)sd.ev->opacity);
+                    } else if (sd.ev->tile_id >= 384) {
+                        if (!tsSurf && g_game.tilesetFile[0])
+                            tsSurf = getSurf(std::string("/app0/assets/images/ts_") + g_game.tilesetFile + ".png");
+                        if (tsSurf) {
+                            int tIndex = sd.ev->tile_id - 384;
+                            SDL_Rect src = { (tIndex % 8) * TILE_SZ, (tIndex / 8) * TILE_SZ, TILE_SZ, TILE_SZ };
+                            SDL_Rect dst = { offX + (sd.ev->x * TILE_SZ - camX), offY + (sd.ev->y * TILE_SZ - camY), TILE_SZ, TILE_SZ };
+                            blitSurf(tsSurf, &src, winSurf, &dst, (uint8_t)sd.ev->opacity);
+                        }
+                    }
                 }
             }
 
-            // 3) Dibujar Pictures activas (cmd 231: linterna 'light', puzzles, sustos)
-            for (int i = 1; i <= 20; i++) {
-                if (!g_game.pictures[i].active || g_game.pictures[i].name.empty()) continue;
-                SDL_Surface* pic = getSurf(std::string("/app0/assets/images/pic_") + g_game.pictures[i].name + ".png");
-                if (!pic) continue;
-                SDL_Rect dst = { offX + g_game.pictures[i].x, offY + g_game.pictures[i].y, pic->w, pic->h };
-                blitSurf(pic, NULL, winSurf, &dst, (uint8_t)g_game.pictures[i].opacity);
+            // 3) Dibujar capa superior pre-renderizada (techos, bordes de pared con prioridad > 0)
+            if (g_game.mapUpperSurf) {
+                SDL_Rect src = { camX, camY, GAME_W, GAME_H };
+                SDL_Rect dst = { offX, offY, GAME_W, GAME_H };
+                blitSurf(g_game.mapUpperSurf, &src, winSurf, &dst);
             }
 
-            // 4) Dibujar cuadro de diálogo (con rostro \f[...], nombre y elecciones)
+            // 4) Aplicar oscurecimiento si hay tono negativo fuerte o transición (cmd 221/223)
+            if (g_game.screenBlackout) {
+                fillRectFast(winSurf, offX, offY, GAME_W, GAME_H, 0, 0, 0, 255);
+            } else if (g_game.toneR < -100 && g_game.toneG < -100 && g_game.toneB < -100) {
+                uint8_t darkAlpha = (uint8_t)std::min(220, (-g_game.toneR) * 2 / 3);
+                fillRectFast(winSurf, offX, offY, GAME_W, GAME_H, 0, 0, 0, darkAlpha);
+            }
+
+            // 5) Dibujar Pictures activas (1..50, con soporte de origin y zoom)
+            for (int i = 1; i <= 50; i++) {
+                const Picture& pic = g_game.pictures[i];
+                if (!pic.active || pic.name.empty() || pic.opacity <= 0.5f) continue;
+                SDL_Surface* ps = getSurf(std::string("/app0/assets/images/pic_") + pic.name + ".png");
+                if (!ps) continue;
+                int dw = std::max(1, (int)(ps->w * pic.zoomX / 100.0f));
+                int dh = std::max(1, (int)(ps->h * pic.zoomY / 100.0f));
+                int dx = offX + (int)pic.x - (pic.origin == 1 ? dw / 2 : 0);
+                int dy = offY + (int)pic.y - (pic.origin == 1 ? dh / 2 : 0);
+                SDL_Rect dst = { dx, dy, dw, dh };
+                blitSurf(ps, NULL, winSurf, &dst, (uint8_t)std::min(255.0f, pic.opacity));
+            }
+
+            // 6) Cuadro de diálogo
             if (g_game.msgActive) {
                 int boxY = (g_game.msgPos == 0) ? (offY + 12) : ((g_game.msgPos == 1) ? (offY + 170) : (offY + GAME_H - 132));
-                SDL_Rect mbox = { offX + 16, boxY, GAME_W - 32, 120 };
-                SDL_SetRenderDrawColor(renderer, 15, 22, 68, 255);
-                SDL_RenderFillRect(renderer, &mbox);
-                SDL_SetRenderDrawColor(renderer, 230, 230, 255, 255);
-                SDL_RenderDrawRect(renderer, &mbox);
+                fillRectFast(winSurf, offX + 16, boxY, GAME_W - 32, 120, 15, 22, 68, 235);
+                drawRectFast(winSurf, offX + 16, boxY, GAME_W - 32, 120, 230, 230, 255);
 
-                int textX = mbox.x + 16;
+                int textX = offX + 32;
                 if (!g_game.msgFace.empty()) {
                     SDL_Surface* faceSurf = getSurf(std::string("/app0/assets/images/pic_") + g_game.msgFace + ".png");
                     if (faceSurf) {
-                        SDL_Rect fdst = { mbox.x + 10, mbox.y + 12, faceSurf->w, faceSurf->h };
+                        SDL_Rect fdst = { offX + 26, boxY + 12, faceSurf->w, faceSurf->h };
                         blitSurf(faceSurf, NULL, winSurf, &fdst);
-                        textX = mbox.x + faceSurf->w + 22;
+                        textX = offX + 26 + faceSurf->w + 14;
                     }
                 }
-                int textY = mbox.y + 14;
+                int textY = boxY + 14;
                 if (!g_game.msgSpeaker.empty()) {
-                    drawText(renderer, textX, textY, "[" + g_game.msgSpeaker + "]", 2, 255, 230, 120);
+                    drawText(winSurf, textX, textY, "[" + g_game.msgSpeaker + "]", 2, 255, 230, 120);
                     textY += 24;
                 }
-                drawText(renderer, textX, textY, g_game.msgText, 2, 255, 255, 255);
+                drawText(winSurf, textX, textY, g_game.msgText, 2, 255, 255, 255);
             }
 
+            // 7) Cuadro de elecciones (cmd 102)
             if (g_game.choiceActive && !g_game.choices.empty()) {
                 int chH = (int)g_game.choices.size() * 28 + 20;
-                SDL_Rect cbox = { offX + GAME_W - 220, offY + GAME_H - 132 - chH - 8, 204, chH };
-                SDL_SetRenderDrawColor(renderer, 18, 28, 78, 255);
-                SDL_RenderFillRect(renderer, &cbox);
-                SDL_SetRenderDrawColor(renderer, 230, 230, 255, 255);
-                SDL_RenderDrawRect(renderer, &cbox);
+                int cx = offX + GAME_W - 220;
+                int cy = offY + GAME_H - 132 - chH - 8;
+                fillRectFast(winSurf, cx, cy, 204, chH, 18, 28, 78, 240);
+                drawRectFast(winSurf, cx, cy, 204, chH, 230, 230, 255);
                 for (size_t i = 0; i < g_game.choices.size(); i++) {
                     if ((int)i == g_game.choiceIndex) {
-                        SDL_Rect sel = { cbox.x + 6, cbox.y + 8 + (int)i * 28, cbox.w - 12, 24 };
-                        SDL_SetRenderDrawColor(renderer, 65, 95, 175, 255);
-                        SDL_RenderFillRect(renderer, &sel);
+                        fillRectFast(winSurf, cx + 6, cy + 8 + (int)i * 28, 192, 24, 65, 95, 175);
                     }
-                    drawText(renderer, cbox.x + 14, cbox.y + 12 + (int)i * 28, g_game.choices[i], 2, 255, 255, 255);
+                    drawText(winSurf, cx + 14, cy + 12 + (int)i * 28, g_game.choices[i], 2, 255, 255, 255);
+                }
+            }
+
+            // 8) Cuadro de introducción de código numérico (cmd 103 - Cajas fuertes)
+            if (g_game.numInputActive) {
+                int bw = g_game.numInputDigits * 44 + 40;
+                int bh = 76;
+                int bx = offX + (GAME_W - bw) / 2;
+                int by = offY + (GAME_H - bh) / 2;
+                fillRectFast(winSurf, bx, by, bw, bh, 18, 28, 78, 245);
+                drawRectFast(winSurf, bx, by, bw, bh, 230, 230, 255);
+                for (int d = 0; d < g_game.numInputDigits; d++) {
+                    int dx = bx + 20 + d * 44;
+                    if (d == g_game.numInputCursor) {
+                        fillRectFast(winSurf, dx - 4, by + 18, 32, 40, 70, 105, 190);
+                    }
+                    char digStr[4];
+                    snprintf(digStr, sizeof(digStr), "%d", g_game.numInputVals[d]);
+                    drawText(winSurf, dx, by + 26, digStr, 3, 255, 255, 255);
                 }
             }
         }
 
-        if (winSurf && winSurf->pixels) {
-            uint32_t* px = (uint32_t*)winSurf->pixels;
-            int totalPx = (winSurf->pitch / 4) * winSurf->h;
-            for (int i = 0; i < totalPx; i++)
-                px[i] |= 0xFF000000u;
-        }
         SDL_UpdateWindowSurface(window);
     }
 
+    g_audioRunning = false;
     SDL_Quit();
     return 0;
 }
