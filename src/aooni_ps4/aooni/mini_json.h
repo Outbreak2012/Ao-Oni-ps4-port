@@ -139,3 +139,4 @@ inline bool loadJsonFile(const char* path, JVal& out) {
     out = parser.parseVal();
     return true;
 }
+
