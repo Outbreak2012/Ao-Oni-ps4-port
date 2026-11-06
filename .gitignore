@@ -1,0 +1,6 @@
+﻿game/
+*.pkg
+*.exe
+*.dll
+build/
+out/
