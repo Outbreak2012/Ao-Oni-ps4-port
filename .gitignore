@@ -5,3 +5,8 @@
 build/
 out/
 Ao Oni/
+PS4Toolchain/
+src/hello_test/*.pkg
+src/hello_test/eboot.bin
+src/hello_test/pkg.gp4
+src/hello_test/hello_world/x64/
