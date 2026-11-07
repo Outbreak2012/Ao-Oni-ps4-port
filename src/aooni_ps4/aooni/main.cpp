@@ -1008,6 +1008,7 @@ struct InterpFrame {
     JVal list;
     size_t ip = 0;
     int evId = 0;
+    int mapId = 0;
 };
 
 struct GameRuntime {
@@ -1280,7 +1281,7 @@ static bool stepCharacterDir(int& x, int& y, int& dir, int d, bool dirFix, bool 
             } else if (g_game.fgStack.empty() && !g_game.pendingTransfer) {
                 const auto& pg = selfEv->pages[selfEv->activePage];
                 if (pg.trigger == 2 && pg.list.a.size() > 1) {
-                    g_game.fgStack.push_back({ pg.list, 0, selfEv->id });
+                    g_game.fgStack.push_back({ pg.list, 0, selfEv->id, g_game.mapId });
                     g_game.fgWaitFrames = 0;
                     g_game.fgWaitForMove = false;
                 }
@@ -1585,6 +1586,31 @@ static bool loadMap(int mapId) {
     }
     refreshEvents();
     buildMapCacheSurfaces();
+
+    // Limpiar marcos residuales de mapas previos que ya solo tenían el marcador final {"c":0}
+    while (!g_game.fgStack.empty()) {
+        InterpFrame& top = g_game.fgStack.back();
+        while (top.ip < top.list.a.size() && top.list[top.ip].get("c").asInt(0) == 0) {
+            top.ip++;
+        }
+        if (top.ip >= top.list.a.size()) g_game.fgStack.pop_back();
+        else break;
+    }
+
+    // Si la pila está libre y el nuevo mapa tiene un evento Autorun (trigger == 3), encolarlo en el acto (Frame 0)
+    if (g_game.fgStack.empty()) {
+        for (const auto& mev : g_game.events) {
+            if (mev.activePage < 0) continue;
+            const auto& pg = mev.pages[mev.activePage];
+            if (pg.trigger == 3 && pg.list.a.size() > 1) {
+                g_game.fgStack.push_back({ pg.list, 0, mev.id, g_game.mapId });
+                g_game.fgWaitFrames = 0;
+                g_game.fgWaitForMove = false;
+                break;
+            }
+        }
+    }
+
     printf("[AoOni] Mapa %03d cargado y cacheado (%dx%d, eventos=%zu)\n", mapId, g_game.mapW, g_game.mapH, g_game.events.size());
     return true;
 }
@@ -2034,7 +2060,7 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                 for (auto& ce : g_game.commonEvents) {
                     if (ce.id == ceId) {
                         if (isForeground) {
-                            g_game.fgStack.push_back({ ce.list, 0, evId });
+                            g_game.fgStack.push_back({ ce.list, 0, evId, g_game.mapId });
                             return;
                         } else {
                             size_t subIp = 0; int subWait = 0;
@@ -2124,6 +2150,7 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                 if (g_game.timerWorking) g_game.timerFrames += 60;
                 g_game.pendingTransfer = true;
                 ip++;
+                while (ip < list.a.size() && list[ip].get("c").asInt(0) == 0) ip++;
                 return;
             }
             case 202: { // Set Event Location
@@ -2557,7 +2584,7 @@ static void updateMoveRoutes(uint32_t now) {
 
 static void startForegroundEvent(int evId, const JVal& list) {
     g_game.fgStack.clear();
-    g_game.fgStack.push_back({ list, 0, evId });
+    g_game.fgStack.push_back({ list, 0, evId, g_game.mapId });
     g_game.fgWaitFrames = 0;
     g_game.fgWaitForMove = false;
 }
@@ -3111,6 +3138,10 @@ int main(int argc, char* argv[]) {
                 if (b == PAD_TRIANGLE || b == PAD_CIRCLE) {
                     playSe("003-System03", 80, 100);
                     state = STATE_MAP;
+                } else if (b == PAD_OPTIONS) {
+                    playSe("003-System03", 80, 100);
+                    setPadLightbar(25, 45, 160);
+                    state = STATE_TITLE;
                 } else if (b == PAD_SQUARE) {
                     saveGame();
                     invStatusMsg = "Partida guardada en consola y memoria!";
@@ -3279,13 +3310,11 @@ int main(int argc, char* argv[]) {
                         // Guardado rápido QoL con Cuadrado directamente en el mapa (si no te persigue Ao Oni)
                         saveGame();
                         autoSaveBannerFrames = 90;
-                    } else if ((b == PAD_TRIANGLE || b == PAD_CIRCLE) && !g_game.menuDisabled) {
+                    } else if ((b == PAD_TRIANGLE || b == PAD_CIRCLE || b == PAD_OPTIONS) && !g_game.menuDisabled) {
                         playSe("002-System02", 80, 100);
                         invCursor = 0;
                         invStatusMsg.clear();
                         state = STATE_INVENTORY;
-                    } else if (b == PAD_OPTIONS) {
-                        state = STATE_TITLE;
                     }
                 }
             }
@@ -3469,7 +3498,9 @@ int main(int argc, char* argv[]) {
             while (!g_game.fgStack.empty() && !g_game.pendingTransfer && g_game.transPhase != 1) {
                 InterpFrame& top = g_game.fgStack.back();
                 int finishedEvId = top.evId;
-                MapEvent* startEv = (finishedEvId > 0) ? findEvent(finishedEvId) : nullptr;
+                int finishedMapId = top.mapId;
+                size_t finishedListLen = top.list.a.size();
+                MapEvent* startEv = (finishedEvId > 0 && finishedMapId == g_game.mapId) ? findEvent(finishedEvId) : nullptr;
                 int startActivePage = startEv ? startEv->activePage : -1;
                 size_t prevDepth = g_game.fgStack.size();
                 runInterpreterSlice(top.list, top.ip, g_game.fgWaitFrames, top.evId, true);
@@ -3477,8 +3508,9 @@ int main(int argc, char* argv[]) {
                 if (top.ip >= top.list.a.size() && !g_game.msgActive && !g_game.choiceActive &&
                     !g_game.numInputActive && !g_game.btnInputActive && !g_game.nameInputActive && !g_game.fgWaitForMove) {
                     g_game.fgStack.pop_back();
-                    // Protección anti-bloqueo: si un evento Autorun (trigger == 3) termina su lista sin cambiar de página ni teletransportar (ej: Map 32 Ev 9, Map 23 Ev 7), auto-desactivarlo para no congelar al jugador
-                    if (g_game.fgStack.empty() && !g_game.pendingTransfer && finishedEvId > 0) {
+                    // Protección anti-bloqueo exclusiva para los 5 eventos Autorun de 1 comando sin Erase Event (Map 23, 27, 32, 38, 71)
+                    if (g_game.fgStack.empty() && !g_game.pendingTransfer && finishedEvId > 0 &&
+                        finishedMapId == g_game.mapId && finishedListLen <= 3) {
                         MapEvent* endEv = findEvent(finishedEvId);
                         if (endEv && !endEv->erased && endEv->activePage >= 0 &&
                             endEv->activePage == startActivePage &&
@@ -3599,6 +3631,7 @@ int main(int argc, char* argv[]) {
             fillRectFast(gameSurf, offX + 24, offY + 24, GAME_W - 48, GAME_H - 48, 18, 26, 70);
             drawRectFast(gameSurf, offX + 24, offY + 24, GAME_W - 48, GAME_H - 48, 220, 220, 255);
             drawText(gameSurf, offX + 44, offY + 40, "OBJETOS (X: Usar | Cuadrado: Guardar | Circulo: Volver)", 2, 255, 235, 140);
+            drawText(gameSurf, offX + 44, offY + GAME_H - 54, "OPTIONS: Volver a la pantalla de titulo", 2, 160, 175, 210);
 
             int iy = offY + 82;
             if (ownedItems.empty()) {
