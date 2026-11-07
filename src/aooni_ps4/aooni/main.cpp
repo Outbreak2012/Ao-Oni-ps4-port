@@ -383,6 +383,17 @@ static std::string utf8ToAscii(const std::string& in) {
     return out;
 }
 
+// PS4 sceVideoOut usa formato A8B8G8R8Srgb (en little-endian: byte0=R, byte1=G, byte2=B, byte3=A)
+static inline uint32_t packWinPixel(uint8_t r, uint8_t g, uint8_t b) {
+    return 0xFF000000u | ((uint32_t)b << 16) | ((uint32_t)g << 8) | (uint32_t)r;
+}
+
+static inline void unpackWinPixel(uint32_t d, uint8_t& r, uint8_t& g, uint8_t& b) {
+    r = (uint8_t)(d & 0xFFu);
+    g = (uint8_t)((d >> 8) & 0xFFu);
+    b = (uint8_t)((d >> 16) & 0xFFu);
+}
+
 static inline void clearSurfFast(SDL_Surface* dst) {
     if (!dst || !dst->pixels) return;
     uint64_t* p64 = (uint64_t*)dst->pixels;
@@ -398,7 +409,7 @@ static inline void fillRectFast(SDL_Surface* dst, int rx, int ry, int rw, int rh
     if (x0 >= x1 || y0 >= y1) return;
 
     if (a == 255) {
-        uint32_t col = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+        uint32_t col = packWinPixel(r, g, b);
         for (int y = y0; y < y1; y++) {
             uint32_t* row = (uint32_t*)((uint8_t*)dst->pixels + y * dst->pitch);
             for (int x = x0; x < x1; x++) row[x] = col;
@@ -408,13 +419,39 @@ static inline void fillRectFast(SDL_Surface* dst, int rx, int ry, int rw, int rh
         for (int y = y0; y < y1; y++) {
             uint32_t* row = (uint32_t*)((uint8_t*)dst->pixels + y * dst->pitch);
             for (int x = x0; x < x1; x++) {
-                uint32_t dp = row[x];
-                uint8_t dr = (dp >> 16) & 0xFF, dg = (dp >> 8) & 0xFF, db = dp & 0xFF;
+                uint8_t dr, dg, db;
+                unpackWinPixel(row[x], dr, dg, db);
                 uint8_t nr = (uint8_t)((r * a + dr * invA) >> 8);
                 uint8_t ng = (uint8_t)((g * a + dg * invA) >> 8);
                 uint8_t nb = (uint8_t)((b * a + db * invA) >> 8);
-                row[x] = 0xFF000000u | ((uint32_t)nr << 16) | ((uint32_t)ng << 8) | (uint32_t)nb;
+                row[x] = packWinPixel(nr, ng, nb);
             }
+        }
+    }
+}
+
+static inline void applyToneRectFast(SDL_Surface* dst, int rx, int ry, int rw, int rh, int tr, int tg, int tb) {
+    if (!dst || !dst->pixels || (tr == 0 && tg == 0 && tb == 0)) return;
+    int x0 = std::max(0, rx), y0 = std::max(0, ry);
+    int x1 = std::min(dst->w, rx + rw), y1 = std::min(dst->h, ry + rh);
+    if (x0 >= x1 || y0 >= y1) return;
+
+    // Si los 3 canales son negativos iguales (ej. -85 en la mansión), usar oscurecimiento directo
+    if (tr < 0 && tr == tg && tg == tb) {
+        uint8_t alpha = (uint8_t)std::min(255, -tr);
+        fillRectFast(dst, rx, ry, rw, rh, 0, 0, 0, alpha);
+        return;
+    }
+
+    for (int y = y0; y < y1; y++) {
+        uint32_t* row = (uint32_t*)((uint8_t*)dst->pixels + y * dst->pitch);
+        for (int x = x0; x < x1; x++) {
+            uint8_t r, g, b;
+            unpackWinPixel(row[x], r, g, b);
+            int nr = std::max(0, std::min(255, (int)r + tr));
+            int ng = std::max(0, std::min(255, (int)g + tg));
+            int nb = std::max(0, std::min(255, (int)b + tb));
+            row[x] = packWinPixel((uint8_t)nr, (uint8_t)ng, (uint8_t)nb);
         }
     }
 }
@@ -430,7 +467,7 @@ static inline void drawCharFast(SDL_Surface* dst, int x, int y, char c, int scal
     int idx = (unsigned char)c;
     if (idx < 32 || idx > 127) idx = '?';
     const uint8_t* glyph = FONT8X8[idx - 32];
-    uint32_t col = 0xFF000000u | ((uint32_t)cr << 16) | ((uint32_t)cg << 8) | (uint32_t)cb;
+    uint32_t col = packWinPixel(cr, cg, cb);
 
     for (int row = 0; row < 8; row++) {
         uint8_t bits = glyph[row];
@@ -532,14 +569,15 @@ static void blitSurf(SDL_Surface* src, const SDL_Rect* sr, SDL_Surface* dst, SDL
                     uint32_t sa = (sp[3] * alphaMul) >> 8;
                     if (sa == 0) continue;
                     if (sa >= 254) {
-                        dp[x] = 0xFF000000u | ((uint32_t)sp[0] << 16) | ((uint32_t)sp[1] << 8) | (uint32_t)sp[2];
+                        dp[x] = packWinPixel(sp[0], sp[1], sp[2]);
                     } else {
-                        uint32_t d = dp[x];
+                        uint8_t dr, dg, db;
+                        unpackWinPixel(dp[x], dr, dg, db);
                         uint32_t inv = 255 - sa;
-                        uint8_t r = (uint8_t)((sp[0] * sa + ((d >> 16) & 0xFF) * inv) >> 8);
-                        uint8_t g = (uint8_t)((sp[1] * sa + ((d >> 8)  & 0xFF) * inv) >> 8);
-                        uint8_t b = (uint8_t)((sp[2] * sa + (d         & 0xFF) * inv) >> 8);
-                        dp[x] = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+                        uint8_t r = (uint8_t)((sp[0] * sa + dr * inv) >> 8);
+                        uint8_t g = (uint8_t)((sp[1] * sa + dg * inv) >> 8);
+                        uint8_t b = (uint8_t)((sp[2] * sa + db * inv) >> 8);
+                        dp[x] = packWinPixel(r, g, b);
                     }
                 }
             } else {
@@ -583,14 +621,15 @@ static void blitSurf(SDL_Surface* src, const SDL_Rect* sr, SDL_Surface* dst, SDL
             uint32_t sa = (sp[3] * alphaMul) >> 8;
             if (sa == 0) continue;
             if (sa >= 254) {
-                drow[px] = 0xFF000000u | ((uint32_t)sp[0] << 16) | ((uint32_t)sp[1] << 8) | (uint32_t)sp[2];
+                drow[px] = packWinPixel(sp[0], sp[1], sp[2]);
             } else {
-                uint32_t d = drow[px];
+                uint8_t dr, dg, db;
+                unpackWinPixel(drow[px], dr, dg, db);
                 uint32_t inv = 255 - sa;
-                uint8_t r = (uint8_t)((sp[0] * sa + ((d >> 16) & 0xFF) * inv) >> 8);
-                uint8_t g = (uint8_t)((sp[1] * sa + ((d >> 8)  & 0xFF) * inv) >> 8);
-                uint8_t b = (uint8_t)((sp[2] * sa + (d         & 0xFF) * inv) >> 8);
-                drow[px] = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+                uint8_t r = (uint8_t)((sp[0] * sa + dr * inv) >> 8);
+                uint8_t g = (uint8_t)((sp[1] * sa + dg * inv) >> 8);
+                uint8_t b = (uint8_t)((sp[2] * sa + db * inv) >> 8);
+                drow[px] = packWinPixel(r, g, b);
             }
         }
     }
@@ -649,6 +688,8 @@ struct MapEvent {
     int id = 0;
     std::string name;
     int x = 0, y = 0;
+    float realX = 0.0f, realY = 0.0f;
+    int animTicks = 0;
     int dir = 2, pattern = 0, opacity = 255, tile_id = 0;
     std::string char_name;
     bool through = false, always_top = false, dir_fix = false, step_anime = false, erased = false;
@@ -721,6 +762,8 @@ struct GameRuntime {
     SDL_Surface* mapUpperSurf = nullptr;
 
     int playerX = 9, playerY = 8, playerDir = 2, playerPattern = 0;
+    float playerRealX = 9.0f * TILE_SZ, playerRealY = 8.0f * TILE_SZ;
+    int playerAnimTicks = 0;
     std::string playerChar = "hirosi";
     bool playerTransparent = true;
     bool playerThrough = false;
@@ -738,7 +781,11 @@ struct GameRuntime {
     int timerFrames = 0;
 
     int toneR = 0, toneG = 0, toneB = 0;
+    float curToneR = 0.0f, curToneG = 0.0f, curToneB = 0.0f;
+    int toneFrames = 0;
     bool screenBlackout = false; // cmd 221 / 222
+    int transPhase = 0;          // 0=normal, 1=fading out to transfer, 2=fading in from transfer/transition
+    int fadeAlpha = 0;
 
     // Pila de ejecución del intérprete foreground (soporta Call Common Event 117 anidado)
     std::vector<InterpFrame> fgStack;
@@ -773,6 +820,22 @@ struct GameRuntime {
     bool returnToTitleTriggered = false;
     uint32_t frameCount = 0;
 } g_game;
+
+static inline bool isPlayerMoving() {
+    return std::fabs(g_game.playerRealX - g_game.playerX * (float)TILE_SZ) > 0.05f ||
+           std::fabs(g_game.playerRealY - g_game.playerY * (float)TILE_SZ) > 0.05f;
+}
+
+static inline bool isEventMoving(const MapEvent& ev) {
+    return std::fabs(ev.realX - ev.x * (float)TILE_SZ) > 0.05f ||
+           std::fabs(ev.realY - ev.y * (float)TILE_SZ) > 0.05f;
+}
+
+static inline float rmxpSpeedPxPerFrame(float spd) {
+    float s = std::max(1.0f, std::min(6.0f, spd));
+    // En RPG Maker XP (ajustado a 60 FPS): speed 3 = 2 px/frame, speed 4 = 4 px/frame (8 frames por tile de 32px)
+    return std::pow(2.0f, s) * 0.25f;
+}
 
 static int rmDirToRow(int d) {
     if (d == 4) return 1;
@@ -994,7 +1057,7 @@ static void applyMoveCmd(int targetId, const MoveCmd& mc) {
         }
         default: break;
     }
-    if (walked) *ppat = (*ppat + 1) % 4;
+    if (walked && *ppat == 0) *ppat = 1;
 }
 
 static void buildMapCacheSurfaces() {
@@ -1087,6 +1150,8 @@ static bool loadMap(int mapId) {
             ev.name = je.get("name").asStr();
             ev.x = je.get("x").asInt(0);
             ev.y = je.get("y").asInt(0);
+            ev.realX = (float)(ev.x * TILE_SZ);
+            ev.realY = (float)(ev.y * TILE_SZ);
             const JVal& pgs = je.get("pages");
             for (size_t p = 0; p < pgs.a.size(); p++) {
                 const JVal& jp = pgs[p];
@@ -1339,11 +1404,11 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
     while (ip < list.a.size() && steps < 160) {
         steps++;
         if (waitFrames > 0) { waitFrames--; return; }
-        if (isForeground && (g_game.msgActive || g_game.choiceActive || g_game.numInputActive || g_game.btnInputActive || g_game.pendingTransfer))
+        if (isForeground && (g_game.msgActive || g_game.choiceActive || g_game.numInputActive || g_game.btnInputActive || g_game.pendingTransfer || g_game.transPhase == 1))
             return;
         if (isForeground && g_game.fgWaitForMove) {
-            bool anyMoving = g_game.playerRouteActive;
-            for (const auto& ev : g_game.events) if (ev.routeActive) anyMoving = true;
+            bool anyMoving = g_game.playerRouteActive || isPlayerMoving();
+            for (const auto& ev : g_game.events) if (ev.routeActive || isEventMoving(ev)) anyMoving = true;
             if (anyMoving) return;
             g_game.fgWaitForMove = false;
         }
@@ -1579,6 +1644,8 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                         tev->x = g_game.variables[p[2].asInt(0)];
                         tev->y = g_game.variables[p[3].asInt(0)];
                     }
+                    tev->realX = (float)(tev->x * TILE_SZ);
+                    tev->realY = (float)(tev->y * TILE_SZ);
                     if (p[4].asInt(0) > 0) tev->dir = p[4].asInt(2);
                 }
                 ip++;
@@ -1615,10 +1682,14 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                 return;
             case 221: // Prepare for Transition
                 g_game.screenBlackout = true;
+                g_game.fadeAlpha = 255;
+                g_game.transPhase = 0;
                 ip++;
                 break;
             case 222: // Execute Transition
                 g_game.screenBlackout = false;
+                g_game.fadeAlpha = 255;
+                g_game.transPhase = 2;
                 ip++;
                 break;
             case 223: { // Change Screen Color Tone
@@ -1626,6 +1697,15 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                 g_game.toneR = (int)t.get("r").asNum(0);
                 g_game.toneG = (int)t.get("g").asNum(0);
                 g_game.toneB = (int)t.get("b").asNum(0);
+                int dur = (p.a.size() >= 2) ? p[1].asInt(0) : 0;
+                if (dur <= 0) {
+                    g_game.curToneR = (float)g_game.toneR;
+                    g_game.curToneG = (float)g_game.toneG;
+                    g_game.curToneB = (float)g_game.toneB;
+                    g_game.toneFrames = 0;
+                } else {
+                    g_game.toneFrames = dur;
+                }
                 ip++;
                 break;
             }
@@ -1767,52 +1847,116 @@ static void updatePictures() {
         pic.opacity = (pic.opacity * (d - 1.0f) + pic.targetOpacity) / d;
         pic.moveFrames--;
     }
+    if (g_game.toneFrames > 0) {
+        float d = (float)g_game.toneFrames;
+        g_game.curToneR = (g_game.curToneR * (d - 1.0f) + (float)g_game.toneR) / d;
+        g_game.curToneG = (g_game.curToneG * (d - 1.0f) + (float)g_game.toneG) / d;
+        g_game.curToneB = (g_game.curToneB * (d - 1.0f) + (float)g_game.toneB) / d;
+        g_game.toneFrames--;
+    } else {
+        g_game.curToneR = (float)g_game.toneR;
+        g_game.curToneG = (float)g_game.toneG;
+        g_game.curToneB = (float)g_game.toneB;
+    }
+}
+
+static void updateSmoothPositions() {
+    // 1) Interpolación suave a 60 FPS del jugador
+    float ptx = (float)(g_game.playerX * TILE_SZ);
+    float pty = (float)(g_game.playerY * TILE_SZ);
+    float pspd = rmxpSpeedPxPerFrame(g_game.playerSpeed);
+    float pdx = ptx - g_game.playerRealX;
+    float pdy = pty - g_game.playerRealY;
+    if (std::fabs(pdx) <= pspd) g_game.playerRealX = ptx;
+    else g_game.playerRealX += (pdx > 0.0f ? pspd : -pspd);
+    if (std::fabs(pdy) <= pspd) g_game.playerRealY = pty;
+    else g_game.playerRealY += (pdy > 0.0f ? pspd : -pspd);
+
+    if (isPlayerMoving()) {
+        g_game.playerAnimTicks++;
+        if (g_game.playerAnimTicks >= 6) {
+            g_game.playerAnimTicks = 0;
+            g_game.playerPattern = (g_game.playerPattern + 1) % 4;
+        }
+    } else {
+        g_game.playerAnimTicks = 0;
+        g_game.playerPattern = 0;
+    }
+
+    // 2) Interpolación suave a 60 FPS de todos los eventos del mapa
+    for (auto& ev : g_game.events) {
+        if (ev.activePage < 0) continue;
+        float etx = (float)(ev.x * TILE_SZ);
+        float ety = (float)(ev.y * TILE_SZ);
+        float espd = rmxpSpeedPxPerFrame(ev.move_speed);
+        float edx = etx - ev.realX;
+        float edy = ety - ev.realY;
+        if (std::fabs(edx) <= espd) ev.realX = etx;
+        else ev.realX += (edx > 0.0f ? espd : -espd);
+        if (std::fabs(edy) <= espd) ev.realY = ety;
+        else ev.realY += (edy > 0.0f ? espd : -espd);
+
+        if (isEventMoving(ev) || ev.step_anime) {
+            ev.animTicks++;
+            int stride = std::max(4, 11 - (int)ev.move_speed);
+            if (ev.animTicks >= stride) {
+                ev.animTicks = 0;
+                ev.pattern = (ev.pattern + 1) % 4;
+            }
+        } else {
+            ev.animTicks = 0;
+            ev.pattern = (ev.activePage >= 0) ? ev.pages[ev.activePage].pattern : 0;
+        }
+    }
 }
 
 static void updateMoveRoutes(uint32_t now) {
     if (g_game.playerRouteActive) {
-        if (g_game.playerRouteWaitFrames > 0) {
-            g_game.playerRouteWaitFrames--;
-        } else if (now - g_game.lastPlayerRouteTick >= 85) {
-            g_game.lastPlayerRouteTick = now;
-            if (g_game.playerRouteIdx < g_game.playerForcedRoute.list.size()) {
-                applyMoveCmd(-1, g_game.playerForcedRoute.list[g_game.playerRouteIdx++]);
-            }
-            if (g_game.playerRouteIdx >= g_game.playerForcedRoute.list.size() && g_game.playerRouteWaitFrames <= 0) {
-                if (g_game.playerForcedRoute.repeat) g_game.playerRouteIdx = 0;
-                else g_game.playerRouteActive = false;
+        if (!isPlayerMoving()) {
+            if (g_game.playerRouteWaitFrames > 0) {
+                g_game.playerRouteWaitFrames--;
+            } else {
+                if (g_game.playerRouteIdx < g_game.playerForcedRoute.list.size()) {
+                    applyMoveCmd(-1, g_game.playerForcedRoute.list[g_game.playerRouteIdx++]);
+                }
+                if (g_game.playerRouteIdx >= g_game.playerForcedRoute.list.size() && g_game.playerRouteWaitFrames <= 0 && !isPlayerMoving()) {
+                    if (g_game.playerForcedRoute.repeat) g_game.playerRouteIdx = 0;
+                    else g_game.playerRouteActive = false;
+                }
             }
         }
     }
     for (auto& ev : g_game.events) {
         if (ev.activePage < 0) continue;
         if (ev.routeActive) {
-            if (ev.routeWaitFrames > 0) {
-                ev.routeWaitFrames--;
-            } else if (now - ev.lastRouteStepTick >= 85) {
-                ev.lastRouteStepTick = now;
-                if (ev.routeIdx < ev.forcedRoute.list.size()) {
-                    applyMoveCmd(ev.id, ev.forcedRoute.list[ev.routeIdx++]);
-                }
-                if (ev.routeIdx >= ev.forcedRoute.list.size() && ev.routeWaitFrames <= 0) {
-                    if (ev.forcedRoute.repeat) ev.routeIdx = 0;
-                    else ev.routeActive = false;
+            if (!isEventMoving(ev)) {
+                if (ev.routeWaitFrames > 0) {
+                    ev.routeWaitFrames--;
+                } else {
+                    if (ev.routeIdx < ev.forcedRoute.list.size()) {
+                        applyMoveCmd(ev.id, ev.forcedRoute.list[ev.routeIdx++]);
+                    }
+                    if (ev.routeIdx >= ev.forcedRoute.list.size() && ev.routeWaitFrames <= 0 && !isEventMoving(ev)) {
+                        if (ev.forcedRoute.repeat) ev.routeIdx = 0;
+                        else ev.routeActive = false;
+                    }
                 }
             }
-        } else if (g_game.fgStack.empty() && ev.move_type > 0) {
+        } else if (g_game.fgStack.empty() && ev.move_type > 0 && !isEventMoving(ev)) {
             if (ev.routeWaitFrames > 0) {
                 ev.routeWaitFrames--;
                 continue;
             }
-            uint32_t delay = (uint32_t)std::max(85.0f, 390.0f - ev.move_speed * 58.0f);
+            // Con move_freq == 5 (persecución de Ao Oni), avanza de forma continua tile a tile sin pausa
+            uint32_t delay = (ev.move_freq >= 5) ? 0u : (uint32_t)std::max(40, (5 - ev.move_freq) * 180);
             if (now - ev.lastAutoMoveTick >= delay) {
                 ev.lastAutoMoveTick = now;
                 if (ev.move_type == 1) {
-                    if (stepCharacterDir(ev.x, ev.y, ev.dir, (rand() % 4 + 1) * 2, ev.dir_fix, ev.through, false, ev.id))
-                        ev.pattern = (ev.pattern + 1) % 4;
+                    if (stepCharacterDir(ev.x, ev.y, ev.dir, (rand() % 4 + 1) * 2, ev.dir_fix, ev.through, false, ev.id) && ev.pattern == 0)
+                        ev.pattern = 1;
                 } else if (ev.move_type == 2) {
                     stepTowardPlayer(ev);
-                    ev.pattern = (ev.pattern + 1) % 4;
+                    if (ev.pattern == 0) ev.pattern = 1;
                 } else if (ev.move_type == 3) {
                     const auto& mr = ev.pages[ev.activePage].move_route;
                     if (!mr.list.empty()) {
@@ -1907,6 +2051,13 @@ static bool loadSavedGame() {
     g_game.toneR = g_memorySave.toneR;
     g_game.toneG = g_memorySave.toneG;
     g_game.toneB = g_memorySave.toneB;
+    g_game.curToneR = (float)g_game.toneR;
+    g_game.curToneG = (float)g_game.toneG;
+    g_game.curToneB = (float)g_game.toneB;
+    g_game.toneFrames = 0;
+    g_game.screenBlackout = false;
+    g_game.transPhase = 2;
+    g_game.fadeAlpha = 255;
     g_game.frameCount = g_memorySave.frameCount;
     g_game.fgStack.clear();
     g_game.msgActive = g_game.choiceActive = g_game.numInputActive = g_game.btnInputActive = false;
@@ -1915,7 +2066,10 @@ static bool loadSavedGame() {
     loadMap(g_memorySave.mapId);
     g_game.playerX = g_memorySave.playerX;
     g_game.playerY = g_memorySave.playerY;
+    g_game.playerRealX = (float)(g_game.playerX * TILE_SZ);
+    g_game.playerRealY = (float)(g_game.playerY * TILE_SZ);
     g_game.playerDir = g_memorySave.playerDir;
+    g_game.playerPattern = 0;
     return true;
 }
 
@@ -1934,8 +2088,13 @@ static void resetNewGame() {
     g_game.playerDirFix = false;
     g_game.playerSpeed = 4.0f;
     g_game.playerDir = 2;
+    g_game.playerPattern = 0;
     g_game.toneR = g_game.toneG = g_game.toneB = 0;
+    g_game.curToneR = g_game.curToneG = g_game.curToneB = 0.0f;
+    g_game.toneFrames = 0;
     g_game.screenBlackout = false;
+    g_game.transPhase = 0;
+    g_game.fadeAlpha = 0;
     g_game.fgStack.clear();
     g_game.msgActive = false;
     g_game.choiceActive = false;
@@ -1947,6 +2106,8 @@ static void resetNewGame() {
     g_game.timerWorking = false;
     g_game.playerX = 9;
     g_game.playerY = 8;
+    g_game.playerRealX = (float)(9 * TILE_SZ);
+    g_game.playerRealY = (float)(8 * TILE_SZ);
     loadMap(75);
 }
 
@@ -2163,8 +2324,9 @@ int main(int argc, char* argv[]) {
             updatePictures();
             updateMoveRoutes(now);
 
-            // Movimiento manual del jugador
-            if (g_game.fgStack.empty() && !g_game.msgActive && !g_game.numInputActive && !g_game.btnInputActive && !g_game.playerRouteActive && (now - lastStepTick) >= 115) {
+            // Movimiento manual fluido del jugador (inicia paso solo cuando alcanza su tile actual)
+            if (g_game.fgStack.empty() && !g_game.msgActive && !g_game.numInputActive && !g_game.btnInputActive &&
+                !g_game.playerRouteActive && !g_game.pendingTransfer && g_game.transPhase == 0 && !isPlayerMoving()) {
                 int d = 0;
                 if (dpadDown) d = 2;
                 else if (dpadLeft) d = 4;
@@ -2174,7 +2336,7 @@ int main(int argc, char* argv[]) {
                 if (d != 0) {
                     lastStepTick = now;
                     if (!g_game.playerDirFix) g_game.playerDir = d;
-                    g_game.playerPattern = (g_game.playerPattern + 1) % 4;
+                    if (g_game.playerPattern == 0) g_game.playerPattern = 1;
                     int nx = g_game.playerX + (d == 4 ? -1 : (d == 6 ? 1 : 0));
                     int ny = g_game.playerY + (d == 8 ? -1 : (d == 2 ? 1 : 0));
 
@@ -2204,8 +2366,11 @@ int main(int argc, char* argv[]) {
                 }
             }
 
+            // Actualizar posiciones sub-tile a 60 FPS (movimiento suave pixel a pixel)
+            updateSmoothPositions();
+
             // Contacto de Ao Oni o eventos Event Touch
-            if (g_game.fgStack.empty()) {
+            if (g_game.fgStack.empty() && !g_game.pendingTransfer && g_game.transPhase == 0) {
                 for (const auto& mev : g_game.events) {
                     if (mev.activePage < 0) continue;
                     const auto& pg = mev.pages[mev.activePage];
@@ -2222,7 +2387,7 @@ int main(int argc, char* argv[]) {
             }
 
             // Buscar eventos Autorun (trigger == 3)
-            if (g_game.fgStack.empty()) {
+            if (g_game.fgStack.empty() && !g_game.pendingTransfer && g_game.transPhase != 1) {
                 for (const auto& mev : g_game.events) {
                     if (mev.activePage < 0) continue;
                     const auto& pg = mev.pages[mev.activePage];
@@ -2232,7 +2397,7 @@ int main(int argc, char* argv[]) {
                     }
                 }
             }
-            if (g_game.fgStack.empty()) {
+            if (g_game.fgStack.empty() && !g_game.pendingTransfer && g_game.transPhase != 1) {
                 for (const auto& ce : g_game.commonEvents) {
                     if (ce.trigger == 1 && g_game.switches[ce.switch_id]) {
                         startForegroundEvent(0, ce.list);
@@ -2242,7 +2407,7 @@ int main(int argc, char* argv[]) {
             }
 
             // Ejecutar pila del intérprete foreground
-            while (!g_game.fgStack.empty()) {
+            while (!g_game.fgStack.empty() && !g_game.pendingTransfer && g_game.transPhase != 1) {
                 InterpFrame& top = g_game.fgStack.back();
                 size_t prevDepth = g_game.fgStack.size();
                 runInterpreterSlice(top.list, top.ip, g_game.fgWaitFrames, top.evId, true);
@@ -2271,14 +2436,30 @@ int main(int argc, char* argv[]) {
                 }
             }
 
+            // Gestión de transiciones suaves entre mapas (cmd 201 + fade out / fade in)
             if (g_game.pendingTransfer) {
-                g_game.pendingTransfer = false;
-                int tm = g_game.nextMapId, tx = g_game.nextX, ty = g_game.nextY, td = g_game.nextDir;
-                if (loadMap(tm)) {
-                    g_game.playerX = tx;
-                    g_game.playerY = ty;
-                    if (td > 0) g_game.playerDir = td;
+                if (g_game.screenBlackout || g_game.fadeAlpha >= 250) {
+                    g_game.pendingTransfer = false;
+                    int tm = g_game.nextMapId, tx = g_game.nextX, ty = g_game.nextY, td = g_game.nextDir;
+                    if (loadMap(tm)) {
+                        g_game.playerX = tx;
+                        g_game.playerY = ty;
+                        g_game.playerRealX = (float)(tx * TILE_SZ);
+                        g_game.playerRealY = (float)(ty * TILE_SZ);
+                        g_game.playerPattern = 0;
+                        if (td > 0) g_game.playerDir = td;
+                    }
+                    if (!g_game.screenBlackout) {
+                        g_game.fadeAlpha = 255;
+                        g_game.transPhase = 2;
+                    }
+                } else {
+                    g_game.transPhase = 1;
+                    g_game.fadeAlpha = std::min(255, g_game.fadeAlpha + 36);
                 }
+            } else if (g_game.transPhase == 2) {
+                g_game.fadeAlpha = std::max(0, g_game.fadeAlpha - 32);
+                if (g_game.fadeAlpha == 0) g_game.transPhase = 0;
             }
             if (g_game.gameOverTriggered) {
                 playBgm("");
@@ -2366,8 +2547,10 @@ int main(int argc, char* argv[]) {
                 drawText(winSurf, offX + 46, offY + GAME_H - 122, invStatusMsg, 2, 140, 255, 160);
             }
         } else if (state == STATE_MAP) {
-            int camX = g_game.playerX * TILE_SZ - GAME_W / 2 + TILE_SZ / 2;
-            int camY = g_game.playerY * TILE_SZ - GAME_H / 2 + TILE_SZ / 2;
+            int pPxX = (int)std::round(g_game.playerRealX);
+            int pPxY = (int)std::round(g_game.playerRealY);
+            int camX = pPxX - GAME_W / 2 + TILE_SZ / 2;
+            int camY = pPxY - GAME_H / 2 + TILE_SZ / 2;
             if (g_game.mapW * TILE_SZ > GAME_W)
                 camX = std::max(0, std::min(camX, g_game.mapW * TILE_SZ - GAME_W));
             else camX = (g_game.mapW * TILE_SZ - GAME_W) / 2;
@@ -2382,20 +2565,20 @@ int main(int argc, char* argv[]) {
                 blitSurf(g_game.mapLowerSurf, &src, winSurf, &dst);
             }
 
-            // 2) Ordenar por coordenada Y y dibujar eventos + jugador
-            struct SpriteDraw { int y, order; bool isPlayer; const MapEvent* ev; };
+            // 2) Ordenar por coordenada Y sub-píxel y dibujar eventos + jugador
+            struct SpriteDraw { float ry; int order; bool isPlayer; const MapEvent* ev; };
             std::vector<SpriteDraw> drawList;
             drawList.reserve(g_game.events.size() + 1);
             for (const auto& mev : g_game.events) {
                 if (mev.activePage < 0 || (mev.char_name.empty() && mev.tile_id <= 0)) continue;
-                drawList.push_back({ mev.y, mev.always_top ? 2 : 0, false, &mev });
+                drawList.push_back({ mev.realY, mev.always_top ? 2 : 0, false, &mev });
             }
             if (!g_game.playerTransparent && !g_game.playerChar.empty()) {
-                drawList.push_back({ g_game.playerY, 1, true, nullptr });
+                drawList.push_back({ g_game.playerRealY, 1, true, nullptr });
             }
             std::sort(drawList.begin(), drawList.end(), [](const SpriteDraw& a, const SpriteDraw& b) {
                 if (a.order != b.order) return a.order < b.order;
-                return a.y < b.y;
+                return a.ry < b.ry;
             });
 
             SDL_Surface* tsSurf = nullptr;
@@ -2405,19 +2588,20 @@ int main(int argc, char* argv[]) {
                     if (!ps) continue;
                     int cw = ps->w / 4, ch = ps->h / 4;
                     SDL_Rect src = { g_game.playerPattern * cw, rmDirToRow(g_game.playerDir) * ch, cw, ch };
-                    int px = offX + (g_game.playerX * TILE_SZ - camX) - (cw - TILE_SZ) / 2;
-                    int py = offY + (g_game.playerY * TILE_SZ - camY) - (ch - TILE_SZ);
+                    int px = offX + (pPxX - camX) - (cw - TILE_SZ) / 2;
+                    int py = offY + (pPxY - camY) - (ch - TILE_SZ);
                     SDL_Rect dst = { px, py, cw, ch };
                     blitSurf(ps, &src, winSurf, &dst);
                 } else if (sd.ev) {
+                    int evPxX = (int)std::round(sd.ev->realX);
+                    int evPxY = (int)std::round(sd.ev->realY);
                     if (!sd.ev->char_name.empty()) {
                         SDL_Surface* es = getSurf(std::string("/app0/assets/images/char_") + sd.ev->char_name + ".png");
                         if (!es) continue;
                         int cw = es->w / 4, ch = es->h / 4;
-                        int pat = sd.ev->step_anime ? ((frame / 10) % 4) : sd.ev->pattern;
-                        SDL_Rect src = { pat * cw, rmDirToRow(sd.ev->dir) * ch, cw, ch };
-                        int ex = offX + (sd.ev->x * TILE_SZ - camX) - (cw - TILE_SZ) / 2;
-                        int ey = offY + (sd.ev->y * TILE_SZ - camY) - (ch - TILE_SZ);
+                        SDL_Rect src = { sd.ev->pattern * cw, rmDirToRow(sd.ev->dir) * ch, cw, ch };
+                        int ex = offX + (evPxX - camX) - (cw - TILE_SZ) / 2;
+                        int ey = offY + (evPxY - camY) - (ch - TILE_SZ);
                         SDL_Rect dst = { ex, ey, cw, ch };
                         blitSurf(es, &src, winSurf, &dst, (uint8_t)sd.ev->opacity);
                     } else if (sd.ev->tile_id >= 384) {
@@ -2426,7 +2610,7 @@ int main(int argc, char* argv[]) {
                         if (tsSurf) {
                             int tIndex = sd.ev->tile_id - 384;
                             SDL_Rect src = { (tIndex % 8) * TILE_SZ, (tIndex / 8) * TILE_SZ, TILE_SZ, TILE_SZ };
-                            SDL_Rect dst = { offX + (sd.ev->x * TILE_SZ - camX), offY + (sd.ev->y * TILE_SZ - camY), TILE_SZ, TILE_SZ };
+                            SDL_Rect dst = { offX + (evPxX - camX), offY + (evPxY - camY), TILE_SZ, TILE_SZ };
                             blitSurf(tsSurf, &src, winSurf, &dst, (uint8_t)sd.ev->opacity);
                         }
                     }
@@ -2440,12 +2624,12 @@ int main(int argc, char* argv[]) {
                 blitSurf(g_game.mapUpperSurf, &src, winSurf, &dst);
             }
 
-            // 4) Aplicar oscurecimiento si hay tono negativo fuerte o transición (cmd 221/223)
-            if (g_game.screenBlackout) {
-                fillRectFast(winSurf, offX, offY, GAME_W, GAME_H, 0, 0, 0, 255);
-            } else if (g_game.toneR < -100 && g_game.toneG < -100 && g_game.toneB < -100) {
-                uint8_t darkAlpha = (uint8_t)std::min(220, (-g_game.toneR) * 2 / 3);
-                fillRectFast(winSurf, offX, offY, GAME_W, GAME_H, 0, 0, 0, darkAlpha);
+            // 4) Aplicar tono de pantalla (cmd 223, ej: -85,-85,-85 en el interior de la mansión)
+            int tr = (int)std::round(g_game.curToneR);
+            int tg = (int)std::round(g_game.curToneG);
+            int tb = (int)std::round(g_game.curToneB);
+            if (tr != 0 || tg != 0 || tb != 0) {
+                applyToneRectFast(winSurf, offX, offY, GAME_W, GAME_H, tr, tg, tb);
             }
 
             // 5) Dibujar Pictures activas (1..50, con soporte de origin y zoom)
@@ -2460,6 +2644,13 @@ int main(int argc, char* argv[]) {
                 int dy = offY + (int)pic.y - (pic.origin == 1 ? dh / 2 : 0);
                 SDL_Rect dst = { dx, dy, dw, dh };
                 blitSurf(ps, NULL, winSurf, &dst, (uint8_t)std::min(255.0f, pic.opacity));
+            }
+
+            // 5.5) Aplicar fundido a negro de transición entre habitaciones o cmd 221/222
+            if (g_game.screenBlackout) {
+                fillRectFast(winSurf, offX, offY, GAME_W, GAME_H, 0, 0, 0, 255);
+            } else if (g_game.fadeAlpha > 0) {
+                fillRectFast(winSurf, offX, offY, GAME_W, GAME_H, 0, 0, 0, (uint8_t)std::min(255, g_game.fadeAlpha));
             }
 
             // 6) Cuadro de diálogo
