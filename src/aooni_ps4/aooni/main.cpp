@@ -1190,28 +1190,67 @@ static void triggerPlayerDeathByAoOni() {
     }
 }
 
-static bool canPassTile(int tx, int ty, bool isPlayer, int selfEvId = -1) {
+// Implementación 1:1 de Game_Map#passable?(x, y, d, self_event) en RGSS1 (con soporte de bits direccionales 0x01..0x08 y prioridades)
+static bool isMapTilePassable(int tx, int ty, int d, int selfEvId = -1) {
     if (tx < 0 || ty < 0 || tx >= g_game.mapW || ty >= g_game.mapH) return false;
+    uint8_t bit = (d == 2) ? 0x01 : ((d == 4) ? 0x02 : ((d == 6) ? 0x04 : ((d == 8) ? 0x08 : 0x00)));
+
+    for (const auto& ev : g_game.events) {
+        if (ev.id == selfEvId || ev.activePage < 0 || ev.through || ev.tile_id < 384) continue;
+        if (ev.x == tx && ev.y == ty) {
+            uint8_t p = ((size_t)ev.tile_id < g_game.passable.size()) ? g_game.passable[ev.tile_id] : 0;
+            uint8_t pr = ((size_t)ev.tile_id < g_game.priorities.size()) ? g_game.priorities[ev.tile_id] : 0;
+            if (bit != 0 && (p & bit) != 0) return false;
+            if ((p & 0x0F) == 0x0F) return false;
+            if (pr == 0) return true;
+        }
+    }
+
+    for (int z = 2; z >= 0; z--) {
+        int16_t tid = g_game.layers[tx + ty * g_game.mapW + z * g_game.mapW * g_game.mapH];
+        if (tid < 0) return false;
+        if (tid == 0) continue;
+        uint8_t p = ((size_t)tid < g_game.passable.size()) ? g_game.passable[tid] : 0;
+        uint8_t pr = ((size_t)tid < g_game.priorities.size()) ? g_game.priorities[tid] : 0;
+        if (bit != 0 && (p & bit) != 0) return false;
+        if ((p & 0x0F) == 0x0F) return false;
+        if (pr == 0) return true;
+    }
+    return true;
+}
+
+static bool hasBlockingCharacterAt(int tx, int ty, bool isPlayer, int selfEvId = -1) {
     for (const auto& ev : g_game.events) {
         if (ev.id == selfEvId || ev.activePage < 0 || ev.through) continue;
         if (ev.x == tx && ev.y == ty && !ev.char_name.empty()) {
             int trig = ev.pages[ev.activePage].trigger;
             if (isPlayer && (trig == 1 || trig == 2)) continue;
-            return false;
+            return true;
         }
     }
     if (!isPlayer && !g_game.playerThrough && g_game.playerX == tx && g_game.playerY == ty)
-        return false;
+        return true;
+    return false;
+}
 
-    for (int z = 2; z >= 0; z--) {
-        int16_t tid = g_game.layers[tx + ty * g_game.mapW + z * g_game.mapW * g_game.mapH];
-        if (tid > 0 && (size_t)tid < g_game.passable.size()) {
-            uint8_t p = g_game.passable[tid];
-            if ((p & 0x0F) == 0x0F) return false;
-            if ((p & 0x0F) == 0x00) return true;
-        }
-    }
+// Implementación 1:1 de Game_Character#passable?(x, y, d) con protección anti-atasco si el tile origen es 0x0F
+static bool canPassMove(int fx, int fy, int d, bool isPlayer, int selfEvId = -1) {
+    int nx = fx + (d == 4 ? -1 : (d == 6 ? 1 : 0));
+    int ny = fy + (d == 8 ? -1 : (d == 2 ? 1 : 0));
+    if (nx < 0 || ny < 0 || nx >= g_game.mapW || ny >= g_game.mapH) return false;
+    if (hasBlockingCharacterAt(nx, ny, isPlayer, selfEvId)) return false;
+
+    int oppDir = (d > 0) ? (10 - d) : 0;
+    if (!isMapTilePassable(nx, ny, oppDir, selfEvId)) return false;
+    // Solo exigir bit de salida del tile actual si el tile actual es transitable base (evita quedarse atrapado si un evento te coloca sobre un borde)
+    if (isMapTilePassable(fx, fy, 0, selfEvId) && !isMapTilePassable(fx, fy, d, selfEvId)) return false;
     return true;
+}
+
+static bool canPassTile(int tx, int ty, bool isPlayer, int selfEvId = -1) {
+    if (tx < 0 || ty < 0 || tx >= g_game.mapW || ty >= g_game.mapH) return false;
+    if (hasBlockingCharacterAt(tx, ty, isPlayer, selfEvId)) return false;
+    return isMapTilePassable(tx, ty, 0, selfEvId);
 }
 
 static MoveRoute parseMoveRoute(const JVal& mrObj) {
@@ -1248,7 +1287,7 @@ static bool stepCharacterDir(int& x, int& y, int& dir, int d, bool dirFix, bool 
             }
         }
     }
-    if (through || canPassTile(nx, ny, isPlayer, evId)) {
+    if ((through && nx >= 0 && ny >= 0 && nx < g_game.mapW && ny < g_game.mapH) || canPassMove(x, y, d, isPlayer, evId)) {
         x = nx; y = ny;
         return true;
     }
@@ -2127,6 +2166,18 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                     g_game.playerRouteIdx = 0;
                     g_game.playerRouteWaitFrames = 0;
                     g_game.playerRouteActive = !mr.list.empty();
+                    // Ejecutar en el acto los modificadores instantáneos (cambio de gráfico/velocidad/through) como en RGSS1 force_move_route
+                    if (g_game.playerRouteActive && !isPlayerMoving()) {
+                        int guard = 0;
+                        while (g_game.playerRouteIdx < g_game.playerForcedRoute.list.size() && guard++ < 16) {
+                            bool consumes = applyMoveCmd(-1, g_game.playerForcedRoute.list[g_game.playerRouteIdx++]);
+                            if (consumes || g_game.playerRouteWaitFrames > 0 || isPlayerMoving()) break;
+                        }
+                        if (g_game.playerRouteIdx >= g_game.playerForcedRoute.list.size() && g_game.playerRouteWaitFrames <= 0 && !isPlayerMoving()) {
+                            if (g_game.playerForcedRoute.repeat) g_game.playerRouteIdx = 0;
+                            else g_game.playerRouteActive = false;
+                        }
+                    }
                 } else {
                     MapEvent* tev = findEvent(tId);
                     if (tev) {
@@ -2134,6 +2185,17 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                         tev->routeIdx = 0;
                         tev->routeWaitFrames = 0;
                         tev->routeActive = !mr.list.empty();
+                        if (tev->routeActive && !isEventMoving(*tev)) {
+                            int guard = 0;
+                            while (tev->routeIdx < tev->forcedRoute.list.size() && guard++ < 16) {
+                                bool consumes = applyMoveCmd(tev->id, tev->forcedRoute.list[tev->routeIdx++]);
+                                if (consumes || tev->routeWaitFrames > 0 || isEventMoving(*tev)) break;
+                            }
+                            if (tev->routeIdx >= tev->forcedRoute.list.size() && tev->routeWaitFrames <= 0 && !isEventMoving(*tev)) {
+                                if (tev->forcedRoute.repeat) tev->routeIdx = 0;
+                                else tev->routeActive = false;
+                            }
+                        }
                     }
                 }
                 ip++;
@@ -2339,23 +2401,50 @@ static void updatePictures() {
     }
 }
 
-static void updateSmoothPositions(bool sprinting) {
-    // 1) Interpolación suave a 60 FPS del jugador (con soporte QoL de Sprint L1/R1)
-    float ptx = (float)(g_game.playerX * TILE_SZ);
-    float pty = (float)(g_game.playerY * TILE_SZ);
+static float getEffectivePlayerStepPx(bool sprinting) {
     float effPlayerSpeed = g_game.playerSpeed;
     if (sprinting && !g_game.playerRouteActive && g_game.fgStack.empty()) {
         effPlayerSpeed = std::min(5.25f, g_game.playerSpeed + 0.65f);
     }
-    float pspd = rmxpSpeedPxPerFrame(effPlayerSpeed);
+    return rmxpSpeedPxPerFrame(effPlayerSpeed);
+}
+
+// Avanza la posición sub-píxel del jugador hacia la casilla destino actual y devuelve el remanente de píxeles del frame
+static float advancePlayerSubPixel(bool sprinting) {
+    float ptx = (float)(g_game.playerX * TILE_SZ);
+    float pty = (float)(g_game.playerY * TILE_SZ);
+    float pspd = getEffectivePlayerStepPx(sprinting);
     float pdx = ptx - g_game.playerRealX;
     float pdy = pty - g_game.playerRealY;
+    float dist = std::max(std::fabs(pdx), std::fabs(pdy));
+    if (dist <= 0.001f) {
+        g_game.playerRealX = ptx;
+        g_game.playerRealY = pty;
+        return 0.0f;
+    }
     if (std::fabs(pdx) <= pspd) g_game.playerRealX = ptx;
     else g_game.playerRealX += (pdx > 0.0f ? pspd : -pspd);
     if (std::fabs(pdy) <= pspd) g_game.playerRealY = pty;
     else g_game.playerRealY += (pdy > 0.0f ? pspd : -pspd);
+    return (pspd > dist) ? (pspd - dist) : 0.0f;
+}
 
-    if (isPlayerMoving()) {
+static void applyCarryoverPlayerSubPixel(float remPx) {
+    if (remPx <= 0.001f) return;
+    float ptx = (float)(g_game.playerX * TILE_SZ);
+    float pty = (float)(g_game.playerY * TILE_SZ);
+    float pdx = ptx - g_game.playerRealX;
+    float pdy = pty - g_game.playerRealY;
+    if (std::fabs(pdx) <= remPx) g_game.playerRealX = ptx;
+    else g_game.playerRealX += (pdx > 0.0f ? remPx : -remPx);
+    if (std::fabs(pdy) <= remPx) g_game.playerRealY = pty;
+    else g_game.playerRealY += (pdy > 0.0f ? remPx : -remPx);
+}
+
+static void updateWalkAndEventsSmooth(bool sprinting, bool holdingMoveInput) {
+    static int s_idleGraceFrames = 0;
+    if (isPlayerMoving() || holdingMoveInput) {
+        s_idleGraceFrames = 3;
         g_game.playerAnimTicks++;
         int pStride = sprinting ? 4 : 6;
         if (g_game.playerAnimTicks >= pStride) {
@@ -2363,11 +2452,15 @@ static void updateSmoothPositions(bool sprinting) {
             g_game.playerPattern = (g_game.playerPattern + 1) % 4;
         }
     } else {
-        g_game.playerAnimTicks = 0;
-        g_game.playerPattern = 0;
+        if (s_idleGraceFrames > 0) {
+            s_idleGraceFrames--;
+        } else {
+            g_game.playerAnimTicks = 0;
+            g_game.playerPattern = 0;
+        }
     }
 
-    // 2) Interpolación suave a 60 FPS de todos los eventos del mapa
+    // Interpolación suave a 60 FPS de todos los eventos del mapa
     for (auto& ev : g_game.events) {
         if (ev.activePage < 0) continue;
         float etx = (float)(ev.x * TILE_SZ);
@@ -2769,7 +2862,7 @@ int main(int argc, char* argv[]) {
     SDL_Surface* gameSurf = SDL_CreateRGBSurfaceWithFormat(0, GAME_W, GAME_H, 32, SDL_PIXELFORMAT_RGBA32);
     if (!gameSurf) gameSurf = winSurf;
 
-    if (SDL_NumJoysticks() >= 1) SDL_JoystickOpen(0);
+    SDL_Joystick* joy = (SDL_NumJoysticks() >= 1) ? SDL_JoystickOpen(0) : nullptr;
 
     initPadHandle();
     setPadLightbar(25, 45, 160);
@@ -2811,9 +2904,10 @@ int main(int argc, char* argv[]) {
     const int offY = 0;
 
     bool dpadUp = false, dpadDown = false, dpadLeft = false, dpadRight = false;
-    bool stickUp = false, stickDown = false, stickLeft = false, stickRight = false;
-    bool hatUp = false, hatDown = false, hatLeft = false, hatRight = false;
     bool padL1 = false, padR1 = false;
+    uint32_t prevPadMask = 0;
+    int lastPressedDir = 2; // Última dirección pulsada por el usuario (2=Abajo, 4=Izq, 6=Der, 8=Arriba)
+    int dpadRepeatHoldFrames = 0;
     uint32_t lastStepTick = 0;
     uint32_t autoSaveBannerFrames = 0;
     uint32_t videoBannerFrames = 0;
@@ -2854,305 +2948,346 @@ int main(int argc, char* argv[]) {
         for (const auto& kv : g_game.inventory)
             if (kv.second > 0) ownedItems.push_back(kv.first);
 
-        auto pushSynthButton = [](int btn) {
-            SDL_Event sev;
-            memset(&sev, 0, sizeof(sev));
-            sev.type = SDL_JOYBUTTONDOWN;
-            sev.jbutton.button = (Uint8)btn;
-            SDL_PushEvent(&sev);
-        };
-
+        // 1) Drenar cola de eventos SDL (y capturar pulsaciones ultra-rápidas intra-frame)
+        uint32_t eventPressedMask = 0;
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
-            if (ev.type == SDL_JOYHATMOTION) {
-                bool nu = (ev.jhat.value & SDL_HAT_UP) != 0;
-                bool nd = (ev.jhat.value & SDL_HAT_DOWN) != 0;
-                bool nl = (ev.jhat.value & SDL_HAT_LEFT) != 0;
-                bool nr = (ev.jhat.value & SDL_HAT_RIGHT) != 0;
-                if (nu && !hatUp) pushSynthButton(PAD_UP);
-                if (nd && !hatDown) pushSynthButton(PAD_DOWN);
-                if (nl && !hatLeft) pushSynthButton(PAD_LEFT);
-                if (nr && !hatRight) pushSynthButton(PAD_RIGHT);
-                hatUp = nu; hatDown = nd; hatLeft = nl; hatRight = nr;
-                dpadUp = hatUp || stickUp;
-                dpadDown = hatDown || stickDown;
-                dpadLeft = hatLeft || stickLeft;
-                dpadRight = hatRight || stickRight;
-            } else if (ev.type == SDL_JOYAXISMOTION) {
-                if (ev.jaxis.axis == 0) {
-                    bool nl = (ev.jaxis.value < -14000);
-                    bool nr = (ev.jaxis.value >  14000);
-                    if (nl && !stickLeft) pushSynthButton(PAD_LEFT);
-                    if (nr && !stickRight) pushSynthButton(PAD_RIGHT);
-                    stickLeft = nl; stickRight = nr;
-                } else if (ev.jaxis.axis == 1) {
-                    bool nu = (ev.jaxis.value < -14000);
-                    bool nd = (ev.jaxis.value >  14000);
-                    if (nu && !stickUp) pushSynthButton(PAD_UP);
-                    if (nd && !stickDown) pushSynthButton(PAD_DOWN);
-                    stickUp = nu; stickDown = nd;
-                }
-                dpadUp = hatUp || stickUp;
-                dpadDown = hatDown || stickDown;
-                dpadLeft = hatLeft || stickLeft;
-                dpadRight = hatRight || stickRight;
-            } else if (ev.type == SDL_JOYBUTTONDOWN) {
-                int b = ev.jbutton.button;
-                if (b == PAD_L1) padL1 = true;
-                if (b == PAD_R1) padR1 = true;
+            if (ev.type == SDL_JOYBUTTONDOWN && ev.jbutton.button < 24) {
+                eventPressedMask |= (1u << ev.jbutton.button);
+            }
+        }
 
-                // Atajos globales PS4 / PS4 Pro: R2 cambia resolución (720p / 1080p / 4K Nativo), L2 cambia aspecto (4:3 / 16:9 / Pixel-Perfect)
-                if (b == PAD_R2) {
-                    cycleVideoResolution();
-                    playSe("001-System01", 80, 100);
-                    videoBannerText = std::string("RESOLUCION: ") + getVideoResLabel();
-                    videoBannerFrames = 110;
-                    continue;
-                } else if (b == PAD_L2) {
-                    g_videoScaleMode = (g_videoScaleMode + 1) % 3;
-                    g_videoClearNeeded = true;
-                    playSe("001-System01", 80, 100);
-                    videoBannerText = std::string("ESCALADO: ") + getVideoScaleLabel();
-                    videoBannerFrames = 110;
-                    continue;
-                }
+        // 2) Sondeo directo por hardware de DualShock 4 (scePadReadState + SDL_Joystick) libre de pérdidas de estado
+        uint32_t curPadMask = 0;
+        float stickX = 0.0f, stickY = 0.0f;
 
-                if (state == STATE_TITLE) {
-                    if (b == PAD_UP)   { menuIndex = (menuIndex + 3) % 4; playSe("001-System01", 80, 100); }
-                    if (b == PAD_DOWN) { menuIndex = (menuIndex + 1) % 4; playSe("001-System01", 80, 100); }
-                    if (b == PAD_LEFT || b == PAD_RIGHT) {
-                        if (menuIndex == 2) {
-                            cycleVideoResolution();
-                            playSe("001-System01", 80, 100);
-                        } else if (menuIndex == 3) {
-                            g_videoScaleMode = (g_videoScaleMode + (b == PAD_RIGHT ? 1 : 2)) % 3;
-                            g_videoClearNeeded = true;
-                            playSe("001-System01", 80, 100);
-                        }
-                    }
-                    if (b == PAD_CROSS || b == PAD_OPTIONS) {
-                        bool hasSave = g_memorySave.valid || g_autoSave.valid;
-                        if (menuIndex == 0) {
-                            playSe("002-System02", 90, 100);
-                            resetNewGame();
-                            state = STATE_MAP;
-                        } else if (menuIndex == 1 && hasSave) {
-                            playSe("002-System02", 90, 100);
-                            loadSavedGame();
-                            state = STATE_MAP;
-                        } else if (menuIndex == 2) {
-                            cycleVideoResolution();
-                            playSe("002-System02", 85, 100);
-                        } else if (menuIndex == 3) {
-                            g_videoScaleMode = (g_videoScaleMode + 1) % 3;
-                            g_videoClearNeeded = true;
-                            playSe("002-System02", 85, 100);
-                        }
-                    }
-                } else if (state == STATE_GAMEOVER) {
-                    if (b == PAD_CROSS && (g_autoSave.valid || g_memorySave.valid)) {
-                        playSe("002-System02", 90, 100);
-                        restoreFromSnapshot(g_autoSave.valid ? g_autoSave : g_memorySave);
-                        state = STATE_MAP;
-                    } else if (b == PAD_CROSS || b == PAD_CIRCLE || b == PAD_OPTIONS) {
-                        playSe("002-System02", 90, 100);
-                        setPadLightbar(25, 45, 160);
-                        state = STATE_TITLE;
-                    }
-                } else if (state == STATE_INVENTORY) {
-                    if (b == PAD_TRIANGLE || b == PAD_CIRCLE) {
-                        playSe("003-System03", 80, 100);
-                        state = STATE_MAP;
-                    } else if (b == PAD_SQUARE) {
-                        saveGame();
-                        invStatusMsg = "Partida guardada en consola y memoria!";
-                    } else if (b == PAD_UP && !ownedItems.empty()) {
-                        invCursor = (invCursor + (int)ownedItems.size() - 1) % (int)ownedItems.size();
+        if (g_padHandle >= 0) {
+            OrbisPadData pdata;
+            memset(&pdata, 0, sizeof(pdata));
+            if (scePadReadState(g_padHandle, &pdata) >= 0) {
+                uint32_t ob = pdata.buttons;
+                if (ob & ORBIS_PAD_BUTTON_CROSS)     curPadMask |= (1u << PAD_CROSS);
+                if (ob & ORBIS_PAD_BUTTON_CIRCLE)    curPadMask |= (1u << PAD_CIRCLE);
+                if (ob & ORBIS_PAD_BUTTON_SQUARE)    curPadMask |= (1u << PAD_SQUARE);
+                if (ob & ORBIS_PAD_BUTTON_TRIANGLE)  curPadMask |= (1u << PAD_TRIANGLE);
+                if (ob & ORBIS_PAD_BUTTON_L1)        curPadMask |= (1u << PAD_L1);
+                if (ob & ORBIS_PAD_BUTTON_R1)        curPadMask |= (1u << PAD_R1);
+                if (ob & ORBIS_PAD_BUTTON_L2)        curPadMask |= (1u << PAD_L2);
+                if (ob & ORBIS_PAD_BUTTON_R2)        curPadMask |= (1u << PAD_R2);
+                if (pdata.analogButtons.l2 > 140)    curPadMask |= (1u << PAD_L2);
+                if (pdata.analogButtons.r2 > 140)    curPadMask |= (1u << PAD_R2);
+                if (ob & ORBIS_PAD_BUTTON_OPTIONS)   curPadMask |= (1u << PAD_OPTIONS);
+                if (ob & ORBIS_PAD_BUTTON_TOUCH_PAD) curPadMask |= (1u << PAD_TOUCHPAD);
+                if (ob & ORBIS_PAD_BUTTON_UP)        curPadMask |= (1u << PAD_UP);
+                if (ob & ORBIS_PAD_BUTTON_DOWN)      curPadMask |= (1u << PAD_DOWN);
+                if (ob & ORBIS_PAD_BUTTON_LEFT)      curPadMask |= (1u << PAD_LEFT);
+                if (ob & ORBIS_PAD_BUTTON_RIGHT)     curPadMask |= (1u << PAD_RIGHT);
+                float sx = ((int)pdata.leftStick.x - 128) / 127.0f;
+                float sy = ((int)pdata.leftStick.y - 128) / 127.0f;
+                if (std::fabs(sx) > std::fabs(stickX)) stickX = sx;
+                if (std::fabs(sy) > std::fabs(stickY)) stickY = sy;
+            }
+        }
+
+        if (!joy && SDL_NumJoysticks() >= 1) joy = SDL_JoystickOpen(0);
+        if (joy) {
+            const int pollBtns[] = {
+                PAD_CROSS, PAD_CIRCLE, PAD_SQUARE, PAD_TRIANGLE,
+                PAD_L1, PAD_R1, PAD_OPTIONS, PAD_UP, PAD_DOWN, PAD_LEFT, PAD_RIGHT, PAD_TOUCHPAD, PAD_L2, PAD_R2
+            };
+            for (int b : pollBtns) {
+                if (SDL_JoystickGetButton(joy, b)) curPadMask |= (1u << b);
+            }
+            Uint8 hat = SDL_JoystickGetHat(joy, 0);
+            if (hat & SDL_HAT_UP)    curPadMask |= (1u << PAD_UP);
+            if (hat & SDL_HAT_DOWN)  curPadMask |= (1u << PAD_DOWN);
+            if (hat & SDL_HAT_LEFT)  curPadMask |= (1u << PAD_LEFT);
+            if (hat & SDL_HAT_RIGHT) curPadMask |= (1u << PAD_RIGHT);
+
+            float jx = SDL_JoystickGetAxis(joy, 0) / 32767.0f;
+            float jy = SDL_JoystickGetAxis(joy, 1) / 32767.0f;
+            if (std::fabs(jx) > std::fabs(stickX)) stickX = jx;
+            if (std::fabs(jy) > std::fabs(stickY)) stickY = jy;
+        }
+
+        // Zona muerta radial limpia (0.34f) para el stick izquierdo
+        const float STICK_DEADZONE = 0.34f;
+        if (stickX < -STICK_DEADZONE) curPadMask |= (1u << PAD_LEFT);
+        if (stickX >  STICK_DEADZONE) curPadMask |= (1u << PAD_RIGHT);
+        if (stickY < -STICK_DEADZONE) curPadMask |= (1u << PAD_UP);
+        if (stickY >  STICK_DEADZONE) curPadMask |= (1u << PAD_DOWN);
+
+        dpadUp    = (curPadMask & (1u << PAD_UP))    != 0;
+        dpadDown  = (curPadMask & (1u << PAD_DOWN))  != 0;
+        dpadLeft  = (curPadMask & (1u << PAD_LEFT))  != 0;
+        dpadRight = (curPadMask & (1u << PAD_RIGHT)) != 0;
+        padL1     = (curPadMask & (1u << PAD_L1))    != 0;
+        padR1     = (curPadMask & (1u << PAD_R1))    != 0;
+
+        uint32_t justPressedMask = (curPadMask & ~prevPadMask) | (eventPressedMask & ~prevPadMask);
+        prevPadMask = curPadMask;
+
+        // Registrar cuál fue la última dirección pulsada para desempate natural en cruceta
+        if (justPressedMask & (1u << PAD_DOWN))  lastPressedDir = 2;
+        if (justPressedMask & (1u << PAD_LEFT))  lastPressedDir = 4;
+        if (justPressedMask & (1u << PAD_RIGHT)) lastPressedDir = 6;
+        if (justPressedMask & (1u << PAD_UP))    lastPressedDir = 8;
+
+        // Auto-repeat cómodo en menús, inventario, teclado de nombre y cajas fuertes al mantener cruceta/stick
+        const uint32_t dpadBits = (1u << PAD_UP) | (1u << PAD_DOWN) | (1u << PAD_LEFT) | (1u << PAD_RIGHT);
+        if (curPadMask & dpadBits) {
+            dpadRepeatHoldFrames++;
+            bool inMenuOrModal = (state != STATE_MAP) || g_game.nameInputActive || g_game.numInputActive || g_game.choiceActive;
+            if (inMenuOrModal && dpadRepeatHoldFrames >= 20 && ((dpadRepeatHoldFrames - 20) % 5 == 0)) {
+                justPressedMask |= (curPadMask & dpadBits);
+            }
+        } else {
+            dpadRepeatHoldFrames = 0;
+        }
+
+        // Procesar cada botón recién pulsado (o repetido en menú) una sola vez limpia por frame
+        for (int b = 0; b <= 20; b++) {
+            if (!(justPressedMask & (1u << b))) continue;
+
+            // Atajos globales PS4 / PS4 Pro: R2 cambia resolución (720p / 1080p / 4K Nativo), L2 cambia aspecto (4:3 / 16:9 / Pixel-Perfect)
+            if (b == PAD_R2) {
+                cycleVideoResolution();
+                playSe("001-System01", 80, 100);
+                videoBannerText = std::string("RESOLUCION: ") + getVideoResLabel();
+                videoBannerFrames = 110;
+                continue;
+            } else if (b == PAD_L2) {
+                g_videoScaleMode = (g_videoScaleMode + 1) % 3;
+                g_videoClearNeeded = true;
+                playSe("001-System01", 80, 100);
+                videoBannerText = std::string("ESCALADO: ") + getVideoScaleLabel();
+                videoBannerFrames = 110;
+                continue;
+            }
+
+            if (state == STATE_TITLE) {
+                if (b == PAD_UP)   { menuIndex = (menuIndex + 3) % 4; playSe("001-System01", 80, 100); }
+                if (b == PAD_DOWN) { menuIndex = (menuIndex + 1) % 4; playSe("001-System01", 80, 100); }
+                if (b == PAD_LEFT || b == PAD_RIGHT) {
+                    if (menuIndex == 2) {
+                        cycleVideoResolution();
                         playSe("001-System01", 80, 100);
-                    } else if (b == PAD_DOWN && !ownedItems.empty()) {
-                        invCursor = (invCursor + 1) % (int)ownedItems.size();
+                    } else if (menuIndex == 3) {
+                        g_videoScaleMode = (g_videoScaleMode + (b == PAD_RIGHT ? 1 : 2)) % 3;
+                        g_videoClearNeeded = true;
                         playSe("001-System01", 80, 100);
-                    } else if (b == PAD_CROSS && !ownedItems.empty()) {
-                        if (invCursor >= (int)ownedItems.size()) invCursor = 0;
-                        int itemId = ownedItems[invCursor];
-                        int ceId = g_game.itemDefs.count(itemId) ? g_game.itemDefs[itemId].common_event_id : 0;
-                        if (ceId > 0) {
-                            playSe("002-System02", 85, 100);
-                            state = STATE_MAP;
-                            for (const auto& ce : g_game.commonEvents) {
-                                if (ce.id == ceId) {
-                                    startForegroundEvent(0, ce.list);
-                                    break;
-                                }
+                    }
+                }
+                if (b == PAD_CROSS || b == PAD_OPTIONS) {
+                    bool hasSave = g_memorySave.valid || g_autoSave.valid;
+                    if (menuIndex == 0) {
+                        playSe("002-System02", 90, 100);
+                        resetNewGame();
+                        state = STATE_MAP;
+                    } else if (menuIndex == 1 && hasSave) {
+                        playSe("002-System02", 90, 100);
+                        loadSavedGame();
+                        state = STATE_MAP;
+                    } else if (menuIndex == 2) {
+                        cycleVideoResolution();
+                        playSe("002-System02", 85, 100);
+                    } else if (menuIndex == 3) {
+                        g_videoScaleMode = (g_videoScaleMode + 1) % 3;
+                        g_videoClearNeeded = true;
+                        playSe("002-System02", 85, 100);
+                    }
+                }
+            } else if (state == STATE_GAMEOVER) {
+                if (b == PAD_CROSS && (g_autoSave.valid || g_memorySave.valid)) {
+                    playSe("002-System02", 90, 100);
+                    restoreFromSnapshot(g_autoSave.valid ? g_autoSave : g_memorySave);
+                    state = STATE_MAP;
+                } else if (b == PAD_CROSS || b == PAD_CIRCLE || b == PAD_OPTIONS) {
+                    playSe("002-System02", 90, 100);
+                    setPadLightbar(25, 45, 160);
+                    state = STATE_TITLE;
+                }
+            } else if (state == STATE_INVENTORY) {
+                if (b == PAD_TRIANGLE || b == PAD_CIRCLE) {
+                    playSe("003-System03", 80, 100);
+                    state = STATE_MAP;
+                } else if (b == PAD_SQUARE) {
+                    saveGame();
+                    invStatusMsg = "Partida guardada en consola y memoria!";
+                } else if (b == PAD_UP && !ownedItems.empty()) {
+                    invCursor = (invCursor + (int)ownedItems.size() - 1) % (int)ownedItems.size();
+                    playSe("001-System01", 80, 100);
+                } else if (b == PAD_DOWN && !ownedItems.empty()) {
+                    invCursor = (invCursor + 1) % (int)ownedItems.size();
+                    playSe("001-System01", 80, 100);
+                } else if (b == PAD_CROSS && !ownedItems.empty()) {
+                    if (invCursor >= (int)ownedItems.size()) invCursor = 0;
+                    int itemId = ownedItems[invCursor];
+                    int ceId = g_game.itemDefs.count(itemId) ? g_game.itemDefs[itemId].common_event_id : 0;
+                    if (ceId > 0) {
+                        playSe("002-System02", 85, 100);
+                        state = STATE_MAP;
+                        for (const auto& ce : g_game.commonEvents) {
+                            if (ce.id == ceId) {
+                                startForegroundEvent(0, ce.list);
+                                break;
+                            }
+                        }
+                    } else {
+                        playSe("004-System04", 80, 100);
+                        invStatusMsg = "Este objeto se usa automaticamente en su cerradura.";
+                    }
+                }
+            } else if (state == STATE_MAP) {
+                if (g_game.nameInputActive) {
+                    int maxCols = (g_game.nameInputRow == 6) ? 9 : 10;
+                    if (b == PAD_UP) {
+                        g_game.nameInputRow = (g_game.nameInputRow + 6) % 7;
+                        int newMaxCols = (g_game.nameInputRow == 6) ? 9 : 10;
+                        if (g_game.nameInputCol >= newMaxCols) g_game.nameInputCol = newMaxCols - 1;
+                        playSe("001-System01", 80, 100);
+                    } else if (b == PAD_DOWN) {
+                        g_game.nameInputRow = (g_game.nameInputRow + 1) % 7;
+                        int newMaxCols = (g_game.nameInputRow == 6) ? 9 : 10;
+                        if (g_game.nameInputCol >= newMaxCols) g_game.nameInputCol = newMaxCols - 1;
+                        playSe("001-System01", 80, 100);
+                    } else if (b == PAD_LEFT) {
+                        g_game.nameInputCol = (g_game.nameInputCol + maxCols - 1) % maxCols;
+                        playSe("001-System01", 80, 100);
+                    } else if (b == PAD_RIGHT) {
+                        g_game.nameInputCol = (g_game.nameInputCol + 1) % maxCols;
+                        playSe("001-System01", 80, 100);
+                    } else if (b == PAD_SQUARE || b == PAD_CIRCLE) {
+                        if (!g_game.nameInputStr.empty()) {
+                            g_game.nameInputStr.pop_back();
+                            playSe("003-System03", 80, 100);
+                        }
+                    } else if (b == PAD_OPTIONS) {
+                        if (g_game.nameInputStr.empty()) g_game.nameInputStr = "Hiroshi";
+                        g_game.actorNames[g_game.nameInputActorId] = g_game.nameInputStr;
+                        g_game.nameInputActive = false;
+                        playSe("002-System02", 90, 100);
+                    } else if (b == PAD_CROSS) {
+                        if (g_game.nameInputRow < 6) {
+                            char ch = NAME_KB_ROWS[g_game.nameInputRow][g_game.nameInputCol];
+                            if ((int)g_game.nameInputStr.size() < g_game.nameInputMaxLen) {
+                                g_game.nameInputStr.push_back(ch);
+                                playSe("001-System01", 85, 100);
+                            } else {
+                                playSe("004-System04", 80, 100);
                             }
                         } else {
-                            playSe("004-System04", 80, 100);
-                            invStatusMsg = "Este objeto se usa automaticamente en su cerradura.";
+                            int qb = g_game.nameInputCol;
+                            if (qb == 0) { // CONFIRMAR
+                                if (g_game.nameInputStr.empty()) g_game.nameInputStr = "Hiroshi";
+                                g_game.actorNames[g_game.nameInputActorId] = g_game.nameInputStr;
+                                g_game.nameInputActive = false;
+                                playSe("002-System02", 90, 100);
+                            } else if (qb == 1) { // BORRAR
+                                if (!g_game.nameInputStr.empty()) {
+                                    g_game.nameInputStr.pop_back();
+                                    playSe("003-System03", 80, 100);
+                                }
+                            } else if (qb >= 2 && qb < 9 && NAME_QUICK_BTNS[qb].value) {
+                                g_game.nameInputStr = NAME_QUICK_BTNS[qb].value;
+                                g_game.nameInputCol = 0; // Mover foco a [CONFIRMAR] tras elegir un nombre rápido
+                                playSe("002-System02", 85, 100);
+                            }
                         }
                     }
-                } else if (state == STATE_MAP) {
-                    if (g_game.nameInputActive) {
-                        int maxCols = (g_game.nameInputRow == 6) ? 9 : 10;
-                        if (b == PAD_UP) {
-                            g_game.nameInputRow = (g_game.nameInputRow + 6) % 7;
-                            int newMaxCols = (g_game.nameInputRow == 6) ? 9 : 10;
-                            if (g_game.nameInputCol >= newMaxCols) g_game.nameInputCol = newMaxCols - 1;
-                            playSe("001-System01", 80, 100);
-                        } else if (b == PAD_DOWN) {
-                            g_game.nameInputRow = (g_game.nameInputRow + 1) % 7;
-                            int newMaxCols = (g_game.nameInputRow == 6) ? 9 : 10;
-                            if (g_game.nameInputCol >= newMaxCols) g_game.nameInputCol = newMaxCols - 1;
-                            playSe("001-System01", 80, 100);
-                        } else if (b == PAD_LEFT) {
-                            g_game.nameInputCol = (g_game.nameInputCol + maxCols - 1) % maxCols;
-                            playSe("001-System01", 80, 100);
-                        } else if (b == PAD_RIGHT) {
-                            g_game.nameInputCol = (g_game.nameInputCol + 1) % maxCols;
-                            playSe("001-System01", 80, 100);
-                        } else if (b == PAD_SQUARE || b == PAD_CIRCLE) {
-                            if (!g_game.nameInputStr.empty()) {
-                                g_game.nameInputStr.pop_back();
-                                playSe("003-System03", 80, 100);
-                            }
-                        } else if (b == PAD_OPTIONS) {
-                            if (g_game.nameInputStr.empty()) g_game.nameInputStr = "Hiroshi";
-                            g_game.actorNames[g_game.nameInputActorId] = g_game.nameInputStr;
-                            g_game.nameInputActive = false;
-                            playSe("002-System02", 90, 100);
-                        } else if (b == PAD_CROSS) {
-                            if (g_game.nameInputRow < 6) {
-                                char ch = NAME_KB_ROWS[g_game.nameInputRow][g_game.nameInputCol];
-                                if ((int)g_game.nameInputStr.size() < g_game.nameInputMaxLen) {
-                                    g_game.nameInputStr.push_back(ch);
-                                    playSe("001-System01", 85, 100);
-                                } else {
-                                    playSe("004-System04", 80, 100);
-                                }
-                            } else {
-                                int qb = g_game.nameInputCol;
-                                if (qb == 0) { // CONFIRMAR
-                                    if (g_game.nameInputStr.empty()) g_game.nameInputStr = "Hiroshi";
-                                    g_game.actorNames[g_game.nameInputActorId] = g_game.nameInputStr;
-                                    g_game.nameInputActive = false;
-                                    playSe("002-System02", 90, 100);
-                                } else if (qb == 1) { // BORRAR
-                                    if (!g_game.nameInputStr.empty()) {
-                                        g_game.nameInputStr.pop_back();
-                                        playSe("003-System03", 80, 100);
-                                    }
-                                } else if (qb >= 2 && qb < 9 && NAME_QUICK_BTNS[qb].value) {
-                                    g_game.nameInputStr = NAME_QUICK_BTNS[qb].value;
-                                    g_game.nameInputCol = 0; // Mover foco a [CONFIRMAR] tras elegir un nombre rápido
-                                    playSe("002-System02", 85, 100);
-                                }
-                            }
-                        }
-                    } else if (g_game.numInputActive) {
-                        if (b == PAD_LEFT) {
-                            g_game.numInputCursor = (g_game.numInputCursor + g_game.numInputDigits - 1) % g_game.numInputDigits;
-                            playSe("001-System01", 80, 100);
-                        } else if (b == PAD_RIGHT) {
-                            g_game.numInputCursor = (g_game.numInputCursor + 1) % g_game.numInputDigits;
-                            playSe("001-System01", 80, 100);
-                        } else if (b == PAD_UP) {
-                            g_game.numInputVals[g_game.numInputCursor] = (g_game.numInputVals[g_game.numInputCursor] + 1) % 10;
-                            playSe("001-System01", 80, 100);
-                        } else if (b == PAD_DOWN) {
-                            g_game.numInputVals[g_game.numInputCursor] = (g_game.numInputVals[g_game.numInputCursor] + 9) % 10;
-                            playSe("001-System01", 80, 100);
-                        } else if (b == PAD_CROSS) {
-                            int total = 0;
-                            for (int d = 0; d < g_game.numInputDigits; d++)
-                                total = total * 10 + g_game.numInputVals[d];
-                            if (g_game.numInputVarId >= 0 && g_game.numInputVarId < 512)
-                                g_game.variables[g_game.numInputVarId] = total;
-                            g_game.numInputActive = false;
-                            playSe("002-System02", 85, 100);
-                        }
-                    } else if (g_game.btnInputActive) {
-                        int rmCode = 0;
-                        if (b == PAD_DOWN) rmCode = 2;
-                        else if (b == PAD_LEFT) rmCode = 4;
-                        else if (b == PAD_RIGHT) rmCode = 6;
-                        else if (b == PAD_UP) rmCode = 8;
-                        else if (b == PAD_SQUARE) rmCode = 11;
-                        else if (b == PAD_CIRCLE || b == PAD_TRIANGLE) rmCode = 12;
-                        else if (b == PAD_CROSS) rmCode = 13;
-                        if (rmCode > 0) {
-                            if (g_game.btnInputVarId >= 0 && g_game.btnInputVarId < 512)
-                                g_game.variables[g_game.btnInputVarId] = rmCode;
-                            g_game.btnInputActive = false;
-                        }
-                    } else if (g_game.choiceActive) {
-                        if (b == PAD_UP && !g_game.choices.empty()) {
-                            g_game.choiceIndex = (g_game.choiceIndex + (int)g_game.choices.size() - 1) % (int)g_game.choices.size();
-                            playSe("001-System01", 80, 100);
-                        }
-                        if (b == PAD_DOWN && !g_game.choices.empty()) {
-                            g_game.choiceIndex = (g_game.choiceIndex + 1) % (int)g_game.choices.size();
-                            playSe("001-System01", 80, 100);
-                        }
-                        if (b == PAD_CROSS && !g_game.fgStack.empty()) {
-                            playSe("002-System02", 85, 100);
-                            int wanted = g_game.choiceIndex;
-                            g_game.choiceActive = false;
-                            g_game.msgActive = false;
-                            InterpFrame& fr = g_game.fgStack.back();
-                            while (fr.ip < fr.list.a.size()) {
-                                const JVal& c = fr.list[fr.ip];
-                                if (c.get("i").asInt(0) == g_game.choiceIndent &&
-                                    c.get("c").asInt(0) == 402 &&
-                                    c.get("p")[0].asInt(-1) == wanted) {
-                                    fr.ip++;
-                                    break;
-                                }
-                                if (c.get("i").asInt(0) == g_game.choiceIndent && c.get("c").asInt(0) == 404)
-                                    break;
+                } else if (g_game.numInputActive) {
+                    if (b == PAD_LEFT) {
+                        g_game.numInputCursor = (g_game.numInputCursor + g_game.numInputDigits - 1) % g_game.numInputDigits;
+                        playSe("001-System01", 80, 100);
+                    } else if (b == PAD_RIGHT) {
+                        g_game.numInputCursor = (g_game.numInputCursor + 1) % g_game.numInputDigits;
+                        playSe("001-System01", 80, 100);
+                    } else if (b == PAD_UP) {
+                        g_game.numInputVals[g_game.numInputCursor] = (g_game.numInputVals[g_game.numInputCursor] + 1) % 10;
+                        playSe("001-System01", 80, 100);
+                    } else if (b == PAD_DOWN) {
+                        g_game.numInputVals[g_game.numInputCursor] = (g_game.numInputVals[g_game.numInputCursor] + 9) % 10;
+                        playSe("001-System01", 80, 100);
+                    } else if (b == PAD_CROSS) {
+                        int total = 0;
+                        for (int d = 0; d < g_game.numInputDigits; d++)
+                            total = total * 10 + g_game.numInputVals[d];
+                        if (g_game.numInputVarId >= 0 && g_game.numInputVarId < 512)
+                            g_game.variables[g_game.numInputVarId] = total;
+                        g_game.numInputActive = false;
+                        playSe("002-System02", 85, 100);
+                    }
+                } else if (g_game.btnInputActive) {
+                    int rmCode = 0;
+                    if (b == PAD_DOWN) rmCode = 2;
+                    else if (b == PAD_LEFT) rmCode = 4;
+                    else if (b == PAD_RIGHT) rmCode = 6;
+                    else if (b == PAD_UP) rmCode = 8;
+                    else if (b == PAD_SQUARE) rmCode = 11;
+                    else if (b == PAD_CIRCLE || b == PAD_TRIANGLE) rmCode = 12;
+                    else if (b == PAD_CROSS) rmCode = 13;
+                    if (rmCode > 0) {
+                        if (g_game.btnInputVarId >= 0 && g_game.btnInputVarId < 512)
+                            g_game.variables[g_game.btnInputVarId] = rmCode;
+                        g_game.btnInputActive = false;
+                    }
+                } else if (g_game.choiceActive) {
+                    if (b == PAD_UP && !g_game.choices.empty()) {
+                        g_game.choiceIndex = (g_game.choiceIndex + (int)g_game.choices.size() - 1) % (int)g_game.choices.size();
+                        playSe("001-System01", 80, 100);
+                    }
+                    if (b == PAD_DOWN && !g_game.choices.empty()) {
+                        g_game.choiceIndex = (g_game.choiceIndex + 1) % (int)g_game.choices.size();
+                        playSe("001-System01", 80, 100);
+                    }
+                    if (b == PAD_CROSS && !g_game.fgStack.empty()) {
+                        playSe("002-System02", 85, 100);
+                        int wanted = g_game.choiceIndex;
+                        g_game.choiceActive = false;
+                        g_game.msgActive = false;
+                        InterpFrame& fr = g_game.fgStack.back();
+                        while (fr.ip < fr.list.a.size()) {
+                            const JVal& c = fr.list[fr.ip];
+                            if (c.get("i").asInt(0) == g_game.choiceIndent &&
+                                c.get("c").asInt(0) == 402 &&
+                                c.get("p")[0].asInt(-1) == wanted) {
                                 fr.ip++;
+                                break;
                             }
-                        }
-                    } else if (g_game.msgActive) {
-                        if (b == PAD_CROSS || b == PAD_CIRCLE) g_game.msgActive = false;
-                    } else if (g_game.fgStack.empty()) {
-                        if (b == PAD_CROSS) {
-                            int fx = g_game.playerX + (g_game.playerDir == 4 ? -1 : (g_game.playerDir == 6 ? 1 : 0));
-                            int fy = g_game.playerY + (g_game.playerDir == 8 ? -1 : (g_game.playerDir == 2 ? 1 : 0));
-                            for (const auto& mev : g_game.events) {
-                                if (mev.activePage < 0) continue;
-                                const auto& pg = mev.pages[mev.activePage];
-                                if (pg.trigger <= 2 && ((mev.x == fx && mev.y == fy) || (mev.x == g_game.playerX && mev.y == g_game.playerY))) {
-                                    if (pg.list.a.size() > 1) {
-                                        startForegroundEvent(mev.id, pg.list);
-                                        break;
-                                    }
-                                }
-                            }
-                        } else if (b == PAD_SQUARE && !g_game.menuDisabled && !g_game.switches[49]) {
-                            // Guardado rápido QoL con Cuadrado directamente en el mapa (si no te persigue Ao Oni)
-                            saveGame();
-                            autoSaveBannerFrames = 90;
-                        } else if ((b == PAD_TRIANGLE || b == PAD_CIRCLE) && !g_game.menuDisabled) {
-                            playSe("002-System02", 80, 100);
-                            invCursor = 0;
-                            invStatusMsg.clear();
-                            state = STATE_INVENTORY;
-                        } else if (b == PAD_OPTIONS) {
-                            state = STATE_TITLE;
+                            if (c.get("i").asInt(0) == g_game.choiceIndent && c.get("c").asInt(0) == 404)
+                                break;
+                            fr.ip++;
                         }
                     }
-                    if (b == PAD_UP)    dpadUp = true;
-                    if (b == PAD_DOWN)  dpadDown = true;
-                    if (b == PAD_LEFT)  dpadLeft = true;
-                    if (b == PAD_RIGHT) dpadRight = true;
+                } else if (g_game.msgActive) {
+                    if (b == PAD_CROSS || b == PAD_CIRCLE) g_game.msgActive = false;
+                } else if (g_game.fgStack.empty()) {
+                    if (b == PAD_CROSS) {
+                        int fx = g_game.playerX + (g_game.playerDir == 4 ? -1 : (g_game.playerDir == 6 ? 1 : 0));
+                        int fy = g_game.playerY + (g_game.playerDir == 8 ? -1 : (g_game.playerDir == 2 ? 1 : 0));
+                        for (const auto& mev : g_game.events) {
+                            if (mev.activePage < 0) continue;
+                            const auto& pg = mev.pages[mev.activePage];
+                            if (pg.trigger <= 2 && ((mev.x == fx && mev.y == fy) || (mev.x == g_game.playerX && mev.y == g_game.playerY))) {
+                                if (pg.list.a.size() > 1) {
+                                    startForegroundEvent(mev.id, pg.list);
+                                    break;
+                                }
+                            }
+                        }
+                    } else if (b == PAD_SQUARE && !g_game.menuDisabled && !g_game.switches[49]) {
+                        // Guardado rápido QoL con Cuadrado directamente en el mapa (si no te persigue Ao Oni)
+                        saveGame();
+                        autoSaveBannerFrames = 90;
+                    } else if ((b == PAD_TRIANGLE || b == PAD_CIRCLE) && !g_game.menuDisabled) {
+                        playSe("002-System02", 80, 100);
+                        invCursor = 0;
+                        invStatusMsg.clear();
+                        state = STATE_INVENTORY;
+                    } else if (b == PAD_OPTIONS) {
+                        state = STATE_TITLE;
+                    }
                 }
-            } else if (ev.type == SDL_JOYBUTTONUP) {
-                int b = ev.jbutton.button;
-                if (b == PAD_UP)    dpadUp = hatUp || stickUp;
-                if (b == PAD_DOWN)  dpadDown = hatDown || stickDown;
-                if (b == PAD_LEFT)  dpadLeft = hatLeft || stickLeft;
-                if (b == PAD_RIGHT) dpadRight = hatRight || stickRight;
-                if (b == PAD_L1)    padL1 = false;
-                if (b == PAD_R1)    padR1 = false;
             }
         }
 
@@ -3167,63 +3302,134 @@ int main(int argc, char* argv[]) {
             if (autoSaveBannerFrames > 0) autoSaveBannerFrames--;
 
             updatePictures();
+
+            // 1) Avanzar primero el sub-píxel del jugador hacia su casilla actual para que no haya ni 1 frame de pausa al llegar a una casilla
+            bool sprinting = (padL1 || padR1);
+            float remMovePx = advancePlayerSubPixel(sprinting);
+
             updateMoveRoutes(now);
 
-            // Movimiento manual fluido del jugador (inicia paso solo cuando alcanza su tile actual)
-            if (g_game.fgStack.empty() && !g_game.msgActive && !g_game.numInputActive && !g_game.btnInputActive &&
-                !g_game.nameInputActive && !g_game.playerRouteActive && !g_game.pendingTransfer && g_game.transPhase == 0 && !isPlayerMoving()) {
-                int d = 0;
-                if (dpadDown) d = 2;
-                else if (dpadLeft) d = 4;
-                else if (dpadRight) d = 6;
-                else if (dpadUp) d = 8;
+            // 2) Movimiento manual ultra-responsivo del jugador (se evalúa en el mismo frame en que alcanza su casilla)
+            bool canManualMove = g_game.fgStack.empty() && !g_game.msgActive && !g_game.numInputActive &&
+                                 !g_game.btnInputActive && !g_game.nameInputActive && !g_game.playerRouteActive &&
+                                 !g_game.pendingTransfer && g_game.transPhase != 1;
+            bool holdingMoveInput = canManualMove && (dpadUp || dpadDown || dpadLeft || dpadRight);
 
-                if (d != 0) {
+            if (canManualMove && !isPlayerMoving()) {
+                int dirH = dpadLeft ? 4 : (dpadRight ? 6 : 0);
+                int dirV = dpadDown ? 2 : (dpadUp ? 8 : 0);
+                int dirCandidates[2] = { 0, 0 };
+
+                if (dirH != 0 && dirV != 0) {
+                    // Si se mantienen 2 direcciones (diagonal en stick o cruceta), priorizar eje dominante o última tecla pulsada
+                    bool preferH = (std::fabs(stickX) > std::fabs(stickY) + 0.08f) ||
+                                   (std::fabs(stickX) >= std::fabs(stickY) - 0.08f && (lastPressedDir == 4 || lastPressedDir == 6));
+                    dirCandidates[0] = preferH ? dirH : dirV;
+                    dirCandidates[1] = preferH ? dirV : dirH;
+                } else if (dirH != 0) {
+                    dirCandidates[0] = dirH;
+                    // Asistencia de esquina suave con stick analógico si el usuario inclina ligeramente en el eje perpendicular
+                    if (std::fabs(stickY) > 0.20f) dirCandidates[1] = (stickY > 0.0f) ? 2 : 8;
+                } else if (dirV != 0) {
+                    dirCandidates[0] = dirV;
+                    if (std::fabs(stickX) > 0.20f) dirCandidates[1] = (stickX > 0.0f) ? 6 : 4;
+                }
+
+                if (dirCandidates[0] != 0) {
                     lastStepTick = now;
-                    if (!g_game.playerDirFix) g_game.playerDir = d;
-                    if (g_game.playerPattern == 0) g_game.playerPattern = 1;
-                    int nx = g_game.playerX + (d == 4 ? -1 : (d == 6 ? 1 : 0));
-                    int ny = g_game.playerY + (d == 8 ? -1 : (d == 2 ? 1 : 0));
+                    int prevX = g_game.playerX, prevY = g_game.playerY;
+                    bool stepTaken = false;
 
-                    bool triggeredTouch = false;
-                    for (const auto& mev : g_game.events) {
-                        if (mev.activePage < 0) continue;
-                        const auto& pg = mev.pages[mev.activePage];
-                        if (mev.x == nx && mev.y == ny) {
-                            // Si el jugador choca contra Ao Oni (attack_on / sprite ao*), muere y vibra el mando
-                            if (mev.collisionAttack || mev.char_name.rfind("ao", 0) == 0) {
-                                triggerPlayerDeathByAoOni();
-                                triggeredTouch = true;
-                                break;
-                            }
-                            if ((pg.trigger == 1 || pg.trigger == 2) && pg.list.a.size() > 1) {
-                                if (canPassTile(nx, ny, true)) { g_game.playerX = nx; g_game.playerY = ny; }
-                                startForegroundEvent(mev.id, pg.list);
-                                triggeredTouch = true;
-                                break;
-                            }
-                        }
-                    }
-                    if (!triggeredTouch && (g_game.playerThrough || canPassTile(nx, ny, true))) {
-                        g_game.playerX = nx;
-                        g_game.playerY = ny;
+                    for (int ci = 0; ci < 2 && !stepTaken; ci++) {
+                        int d = dirCandidates[ci];
+                        if (d == 0) continue;
+                        if (ci == 0 && !g_game.playerDirFix) g_game.playerDir = d;
+
+                        int nx = g_game.playerX + (d == 4 ? -1 : (d == 6 ? 1 : 0));
+                        int ny = g_game.playerY + (d == 8 ? -1 : (d == 2 ? 1 : 0));
+
+                        bool triggeredTouch = false;
                         for (const auto& mev : g_game.events) {
                             if (mev.activePage < 0) continue;
                             const auto& pg = mev.pages[mev.activePage];
-                            if ((pg.trigger == 1 || pg.trigger == 2) && mev.x == g_game.playerX && mev.y == g_game.playerY && pg.list.a.size() > 1) {
-                                startForegroundEvent(mev.id, pg.list);
-                                break;
+                            if (mev.x == nx && mev.y == ny) {
+                                if (!g_game.playerDirFix) g_game.playerDir = d;
+                                // Si el jugador choca contra Ao Oni (attack_on / sprite ao*), muere y vibra el mando
+                                if (mev.collisionAttack || mev.char_name.rfind("ao", 0) == 0) {
+                                    triggerPlayerDeathByAoOni();
+                                    triggeredTouch = true;
+                                    stepTaken = true;
+                                    break;
+                                }
+                                if ((pg.trigger == 1 || pg.trigger == 2) && pg.list.a.size() > 1) {
+                                    if (g_game.playerThrough || canPassMove(g_game.playerX, g_game.playerY, d, true)) {
+                                        g_game.playerX = nx;
+                                        g_game.playerY = ny;
+                                    }
+                                    startForegroundEvent(mev.id, pg.list);
+                                    triggeredTouch = true;
+                                    stepTaken = true;
+                                    break;
+                                }
                             }
                         }
+
+                        if (!triggeredTouch &&
+                            ((g_game.playerThrough && nx >= 0 && ny >= 0 && nx < g_game.mapW && ny < g_game.mapH) ||
+                             canPassMove(g_game.playerX, g_game.playerY, d, true))) {
+                            if (!g_game.playerDirFix) g_game.playerDir = d;
+                            g_game.playerX = nx;
+                            g_game.playerY = ny;
+                            stepTaken = true;
+                            for (const auto& mev : g_game.events) {
+                                if (mev.activePage < 0) continue;
+                                const auto& pg = mev.pages[mev.activePage];
+                                if ((pg.trigger == 1 || pg.trigger == 2) && mev.x == g_game.playerX && mev.y == g_game.playerY && pg.list.a.size() > 1) {
+                                    startForegroundEvent(mev.id, pg.list);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    // 3) Asistencia de esquina (Corner-Slide de 1 casilla) al embestir el borde de una puerta/pasillo
+                    if (!stepTaken && dirCandidates[1] == 0) {
+                        int d = dirCandidates[0];
+                        int nx = g_game.playerX + (d == 4 ? -1 : (d == 6 ? 1 : 0));
+                        int ny = g_game.playerY + (d == 8 ? -1 : (d == 2 ? 1 : 0));
+                        const int perpDirs[2] = { (d == 4 || d == 6) ? 8 : 4, (d == 4 || d == 6) ? 2 : 6 };
+                        int slideDir = 0;
+                        int openCount = 0;
+                        for (int pd : perpDirs) {
+                            int sx = g_game.playerX + (pd == 4 ? -1 : (pd == 6 ? 1 : 0));
+                            int sy = g_game.playerY + (pd == 8 ? -1 : (pd == 2 ? 1 : 0));
+                            if (canPassMove(g_game.playerX, g_game.playerY, pd, true) && canPassMove(sx, sy, d, true)) {
+                                slideDir = pd;
+                                openCount++;
+                            }
+                        }
+                        // Deslizar automáticamente si solo uno de los dos lados contiguos tiene paso abierto hacia adelante
+                        if (openCount == 1 && slideDir != 0) {
+                            g_game.playerX += (slideDir == 4 ? -1 : (slideDir == 6 ? 1 : 0));
+                            g_game.playerY += (slideDir == 8 ? -1 : (slideDir == 2 ? 1 : 0));
+                            stepTaken = true;
+                        }
+                        (void)nx; (void)ny;
+                    }
+
+                    if (g_game.playerPattern == 0) g_game.playerPattern = 1;
+                    // Si la casilla cambió en el mismo frame en que terminamos la casilla previa, arrastrar el sub-píxel sobrante
+                    if ((g_game.playerX != prevX || g_game.playerY != prevY) && remMovePx > 0.0f) {
+                        applyCarryoverPlayerSubPixel(remMovePx);
                     }
                 }
             }
 
-            // Actualizar posiciones sub-tile a 60 FPS (con soporte de Sprint QoL con L1 o R1)
-            updateSmoothPositions(padL1 || padR1);
+            // Actualizar animación de caminata del jugador y posiciones sub-píxel de eventos a 60 FPS
+            updateWalkAndEventsSmooth(sprinting, holdingMoveInput);
 
             // Contacto de Ao Oni o eventos Event Touch en la misma casilla
-            if (g_game.fgStack.empty() && !g_game.pendingTransfer && g_game.transPhase == 0) {
+            if (g_game.fgStack.empty() && !g_game.pendingTransfer && g_game.transPhase != 1) {
                 for (const auto& mev : g_game.events) {
                     if (mev.activePage < 0) continue;
                     const auto& pg = mev.pages[mev.activePage];
@@ -3262,12 +3468,25 @@ int main(int argc, char* argv[]) {
             // Ejecutar pila del intérprete foreground
             while (!g_game.fgStack.empty() && !g_game.pendingTransfer && g_game.transPhase != 1) {
                 InterpFrame& top = g_game.fgStack.back();
+                int finishedEvId = top.evId;
+                MapEvent* startEv = (finishedEvId > 0) ? findEvent(finishedEvId) : nullptr;
+                int startActivePage = startEv ? startEv->activePage : -1;
                 size_t prevDepth = g_game.fgStack.size();
                 runInterpreterSlice(top.list, top.ip, g_game.fgWaitFrames, top.evId, true);
                 if (g_game.fgStack.size() != prevDepth) continue; // Se hizo push de un CommonEvent (cmd 117)
                 if (top.ip >= top.list.a.size() && !g_game.msgActive && !g_game.choiceActive &&
                     !g_game.numInputActive && !g_game.btnInputActive && !g_game.nameInputActive && !g_game.fgWaitForMove) {
                     g_game.fgStack.pop_back();
+                    // Protección anti-bloqueo: si un evento Autorun (trigger == 3) termina su lista sin cambiar de página ni teletransportar (ej: Map 32 Ev 9, Map 23 Ev 7), auto-desactivarlo para no congelar al jugador
+                    if (g_game.fgStack.empty() && !g_game.pendingTransfer && finishedEvId > 0) {
+                        MapEvent* endEv = findEvent(finishedEvId);
+                        if (endEv && !endEv->erased && endEv->activePage >= 0 &&
+                            endEv->activePage == startActivePage &&
+                            endEv->pages[endEv->activePage].trigger == 3) {
+                            endEv->erased = true;
+                            endEv->activePage = -1;
+                        }
+                    }
                 } else {
                     break;
                 }
