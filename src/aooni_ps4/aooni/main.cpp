@@ -269,6 +269,7 @@ struct ActiveSound {
     int volume = 100;     // 0..100
     int fadeTotalFrames = 0;
     int fadeRemFrames = 0;
+    bool fadeIn = false;
     bool active = false;
     bool loop = false;
     std::string name;
@@ -379,7 +380,7 @@ static void updateRumble() {
     }
 }
 
-static void playBgm(const std::string& name, int volume = 100, int pitch = 100) {
+static void playBgm(const std::string& name, int volume = 100, int pitch = 100, int fadeInSeconds = 0) {
     if (name == "horor-b") {
         // Pulso de susto al iniciar la música de persecución de Ao Oni
         triggerRumble(210, 180, 24);
@@ -406,8 +407,10 @@ static void playBgm(const std::string& name, int volume = 100, int pitch = 100) 
         g_bgmTrack.origPitch = pitch;
         g_bgmTrack.stepFP = (uint32_t)((std::max(25, std::min(250, pitch)) * 65536ULL) / 100ULL);
         g_bgmTrack.volume = std::max(0, std::min(100, volume));
-        g_bgmTrack.fadeTotalFrames = 0;
-        g_bgmTrack.fadeRemFrames = 0;
+        int f = (fadeInSeconds > 0) ? (fadeInSeconds * 48000) : 0;
+        g_bgmTrack.fadeTotalFrames = f;
+        g_bgmTrack.fadeRemFrames = f;
+        g_bgmTrack.fadeIn = (f > 0);
         g_bgmTrack.loop = true;
         g_bgmTrack.name = name;
         g_bgmTrack.active = true;
@@ -423,11 +426,12 @@ static void fadeOutBgm(int seconds) {
         int f = std::max(1, seconds) * 48000;
         g_bgmTrack.fadeTotalFrames = f;
         g_bgmTrack.fadeRemFrames = f;
+        g_bgmTrack.fadeIn = false;
     }
     pthread_mutex_unlock(&g_audioMutex);
 }
 
-static void playBgs(const std::string& name, int volume = 100, int pitch = 100) {
+static void playBgs(const std::string& name, int volume = 100, int pitch = 100, int fadeInSeconds = 0) {
     pthread_mutex_lock(&g_audioMutex);
     if (name.empty()) {
         g_bgsTrack.active = false;
@@ -443,8 +447,10 @@ static void playBgs(const std::string& name, int volume = 100, int pitch = 100) 
         g_bgsTrack.origPitch = pitch;
         g_bgsTrack.stepFP = (uint32_t)((std::max(25, std::min(250, pitch)) * 65536ULL) / 100ULL);
         g_bgsTrack.volume = std::max(0, std::min(100, volume));
-        g_bgsTrack.fadeTotalFrames = 0;
-        g_bgsTrack.fadeRemFrames = 0;
+        int f = (fadeInSeconds > 0) ? (fadeInSeconds * 48000) : 0;
+        g_bgsTrack.fadeTotalFrames = f;
+        g_bgsTrack.fadeRemFrames = f;
+        g_bgsTrack.fadeIn = (f > 0);
         g_bgsTrack.loop = true;
         g_bgsTrack.name = name;
         g_bgsTrack.active = true;
@@ -460,6 +466,7 @@ static void fadeOutBgs(int seconds) {
         int f = std::max(1, seconds) * 48000;
         g_bgsTrack.fadeTotalFrames = f;
         g_bgsTrack.fadeRemFrames = f;
+        g_bgsTrack.fadeIn = false;
     }
     pthread_mutex_unlock(&g_audioMutex);
 }
@@ -516,13 +523,24 @@ static inline void mixTrack(ActiveSound& tr, int32_t* accum, int frames) {
         }
         int vol = tr.volume;
         if (tr.fadeTotalFrames > 0) {
-            if (tr.fadeRemFrames <= 0) {
-                tr.active = false;
-                tr.fadeTotalFrames = 0;
-                return;
+            if (tr.fadeIn) {
+                if (tr.fadeRemFrames <= 0) {
+                    tr.fadeTotalFrames = 0;
+                    tr.fadeIn = false;
+                } else {
+                    int elapsed = tr.fadeTotalFrames - tr.fadeRemFrames;
+                    vol = (vol * (elapsed / 256)) / std::max(1, tr.fadeTotalFrames / 256);
+                    tr.fadeRemFrames--;
+                }
+            } else {
+                if (tr.fadeRemFrames <= 0) {
+                    tr.active = false;
+                    tr.fadeTotalFrames = 0;
+                    return;
+                }
+                vol = (vol * (tr.fadeRemFrames / 256)) / std::max(1, tr.fadeTotalFrames / 256);
+                tr.fadeRemFrames--;
             }
-            vol = (vol * (tr.fadeRemFrames / 256)) / std::max(1, tr.fadeTotalFrames / 256);
-            tr.fadeRemFrames--;
         }
         accum[i * 2]     += ((int32_t)smp[idx * 2]     * vol) / 100;
         accum[i * 2 + 1] += ((int32_t)smp[idx * 2 + 1] * vol) / 100;
@@ -965,6 +983,7 @@ struct MapEvent {
     std::string char_name;
     bool through = false, always_top = false, dir_fix = false, step_anime = false, erased = false;
     bool collisionAttack = false; // Activado por MoveCmd 45 "attack_on" (XAS_BA)
+    bool isBattler = false;       // Identificado por página dummy con variable_id == 25 (XAS_BA::ENEMY_ID_VARIABLE_ID)
     int move_type = 0;
     float move_speed = 3.0f;
     int move_freq = 3;
@@ -1070,6 +1089,7 @@ struct GameRuntime {
     std::string msgFace;
     std::string msgSpeaker;
     std::string msgText;
+    size_t msgCharReveal = 0; // Efecto typewriter de XRXS9 Window_Message
     int msgPos = 2;
     bool choiceActive = false;
     std::vector<std::string> choices;
@@ -1132,6 +1152,8 @@ static MapEvent* findEvent(int id) {
 }
 
 static bool checkPageCond(int mapId, int evId, const EventPage& p) {
+    // En XAS_BA (092_battler_attachment.rb), la página con variable_id == 25 es solo una etiqueta de metadatos para registrar el enemigo
+    if (p.var_valid && p.var_id == 25) return false;
     if (p.sw1_valid && (p.sw1_id < 0 || p.sw1_id >= 512 || !g_game.switches[p.sw1_id])) return false;
     if (p.sw2_valid && (p.sw2_id < 0 || p.sw2_id >= 512 || !g_game.switches[p.sw2_id])) return false;
     if (p.var_valid && (p.var_id < 0 || p.var_id >= 512 || g_game.variables[p.var_id] < p.var_val)) return false;
@@ -1141,6 +1163,23 @@ static bool checkPageCond(int mapId, int evId, const EventPage& p) {
         if (!g_game.selfSwitches[key]) return false;
     }
     return true;
+}
+
+// Implementación 1:1 de Game_Event#refresh (021_Game_Event.rb:141-163) y Game_Character#move_type_custom (019_Game_Character_2.rb:322-344)
+static std::string resolveAoOniCharName(const std::string& rawName) {
+    if (rawName != "ao") return rawName;
+    if (g_game.switches[76]) { // Modo SOUTHPARK
+        return (g_game.variables[1] == 0) ? "ao_s" : "ao_s1";
+    }
+    if (g_game.switches[175]) { // Modo BLOCKMAN / Fuatti
+        return "ao_h";
+    }
+    switch (g_game.variables[1]) {
+        case 1: return "ao_mika";
+        case 2: return "ao_takesi";
+        case 3: return "ao_takurou";
+        default: return "ao";
+    }
 }
 
 static void refreshEvents() {
@@ -1162,7 +1201,7 @@ static void refreshEvents() {
             ev.collisionAttack = false;
             if (found >= 0) {
                 const auto& pg = ev.pages[found];
-                ev.char_name = pg.char_name;
+                ev.char_name = resolveAoOniCharName(pg.char_name);
                 ev.tile_id = pg.tile_id;
                 ev.dir = pg.dir;
                 ev.pattern = pg.pattern;
@@ -1174,10 +1213,39 @@ static void refreshEvents() {
                 ev.move_type = pg.move_type;
                 ev.move_speed = (float)pg.move_speed;
                 ev.move_freq = pg.move_freq;
+                // Pre-aplicar modificadores iniciales de velocidad/ataque (code 45: @move_speed = 4.3, self.attack_on) al cambiar de página de IA (var[7])
+                if (pg.move_type == 3 && !pg.move_route.list.empty()) {
+                    while (ev.routeIdx < pg.move_route.list.size()) {
+                        const auto& mc = pg.move_route.list[ev.routeIdx];
+                        if (mc.code == 29) {
+                            ev.move_speed = (float)mc.params[0].asNum(3.0);
+                            ev.routeIdx++;
+                        } else if (mc.code == 45) {
+                            std::string s = mc.params[0].asStr();
+                            float spd = 0.0f;
+                            if (s.find("attack_on") != std::string::npos) {
+                                ev.collisionAttack = true;
+                                ev.routeIdx++;
+                            } else if (s.find("attack_off") != std::string::npos) {
+                                ev.collisionAttack = false;
+                                ev.routeIdx++;
+                            } else if (sscanf(s.c_str(), " @move_speed = %f", &spd) == 1 && spd > 0.1f) {
+                                ev.move_speed = spd;
+                                ev.routeIdx++;
+                            } else {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
             } else {
                 ev.char_name.clear();
                 ev.tile_id = 0;
             }
+        } else if (found >= 0 && ev.pages[found].char_name == "ao") {
+            ev.char_name = resolveAoOniCharName("ao");
         }
     }
 }
@@ -1407,7 +1475,7 @@ static bool applyMoveCmd(int targetId, const MoveCmd& mc) {
         case 39: if (ev) ev->always_top = true; consumesStep = false; break;
         case 40: if (ev) ev->always_top = false; consumesStep = false; break;
         case 41: // Change Graphic: [char_name, hue, dir, pattern]
-            *pchar = mc.params[0].asStr();
+            *pchar = resolveAoOniCharName(mc.params[0].asStr());
             if (targetId == -1) g_game.playerTransparent = pchar->empty();
             if (mc.params.a.size() >= 3 && mc.params[2].asInt(0) > 0) *pdir = mc.params[2].asInt(2);
             if (mc.params.a.size() >= 4) *ppat = mc.params[3].asInt(0) % 4;
@@ -1579,11 +1647,14 @@ static bool loadMap(int mapId) {
                 pg.always_top = jp.get("always_top").asBool(false);
                 pg.trigger = jp.get("trigger").asInt(0);
                 pg.list = jp.get("list");
+                if (pg.var_valid && pg.var_id == 25) ev.isBattler = true;
                 ev.pages.push_back(pg);
             }
             g_game.events.push_back(ev);
         }
     }
+    // Reiniciar el estado de waypoints de IA de Ao Oni (var[7]) al entrar a cada sala
+    g_game.variables[7] = 0;
     refreshEvents();
     buildMapCacheSurfaces();
 
@@ -1661,9 +1732,17 @@ static void formatDialogText(const std::string& raw, std::string& faceOut, std::
         size_t fend = s.find(']', fpos + 3);
         if (fend != std::string::npos) {
             std::string baseFace = s.substr(fpos + 3, fend - (fpos + 3));
-            if (g_game.switches[47]) faceOut = baseFace + "s";
-            else if (g_game.switches[76]) faceOut = baseFace + "2";
-            else faceOut = baseFace;
+            // Implementación 1:1 de 093_XRXS9msg.rb:281-297:
+            // switch 47 ("HIROSI") = retrato clásico 1.0; switch 76 ("SOUTHPARK") = *s.png; por defecto 6.23 = *2.png
+            if (g_game.switches[47]) {
+                faceOut = baseFace;
+            } else if (g_game.switches[76]) {
+                std::string spFace = baseFace + "s";
+                faceOut = getSurf(std::string("/app0/assets/images/pic_") + spFace + ".png") ? spFace : baseFace;
+            } else {
+                std::string v6Face = baseFace + "2";
+                faceOut = getSurf(std::string("/app0/assets/images/pic_") + v6Face + ".png") ? v6Face : baseFace;
+            }
             s.erase(fpos, fend - fpos + 1);
         }
     }
@@ -1888,7 +1967,7 @@ static void execControlVars(int evId, const JVal& p) {
     refreshEvents();
 }
 
-static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, int evId, bool isForeground) {
+static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, int evId, bool isForeground, bool* outExited = nullptr) {
     int startPage = -2;
     if (!isForeground && evId > 0) {
         MapEvent* selfEv = findEvent(evId);
@@ -1896,7 +1975,7 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
         startPage = selfEv->activePage;
     }
     int steps = 0;
-    while (ip < list.a.size() && steps < 160) {
+    while (ip < list.a.size() && steps < 1024) {
         if (!isForeground && evId > 0) {
             MapEvent* selfEv = findEvent(evId);
             if (!selfEv || selfEv->erased || selfEv->activePage != startPage) return;
@@ -1929,6 +2008,7 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                     ip++;
                 }
                 formatDialogText(lines, g_game.msgFace, g_game.msgSpeaker, g_game.msgText);
+                g_game.msgCharReveal = 0;
                 g_game.msgActive = true;
                 if (ip < list.a.size() && list[ip].get("c").asInt(0) == 102) {
                     const JVal& cp = list[ip].get("p");
@@ -1941,6 +2021,7 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                     g_game.choiceIndex = 0;
                     g_game.choiceIndent = list[ip].get("i").asInt(0);
                     g_game.choiceActive = true;
+                    g_game.msgCharReveal = g_game.msgText.size();
                     ip++;
                 }
                 return;
@@ -2041,11 +2122,21 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
             }
             case 115: // Exit Event Processing
                 ip = list.a.size();
+                if (outExited) *outExited = true;
+                if (isForeground) {
+                    for (auto& fr : g_game.fgStack)
+                        if (fr.evId == evId) fr.ip = fr.list.a.size();
+                }
                 return;
             case 116: { // Erase Event
                 MapEvent* ev = findEvent(evId);
                 if (ev) { ev->erased = true; ev->activePage = -1; }
                 ip = list.a.size();
+                if (outExited) *outExited = true;
+                if (isForeground) {
+                    for (auto& fr : g_game.fgStack)
+                        if (fr.evId == evId) fr.ip = fr.list.a.size();
+                }
                 return;
             }
             case 117: { // Call Common Event
@@ -2055,6 +2146,7 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                     // CE 1 (gameover) llamado desde evento paralelo (ej: CE 25 armario cuando Ao Oni te descubre)
                     triggerPlayerDeathByAoOni();
                     ip = list.a.size();
+                    if (outExited) *outExited = true;
                     return;
                 }
                 for (auto& ce : g_game.commonEvents) {
@@ -2063,8 +2155,13 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                             g_game.fgStack.push_back({ ce.list, 0, evId, g_game.mapId });
                             return;
                         } else {
-                            size_t subIp = 0; int subWait = 0;
-                            runInterpreterSlice(ce.list, subIp, subWait, evId, false);
+                            size_t subIp = 0; int subWait = 0; bool subExited = false;
+                            runInterpreterSlice(ce.list, subIp, subWait, evId, false, &subExited);
+                            if (subExited) {
+                                ip = list.a.size();
+                                if (outExited) *outExited = true;
+                                return;
+                            }
                         }
                         break;
                     }
@@ -2302,9 +2399,11 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                 ip++;
                 break;
             }
-            case 241: { // Play BGM
+            case 241: { // Play BGM (con soporte de Zenith RGSS15 098_fadein.rb FADE_VARIABLE = 10)
                 const JVal& af = p[0];
-                playBgm(af.get("name").asStr(), af.get("volume").asInt(100), af.get("pitch").asInt(100));
+                int fadeSec = (g_game.variables[10] > 0) ? g_game.variables[10] : 0;
+                g_game.variables[10] = 0;
+                playBgm(af.get("name").asStr(), af.get("volume").asInt(100), af.get("pitch").asInt(100), fadeSec);
                 ip++;
                 break;
             }
@@ -2312,9 +2411,11 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                 fadeOutBgm(p[0].asInt(1));
                 ip++;
                 break;
-            case 245: { // Play BGS
+            case 245: { // Play BGS (con soporte de Zenith RGSS15 098_fadein.rb FADE_VARIABLE = 10)
                 const JVal& af = p[0];
-                playBgs(af.get("name").asStr(), af.get("volume").asInt(100), af.get("pitch").asInt(100));
+                int fadeSec = (g_game.variables[10] > 0) ? g_game.variables[10] : 0;
+                g_game.variables[10] = 0;
+                playBgs(af.get("name").asStr(), af.get("volume").asInt(100), af.get("pitch").asInt(100), fadeSec);
                 ip++;
                 break;
             }
@@ -2487,18 +2588,23 @@ static void updateWalkAndEventsSmooth(bool sprinting, bool holdingMoveInput) {
         }
     }
 
-    // Interpolación suave a 60 FPS de todos los eventos del mapa
+    // Interpolación suave a 60 FPS de todos los eventos del mapa (con pausa XAS_BA_BATTLEEVENT_NONPREEMPT para Ao Oni en diálogos)
+    bool nonPreemptPause = !g_game.fgStack.empty() || g_game.msgActive || g_game.choiceActive ||
+                           g_game.numInputActive || g_game.btnInputActive || g_game.nameInputActive || g_game.pendingTransfer;
     for (auto& ev : g_game.events) {
         if (ev.activePage < 0) continue;
-        float etx = (float)(ev.x * TILE_SZ);
-        float ety = (float)(ev.y * TILE_SZ);
-        float espd = rmxpSpeedPxPerFrame(ev.move_speed);
-        float edx = etx - ev.realX;
-        float edy = ety - ev.realY;
-        if (std::fabs(edx) <= espd) ev.realX = etx;
-        else ev.realX += (edx > 0.0f ? espd : -espd);
-        if (std::fabs(edy) <= espd) ev.realY = ety;
-        else ev.realY += (edy > 0.0f ? espd : -espd);
+        bool isAoBattler = ev.isBattler || ev.collisionAttack || ev.char_name.rfind("ao", 0) == 0;
+        if (!nonPreemptPause || ev.routeActive || !isAoBattler) {
+            float etx = (float)(ev.x * TILE_SZ);
+            float ety = (float)(ev.y * TILE_SZ);
+            float espd = rmxpSpeedPxPerFrame(ev.move_speed);
+            float edx = etx - ev.realX;
+            float edy = ety - ev.realY;
+            if (std::fabs(edx) <= espd) ev.realX = etx;
+            else ev.realX += (edx > 0.0f ? espd : -espd);
+            if (std::fabs(edy) <= espd) ev.realY = ety;
+            else ev.realY += (edy > 0.0f ? espd : -espd);
+        }
 
         if (isEventMoving(ev) || ev.step_anime) {
             ev.animTicks++;
@@ -3138,6 +3244,11 @@ int main(int argc, char* argv[]) {
                 if (b == PAD_TRIANGLE || b == PAD_CIRCLE) {
                     playSe("003-System03", 80, 100);
                     state = STATE_MAP;
+                } else if (g_game.switches[178]) {
+                    // En 072_Scene_Menu.rb:134-137 (evento del sótano del anexo en Map 67), cuando se activa switch 178 en el menú, solo permite salir con Círculo
+                    if (b == PAD_CROSS || b == PAD_SQUARE || b == PAD_OPTIONS) {
+                        playSe("004-System04", 80, 100);
+                    }
                 } else if (b == PAD_OPTIONS) {
                     playSe("003-System03", 80, 100);
                     setPadLightbar(25, 45, 160);
@@ -3276,6 +3387,7 @@ int main(int argc, char* argv[]) {
                         int wanted = g_game.choiceIndex;
                         g_game.choiceActive = false;
                         g_game.msgActive = false;
+                        if (g_game.switches[49]) g_game.timerWorking = true; // 054_Window_Message.rb:64-66
                         InterpFrame& fr = g_game.fgStack.back();
                         while (fr.ip < fr.list.a.size()) {
                             const JVal& c = fr.list[fr.ip];
@@ -3291,7 +3403,14 @@ int main(int argc, char* argv[]) {
                         }
                     }
                 } else if (g_game.msgActive) {
-                    if (b == PAD_CROSS || b == PAD_CIRCLE) g_game.msgActive = false;
+                    if (b == PAD_CROSS || b == PAD_CIRCLE) {
+                        if (g_game.msgCharReveal < g_game.msgText.size()) {
+                            g_game.msgCharReveal = g_game.msgText.size();
+                        } else {
+                            g_game.msgActive = false;
+                            if (g_game.switches[49]) g_game.timerWorking = true; // 054_Window_Message.rb:64-66
+                        }
+                    }
                 } else if (g_game.fgStack.empty()) {
                     if (b == PAD_CROSS) {
                         int fx = g_game.playerX + (g_game.playerDir == 4 ? -1 : (g_game.playerDir == 6 ? 1 : 0));
@@ -3314,15 +3433,30 @@ int main(int argc, char* argv[]) {
                         playSe("002-System02", 80, 100);
                         invCursor = 0;
                         invStatusMsg.clear();
+                        // Implementación 1:1 de 072_Scene_Menu.rb:26-43:
+                        // En la celda del sótano del anexo (Map 67, X=9, Y=14, mirando abajo tras colocar las 3 muñecas), abrir el menú activa a Takuro Oni (switch 178)
+                        if (g_game.mapId == 67 && g_game.playerX == 9 && g_game.playerY == 14 && g_game.playerDir == 2 &&
+                            g_game.switches[168] && g_game.switches[169] && g_game.switches[170] && !g_game.switches[180]) {
+                            g_game.variables[1] = 3;
+                            g_game.switches[178] = true;
+                            refreshEvents();
+                            playBgm("horor-b", 100, 100);
+                            invStatusMsg = "Se escucha algo acercarse! Pulsa Circulo para salir!";
+                        }
                         state = STATE_INVENTORY;
                     }
                 }
             }
         }
 
-        // QoL: Avance rápido de diálogos manteniendo R1 pulsado
-        if (state == STATE_MAP && g_game.msgActive && !g_game.choiceActive && padR1 && (frame % 4 == 0)) {
-            g_game.msgActive = false;
+        // Avance del efecto typewriter (XRXS9 Window_Message) y avance rápido con R1
+        if (state == STATE_MAP && g_game.msgActive) {
+            if (g_game.msgCharReveal < g_game.msgText.size()) {
+                g_game.msgCharReveal = std::min(g_game.msgText.size(), g_game.msgCharReveal + (padR1 ? 8 : 2));
+            } else if (!g_game.choiceActive && padR1 && (frame % 4 == 0)) {
+                g_game.msgActive = false;
+                if (g_game.switches[49]) g_game.timerWorking = true;
+            }
         }
         if (videoBannerFrames > 0) videoBannerFrames--;
 
@@ -3774,7 +3908,7 @@ int main(int argc, char* argv[]) {
                 fillRectFast(gameSurf, offX, offY, GAME_W, GAME_H, 0, 0, 0, (uint8_t)std::min(255, g_game.fadeAlpha));
             }
 
-            // 5.6) Cronómetro en pantalla si el Easter Egg "TIMER" (switch 43) está activo
+            // 5.6) Cronómetro en pantalla si el Easter Egg "TIMER" (switch 43 / 026_Sprite_Timer.rb) está activo
             if (g_game.switches[43]) {
                 uint32_t totalFrames = g_game.frameCount;
                 int mins = (int)((totalFrames / 3600) % 100);
@@ -3785,6 +3919,14 @@ int main(int argc, char* argv[]) {
                 fillRectFast(gameSurf, offX + 12, offY + 12, 116, 26, 15, 22, 68, 210);
                 drawRectFast(gameSurf, offX + 12, offY + 12, 116, 26, 190, 210, 255);
                 drawText(gameSurf, offX + 20, offY + 18, tbuf, 2, 255, 240, 130);
+                if (g_game.timerWorking) {
+                    int chaseSec = g_game.timerFrames / 60;
+                    char cbuf[32];
+                    snprintf(cbuf, sizeof(cbuf), "ONI %02d:%02d", chaseSec / 60, chaseSec % 60);
+                    fillRectFast(gameSurf, offX + 134, offY + 12, 126, 26, 55, 16, 48, 220);
+                    drawRectFast(gameSurf, offX + 134, offY + 12, 126, 26, 255, 160, 210);
+                    drawText(gameSurf, offX + 142, offY + 18, cbuf, 2, 255, 190, 220);
+                }
             }
 
             if (autoSaveBannerFrames > 0) {
@@ -3813,7 +3955,13 @@ int main(int argc, char* argv[]) {
                     drawText(gameSurf, textX, textY, "[" + g_game.msgSpeaker + "]", 2, 255, 230, 120);
                     textY += 24;
                 }
-                drawText(gameSurf, textX, textY, g_game.msgText, 2, 255, 255, 255);
+                size_t revLen = std::min(g_game.msgCharReveal, g_game.msgText.size());
+                // Evitar partir secuencias UTF-8 de 2 bytes (0xC2 / 0xC3) a la mitad durante el efecto typewriter
+                if (revLen > 0 && revLen < g_game.msgText.size()) {
+                    unsigned char lastB = (unsigned char)g_game.msgText[revLen - 1];
+                    if (lastB == 0xC2 || lastB == 0xC3) revLen++;
+                }
+                drawText(gameSurf, textX, textY, g_game.msgText.substr(0, revLen), 2, 255, 255, 255);
             }
 
             // 7) Cuadro de elecciones (cmd 102)
