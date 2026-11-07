@@ -17,8 +17,10 @@
 
 #include <SDL2/SDL.h>
 #include <orbis/libkernel.h>
+#include <orbis/VideoOut.h>
 #include <orbis/AudioOut.h>
 #include <orbis/UserService.h>
+#include <orbis/Pad.h>
 #include "mini_json.h"
 
 #define STBI_NO_SIMD
@@ -32,6 +34,7 @@
 #define GAME_H   480
 #define TILE_SZ  32
 
+// Mapeo exacto de botones de libSDL2.a (SDL_sysjoystick.c.o para DualShock 4)
 #define PAD_CROSS    0
 #define PAD_CIRCLE   1
 #define PAD_SQUARE   2
@@ -39,10 +42,219 @@
 #define PAD_L1       4
 #define PAD_R1       5
 #define PAD_OPTIONS  9
-#define PAD_UP       11
-#define PAD_DOWN     12
-#define PAD_LEFT     13
-#define PAD_RIGHT    14
+#define PAD_L3       11
+#define PAD_R3       12
+#define PAD_UP       13
+#define PAD_DOWN     14
+#define PAD_LEFT     15
+#define PAD_RIGHT    16
+#define PAD_TOUCHPAD 17
+#define PAD_L2       18
+#define PAD_R2       19
+
+// ==================== SALIDA DE VIDEO PS4 / PS4 PRO 4K NATIVO (sceVideoOut) ====================
+extern "C" void* SDL_GetVideoDevice(void);
+
+struct PS4_VideoData {
+    int32_t handle;                        // +0x00
+    uint32_t width;                        // +0x04
+    uint32_t height;                       // +0x08
+    uint32_t pad0;                         // +0x0C
+    OrbisKernelEqueue flipQueue;           // +0x10
+    OrbisVideoOutBufferAttribute attr;     // +0x18 (0x28 bytes)
+    int32_t currentBuffer;                 // +0x40
+    uint32_t pad1;                         // +0x44
+    void* buffers[2];                      // +0x48, +0x50
+    off_t directMemOff;                    // +0x58
+    void* videoMem;                        // +0x60
+    uint32_t singleBufferSize;             // +0x68
+    uint32_t totalAllocSize;               // +0x6C
+};
+
+enum VideoScaleMode {
+    SCALE_4_3_FIT = 0,       // 4:3 Nítido Completo (ej: 2880x2160 en 4K, 1440x1080 en 1080p, 960x720 en 720p)
+    SCALE_16_9_FULL = 1,     // 16:9 Pantalla Completa (3840x2160 en 4K)
+    SCALE_PIXEL_PERFECT = 2  // Entero Pixel-Perfect (4x = 2560x1920 en 4K, 2x = 1280x960 en 1080p)
+};
+
+static int g_videoScaleMode = SCALE_4_3_FIT;
+static int g_videoResIndex = 0; // 0 = 720p (1280x720), 1 = 1080p (1920x1080), 2 = 4K Nativo PS4 Pro (3840x2160)
+static bool g_videoClearNeeded = true;
+
+static PS4_VideoData* getPs4VideoData() {
+    void* dev = SDL_GetVideoDevice();
+    if (!dev) return nullptr;
+    return *(PS4_VideoData**)((uint8_t*)dev + 0x530);
+}
+
+static bool setVideoOutputResolution(int targetW, int targetH) {
+    PS4_VideoData* vd = getPs4VideoData();
+    if (!vd || vd->handle <= 0) return false;
+    if ((int)vd->width == targetW && (int)vd->height == targetH) {
+        g_videoClearNeeded = true;
+        return true;
+    }
+
+    uint32_t singleSz = (uint32_t)targetW * (uint32_t)targetH * 4u;
+    uint32_t totalSz  = (singleSz * 2u + 0xFFFFFu) & ~0xFFFFFu; // Alineado a 1 MB
+
+    off_t newPhys = 0;
+    int32_t ret = sceKernelAllocateDirectMemory(0, 0x180000000ULL, totalSz, 0x100000, 3, &newPhys);
+    if (ret < 0) {
+        printf("[AoOni] No se pudo reservar DirectMemory para %dx%d (err=0x%08x)\n", targetW, targetH, ret);
+        return false;
+    }
+
+    void* newMem = nullptr;
+    ret = sceKernelMapDirectMemory(&newMem, totalSz, 0x33, 0, newPhys, 0x100000);
+    if (ret < 0 || !newMem) {
+        sceKernelReleaseDirectMemory(newPhys, totalSz);
+        printf("[AoOni] No se pudo mapear DirectMemory para %dx%d (err=0x%08x)\n", targetW, targetH, ret);
+        return false;
+    }
+
+    memset(newMem, 0, totalSz);
+    void* newBufs[2] = { newMem, (uint8_t*)newMem + singleSz };
+    OrbisVideoOutBufferAttribute newAttr;
+    memset(&newAttr, 0, sizeof(newAttr));
+    sceVideoOutSetBufferAttribute(&newAttr, ORBIS_VIDEO_OUT_PIXEL_FORMAT_A8B8G8R8_SRGB,
+                                  ORBIS_VIDEO_OUT_TILING_MODE_LINEAR, ORBIS_VIDEO_OUT_ASPECT_RATIO_16_9,
+                                  targetW, targetH, targetW);
+
+    sceVideoOutUnregisterBuffers(vd->handle, 0);
+    ret = sceVideoOutRegisterBuffers(vd->handle, 0, newBufs, 2, &newAttr);
+    if (ret < 0) {
+        // Fallback seguro a los buffers anteriores si el monitor/emulador no soporta esa resolución
+        sceVideoOutRegisterBuffers(vd->handle, 0, vd->buffers, 2, &vd->attr);
+        sceKernelMunmap(newMem, totalSz);
+        sceKernelReleaseDirectMemory(newPhys, totalSz);
+        printf("[AoOni] sceVideoOutRegisterBuffers rechazo %dx%d (err=0x%08x), manteniendo %ux%u\n",
+               targetW, targetH, ret, vd->width, vd->height);
+        return false;
+    }
+
+    if (vd->videoMem && vd->totalAllocSize > 0) {
+        sceKernelMunmap(vd->videoMem, vd->totalAllocSize);
+    }
+    if (vd->directMemOff != 0 && vd->totalAllocSize > 0) {
+        sceKernelReleaseDirectMemory(vd->directMemOff, vd->totalAllocSize);
+    }
+
+    vd->width = (uint32_t)targetW;
+    vd->height = (uint32_t)targetH;
+    vd->attr = newAttr;
+    vd->currentBuffer = 0;
+    vd->buffers[0] = newBufs[0];
+    vd->buffers[1] = newBufs[1];
+    vd->directMemOff = newPhys;
+    vd->videoMem = newMem;
+    vd->singleBufferSize = singleSz;
+    vd->totalAllocSize = totalSz;
+    g_videoClearNeeded = true;
+    printf("[AoOni] Modo de salida de video activo: %dx%d (%s)\n",
+           targetW, targetH, (targetW >= 3840) ? "4K Nativo PS4 Pro" : ((targetW >= 1920) ? "1080p Full HD" : "720p HD"));
+    return true;
+}
+
+static void cycleVideoResolution() {
+    const int resTable[3][2] = { {1280, 720}, {1920, 1080}, {3840, 2160} };
+    for (int attempt = 0; attempt < 3; attempt++) {
+        g_videoResIndex = (g_videoResIndex + 1) % 3;
+        if (setVideoOutputResolution(resTable[g_videoResIndex][0], resTable[g_videoResIndex][1]))
+            return;
+    }
+}
+
+static const char* getVideoResLabel() {
+    PS4_VideoData* vd = getPs4VideoData();
+    uint32_t w = vd ? vd->width : SCREEN_W;
+    if (w >= 3840) return "4K Nativo (3840x2160 PS4 Pro)";
+    if (w >= 1920) return "1080p Full HD (1920x1080)";
+    return "720p HD (1280x720)";
+}
+
+static const char* getVideoScaleLabel() {
+    if (g_videoScaleMode == SCALE_16_9_FULL) return "16:9 Completa";
+    if (g_videoScaleMode == SCALE_PIXEL_PERFECT) return "Pixel-Perfect";
+    return "4:3 Nitido";
+}
+
+// Escalador Nearest-Neighbor con caché de scanlines (escala 640x480 -> hasta 3840x2160 4K en < 1.5 ms)
+static void presentScaledCanvas(SDL_Window* window, SDL_Surface* gameSurf) {
+    PS4_VideoData* vd = getPs4VideoData();
+    if (!vd || !vd->buffers[0] || !vd->buffers[1]) {
+        SDL_Surface* winSurf = SDL_GetWindowSurface(window);
+        if (winSurf && gameSurf) {
+            SDL_BlitScaled(gameSurf, NULL, winSurf, NULL);
+            SDL_UpdateWindowSurface(window);
+        }
+        return;
+    }
+
+    if (g_videoClearNeeded) {
+        if (vd->buffers[0]) memset(vd->buffers[0], 0, vd->singleBufferSize);
+        if (vd->buffers[1]) memset(vd->buffers[1], 0, vd->singleBufferSize);
+        g_videoClearNeeded = false;
+    }
+
+    const int outW = (int)vd->width;
+    const int outH = (int)vd->height;
+    int dstW = outW, dstH = outH;
+
+    if (g_videoScaleMode == SCALE_4_3_FIT) {
+        dstH = outH;
+        dstW = (outH * 4) / 3;
+        if (dstW > outW) { dstW = outW; dstH = (outW * 3) / 4; }
+    } else if (g_videoScaleMode == SCALE_PIXEL_PERFECT) {
+        int factor = std::min(outW / GAME_W, outH / GAME_H);
+        if (factor < 1) factor = 1;
+        dstW = GAME_W * factor;
+        dstH = GAME_H * factor;
+    } else {
+        dstW = outW;
+        dstH = outH;
+    }
+
+    const int dstX = (outW - dstW) / 2;
+    const int dstY = (outH - dstH) / 2;
+    uint32_t* dstBase = (uint32_t*)vd->buffers[vd->currentBuffer];
+    const uint32_t* srcBase = (const uint32_t*)gameSurf->pixels;
+    const int srcPitch = gameSurf->pitch / 4;
+
+    static int s_cachedDstW = 0;
+    static int s_xMap[4096];
+    if (s_cachedDstW != dstW) {
+        for (int x = 0; x < dstW && x < 4096; x++) {
+            s_xMap[x] = (x * GAME_W) / dstW;
+        }
+        s_cachedDstW = dstW;
+    }
+
+    int prevSy = -1;
+    uint32_t* prevDstRow = nullptr;
+    const size_t rowBytes = (size_t)dstW * 4u;
+
+    for (int y = 0; y < dstH; y++) {
+        int sy = (y * GAME_H) / dstH;
+        uint32_t* dstRow = dstBase + (size_t)(dstY + y) * outW + dstX;
+        if (sy == prevSy && prevDstRow) {
+            memcpy(dstRow, prevDstRow, rowBytes);
+        } else {
+            const uint32_t* srcRow = srcBase + (size_t)sy * srcPitch;
+            for (int x = 0; x < dstW; x++) {
+                dstRow[x] = srcRow[s_xMap[x]];
+            }
+            prevSy = sy;
+            prevDstRow = dstRow;
+        }
+    }
+
+    sceVideoOutSubmitFlip(vd->handle, vd->currentBuffer, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0);
+    OrbisKernelEvent ev;
+    int outEv = 0;
+    sceKernelWaitEqueue(vd->flipQueue, &ev, 1, &outEv, NULL);
+    vd->currentBuffer = (vd->currentBuffer + 1) & 1;
+}
 
 // ==================== SISTEMA DE AUDIO PS4 (sceAudioOut 48kHz Stereo) ====================
 struct PcmBuffer {
@@ -117,7 +329,61 @@ static const PcmBuffer* getPcm(const std::string& prefix, const std::string& raw
     return pb;
 }
 
+// ==================== VIBRACIÓN Y BARRA DE LUZ DUALSHOCK 4 (scePad) ====================
+static int g_padHandle = -1;
+static int g_rumbleFrames = 0;
+static uint8_t g_rumbleLarge = 0;
+static uint8_t g_rumbleSmall = 0;
+static uint8_t g_lastLightR = 0, g_lastLightG = 0, g_lastLightB = 0;
+
+static void initPadHandle() {
+    int32_t userId = 0;
+    if (sceUserServiceGetInitialUser(&userId) == 0) {
+        g_padHandle = scePadGetHandle(userId, 0, 0);
+    }
+    if (g_padHandle < 0) {
+        g_padHandle = 1; // Handle abierto por SDL_JoystickOpen(0) en PS4 / shadPS4
+    }
+}
+
+static void triggerRumble(uint8_t largeMotor, uint8_t smallMotor, int frames) {
+    if (g_padHandle < 0) initPadHandle();
+    if (frames >= g_rumbleFrames || largeMotor >= g_rumbleLarge) {
+        g_rumbleLarge = largeMotor;
+        g_rumbleSmall = smallMotor;
+        g_rumbleFrames = std::max(g_rumbleFrames, frames);
+        OrbisPadVibeParam vp;
+        vp.lgMotor = largeMotor;
+        vp.smMotor = smallMotor;
+        scePadSetVibration(g_padHandle, &vp);
+    }
+}
+
+static void setPadLightbar(uint8_t r, uint8_t g, uint8_t b) {
+    if (r == g_lastLightR && g == g_lastLightG && b == g_lastLightB) return;
+    if (g_padHandle < 0) initPadHandle();
+    g_lastLightR = r; g_lastLightG = g; g_lastLightB = b;
+    OrbisPadColor col = { r, g, b, 255 };
+    scePadSetLightBar(g_padHandle, &col);
+}
+
+static void updateRumble() {
+    if (g_rumbleFrames > 0) {
+        g_rumbleFrames--;
+        if (g_rumbleFrames == 0 && g_padHandle >= 0) {
+            OrbisPadVibeParam vp = { 0, 0 };
+            scePadSetVibration(g_padHandle, &vp);
+            g_rumbleLarge = 0;
+            g_rumbleSmall = 0;
+        }
+    }
+}
+
 static void playBgm(const std::string& name, int volume = 100, int pitch = 100) {
+    if (name == "horor-b") {
+        // Pulso de susto al iniciar la música de persecución de Ao Oni
+        triggerRumble(210, 180, 24);
+    }
     pthread_mutex_lock(&g_audioMutex);
     if (name.empty()) {
         g_bgmTrack.active = false;
@@ -200,6 +466,11 @@ static void fadeOutBgs(int seconds) {
 
 static void playSe(const std::string& name, int volume = 100, int pitch = 100) {
     if (name.empty()) return;
+    if (name == "bikkuri" || name == "crash23" || name == "a5_05142") {
+        triggerRumble(220, 180, 22);
+    } else if (name == "025-Door02" && pitch >= 140) {
+        triggerRumble(255, 255, 45);
+    }
     pthread_mutex_lock(&g_audioMutex);
     const PcmBuffer* pb = getPcm("se_", name);
     if (pb && pb->frames > 0) {
@@ -693,6 +964,7 @@ struct MapEvent {
     int dir = 2, pattern = 0, opacity = 255, tile_id = 0;
     std::string char_name;
     bool through = false, always_top = false, dir_fix = false, step_anime = false, erased = false;
+    bool collisionAttack = false; // Activado por MoveCmd 45 "attack_on" (XAS_BA)
     int move_type = 0;
     float move_speed = 3.0f;
     int move_freq = 3;
@@ -814,6 +1086,14 @@ struct GameRuntime {
     bool btnInputActive = false;
     int btnInputVarId = 8;
 
+    // Entrada de nombre del protagonista (cmd 303 - Teclado en pantalla + Easter Eggs oficiales)
+    bool nameInputActive = false;
+    int nameInputActorId = 2;
+    int nameInputMaxLen = 10;
+    std::string nameInputStr = "Hiroshi";
+    int nameInputRow = 6; // Fila 6 = botones rápidos ([CONFIRMAR], [BORRAR], Hiroshi, SOUTHPARK, GODMODE...)
+    int nameInputCol = 0;
+
     bool pendingTransfer = false;
     int nextMapId = 0, nextX = 0, nextY = 0, nextDir = 0;
     bool gameOverTriggered = false;
@@ -832,7 +1112,7 @@ static inline bool isEventMoving(const MapEvent& ev) {
 }
 
 static inline float rmxpSpeedPxPerFrame(float spd) {
-    float s = std::max(1.0f, std::min(6.0f, spd));
+    float s = std::max(1.0f, std::min(7.0f, spd));
     // En RPG Maker XP (ajustado a 60 FPS): speed 3 = 2 px/frame, speed 4 = 4 px/frame (8 frames por tile de 32px)
     return std::pow(2.0f, s) * 0.25f;
 }
@@ -876,6 +1156,9 @@ static void refreshEvents() {
             ev.activePage = found;
             ev.parIp = 0;
             ev.parWait = 0;
+            ev.routeIdx = 0;
+            ev.routeWaitFrames = 0;
+            ev.collisionAttack = false;
             if (found >= 0) {
                 const auto& pg = ev.pages[found];
                 ev.char_name = pg.char_name;
@@ -895,6 +1178,15 @@ static void refreshEvents() {
                 ev.tile_id = 0;
             }
         }
+    }
+}
+
+static void triggerPlayerDeathByAoOni() {
+    if (!g_game.switches[150] && !g_game.switches[50]) {
+        g_game.switches[50] = true;
+        refreshEvents();
+        triggerRumble(255, 255, 65);
+        setPadLightbar(255, 0, 0);
     }
 }
 
@@ -941,6 +1233,21 @@ static bool stepCharacterDir(int& x, int& y, int& dir, int d, bool dirFix, bool 
     if (!dirFix) dir = d;
     int nx = x + (d == 4 ? -1 : (d == 6 ? 1 : 0));
     int ny = y + (d == 8 ? -1 : (d == 2 ? 1 : 0));
+    if (!isPlayer && evId > 0 && nx == g_game.playerX && ny == g_game.playerY) {
+        MapEvent* selfEv = findEvent(evId);
+        if (selfEv && selfEv->activePage >= 0) {
+            if (selfEv->collisionAttack || selfEv->char_name.rfind("ao", 0) == 0) {
+                triggerPlayerDeathByAoOni();
+            } else if (g_game.fgStack.empty() && !g_game.pendingTransfer) {
+                const auto& pg = selfEv->pages[selfEv->activePage];
+                if (pg.trigger == 2 && pg.list.a.size() > 1) {
+                    g_game.fgStack.push_back({ pg.list, 0, selfEv->id });
+                    g_game.fgWaitFrames = 0;
+                    g_game.fgWaitForMove = false;
+                }
+            }
+        }
+    }
     if (through || canPassTile(nx, ny, isPlayer, evId)) {
         x = nx; y = ny;
         return true;
@@ -948,13 +1255,32 @@ static bool stepCharacterDir(int& x, int& y, int& dir, int d, bool dirFix, bool 
     return false;
 }
 
+// Implementación 1:1 de SCRIPT [96] idou_route (move_toward_position / move_toward_event)
+static bool stepTowardCoords(int& x, int& y, int& dir, int tx, int ty, bool dirFix, bool through, bool isPlayer, int evId) {
+    int sx = x - tx;
+    int sy = y - ty;
+    if (sx == 0 && sy == 0) return false;
+    int abs_sx = std::abs(sx);
+    int abs_sy = std::abs(sy);
+    if (abs_sx == abs_sy) {
+        if (rand() % 2 == 0) abs_sx++; else abs_sy++;
+    }
+    if (abs_sx > abs_sy) {
+        int d1 = (sx > 0) ? 4 : 6;
+        int d2 = (sy > 0) ? 8 : 2;
+        if (stepCharacterDir(x, y, dir, d1, dirFix, through, isPlayer, evId)) return true;
+        if (sy != 0 && stepCharacterDir(x, y, dir, d2, dirFix, through, isPlayer, evId)) return true;
+    } else {
+        int d1 = (sy > 0) ? 8 : 2;
+        int d2 = (sx > 0) ? 4 : 6;
+        if (stepCharacterDir(x, y, dir, d1, dirFix, through, isPlayer, evId)) return true;
+        if (sx != 0 && stepCharacterDir(x, y, dir, d2, dirFix, through, isPlayer, evId)) return true;
+    }
+    return false;
+}
+
 static void stepTowardPlayer(MapEvent& ev) {
-    int dx = g_game.playerX - ev.x;
-    int dy = g_game.playerY - ev.y;
-    int d1 = (std::abs(dx) >= std::abs(dy)) ? (dx > 0 ? 6 : 4) : (dy > 0 ? 2 : 8);
-    int d2 = (std::abs(dx) >= std::abs(dy)) ? (dy > 0 ? 2 : 8) : (dx > 0 ? 6 : 4);
-    if (!stepCharacterDir(ev.x, ev.y, ev.dir, d1, ev.dir_fix, ev.through, false, ev.id) && (dx != 0 || dy != 0))
-        stepCharacterDir(ev.x, ev.y, ev.dir, d2, ev.dir_fix, ev.through, false, ev.id);
+    stepTowardCoords(ev.x, ev.y, ev.dir, g_game.playerX, g_game.playerY, ev.dir_fix, ev.through, false, ev.id);
 }
 
 static void stepAwayFromPlayer(MapEvent& ev) {
@@ -966,7 +1292,8 @@ static void stepAwayFromPlayer(MapEvent& ev) {
         stepCharacterDir(ev.x, ev.y, ev.dir, d2, ev.dir_fix, ev.through, false, ev.id);
 }
 
-static void applyMoveCmd(int targetId, const MoveCmd& mc) {
+// Devuelve true si el comando consume un paso/turno/espera de movimiento, o false si es instantáneo (código 27..45 modificador)
+static bool applyMoveCmd(int targetId, const MoveCmd& mc) {
     int* px = (targetId == -1) ? &g_game.playerX : nullptr;
     int* py = (targetId == -1) ? &g_game.playerY : nullptr;
     int* pdir = (targetId == -1) ? &g_game.playerDir : nullptr;
@@ -976,14 +1303,15 @@ static void applyMoveCmd(int targetId, const MoveCmd& mc) {
     std::string* pchar = (targetId == -1) ? &g_game.playerChar : nullptr;
 
     MapEvent* ev = (targetId > 0) ? findEvent(targetId) : nullptr;
-    if (targetId > 0 && !ev) return;
+    if (targetId > 0 && !ev) return true;
     if (ev) {
         px = &ev->x; py = &ev->y; pdir = &ev->dir; ppat = &ev->pattern;
         pthr = &ev->through; pdfix = &ev->dir_fix; pchar = &ev->char_name;
     }
-    if (!px) return;
+    if (!px) return true;
 
     bool walked = false;
+    bool consumesStep = true;
     switch (mc.code) {
         case 1: walked = stepCharacterDir(*px, *py, *pdir, 2, *pdfix, *pthr, targetId == -1, targetId); break;
         case 2: walked = stepCharacterDir(*px, *py, *pdir, 4, *pdfix, *pthr, targetId == -1, targetId); break;
@@ -1023,41 +1351,76 @@ static void applyMoveCmd(int targetId, const MoveCmd& mc) {
             int dx = g_game.playerX - ev->x, dy = g_game.playerY - ev->y;
             ev->dir = (std::abs(dx) >= std::abs(dy)) ? (dx >= 0 ? 6 : 4) : (dy >= 0 ? 2 : 8);
         } break;
-        case 27: g_game.switches[mc.params[0].asInt(1)] = true; refreshEvents(); break;
-        case 28: g_game.switches[mc.params[0].asInt(1)] = false; refreshEvents(); break;
-        case 29: if (targetId == -1) g_game.playerSpeed = (float)mc.params[0].asNum(4.0); else if (ev) ev->move_speed = (float)mc.params[0].asNum(3.0); break;
-        case 33: if (ev) ev->step_anime = true; break;
-        case 34: if (ev) ev->step_anime = false; break;
-        case 35: *pdfix = true; break;
-        case 36: *pdfix = false; break;
-        case 37: *pthr = true; break;
-        case 38: *pthr = false; break;
-        case 39: if (ev) ev->always_top = true; break;
-        case 40: if (ev) ev->always_top = false; break;
+        case 27: g_game.switches[mc.params[0].asInt(1)] = true; refreshEvents(); consumesStep = false; break;
+        case 28: g_game.switches[mc.params[0].asInt(1)] = false; refreshEvents(); consumesStep = false; break;
+        case 29:
+            if (targetId == -1) g_game.playerSpeed = (float)mc.params[0].asNum(4.0);
+            else if (ev) ev->move_speed = (float)mc.params[0].asNum(3.0);
+            consumesStep = false;
+            break;
+        case 33: if (ev) ev->step_anime = true; consumesStep = false; break;
+        case 34: if (ev) ev->step_anime = false; consumesStep = false; break;
+        case 35: *pdfix = true; consumesStep = false; break;
+        case 36: *pdfix = false; consumesStep = false; break;
+        case 37: *pthr = true; consumesStep = false; break;
+        case 38: *pthr = false; consumesStep = false; break;
+        case 39: if (ev) ev->always_top = true; consumesStep = false; break;
+        case 40: if (ev) ev->always_top = false; consumesStep = false; break;
         case 41: // Change Graphic: [char_name, hue, dir, pattern]
             *pchar = mc.params[0].asStr();
             if (targetId == -1) g_game.playerTransparent = pchar->empty();
             if (mc.params.a.size() >= 3 && mc.params[2].asInt(0) > 0) *pdir = mc.params[2].asInt(2);
             if (mc.params.a.size() >= 4) *ppat = mc.params[3].asInt(0) % 4;
+            consumesStep = false;
             break;
-        case 42: if (ev) ev->opacity = mc.params[0].asInt(255); break;
+        case 42: if (ev) ev->opacity = mc.params[0].asInt(255); consumesStep = false; break;
         case 44: { // Play SE inside Move Route
             const JVal& af = mc.params[0];
             playSe(af.get("name").asStr(), af.get("volume").asInt(100), af.get("pitch").asInt(100));
+            consumesStep = false;
             break;
         }
-        case 45: { // Script inside Move Route (ej: @move_speed = 4.1)
+        case 45: { // Script inside Move Route (ej: @move_speed = 4.1, attack_on, move_toward_event, move_toward_position)
             std::string s = mc.params[0].asStr();
             float spd = 0.0f;
-            if (sscanf(s.c_str(), " @move_speed = %f", &spd) == 1 && spd > 0.1f) {
+            int arg1 = 0, arg2 = 0;
+            if (s.find("attack_on") != std::string::npos) {
+                if (ev) ev->collisionAttack = true;
+                consumesStep = false;
+            } else if (s.find("attack_off") != std::string::npos) {
+                if (ev) ev->collisionAttack = false;
+                consumesStep = false;
+            } else if (sscanf(s.c_str(), " @move_speed = %f", &spd) == 1 && spd > 0.1f) {
                 if (targetId == -1) g_game.playerSpeed = spd;
                 else if (ev) ev->move_speed = spd;
+                consumesStep = false;
+            } else if (sscanf(s.c_str(), " move_toward_event ( %d )", &arg1) == 1 ||
+                       sscanf(s.c_str(), " move_toward_event(%d)", &arg1) == 1) {
+                MapEvent* tev = findEvent(arg1);
+                if (tev) walked = stepTowardCoords(*px, *py, *pdir, tev->x, tev->y, *pdfix, *pthr, targetId == -1, targetId);
+                consumesStep = true;
+            } else if (sscanf(s.c_str(), " move_toward_position ( %d , %d )", &arg1, &arg2) == 2 ||
+                       sscanf(s.c_str(), " move_toward_position(%d, %d)", &arg1, &arg2) == 2 ||
+                       sscanf(s.c_str(), " move_toward_position(%d,%d)", &arg1, &arg2) == 2) {
+                walked = stepTowardCoords(*px, *py, *pdir, arg1, arg2, *pdfix, *pthr, targetId == -1, targetId);
+                consumesStep = true;
+            } else if (sscanf(s.c_str(), " turn_toward_event(%d)", &arg1) == 1) {
+                MapEvent* tev = findEvent(arg1);
+                if (tev) {
+                    int sx = *px - tev->x, sy = *py - tev->y;
+                    if (sx != 0 || sy != 0)
+                        *pdir = (std::abs(sx) > std::abs(sy)) ? (sx > 0 ? 4 : 6) : (sy > 0 ? 8 : 2);
+                }
+                consumesStep = true;
+            } else {
+                consumesStep = false;
             }
             break;
         }
-        default: break;
+        default: consumesStep = false; break;
     }
     if (walked && *ppat == 0) *ppat = 1;
+    return consumesStep;
 }
 
 static void buildMapCacheSurfaces() {
@@ -1189,7 +1552,20 @@ static bool loadMap(int mapId) {
 
 static void formatDialogText(const std::string& raw, std::string& faceOut, std::string& speakerOut, std::string& cleanOut) {
     std::string s = raw;
-    for (int pass = 0; pass < 2; pass++) {
+    // Normalizar códigos con espacios de la traducción al español (Map035: "\ C [2]", "\ _ ")
+    auto replaceAll = [](std::string& str, const std::string& from, const std::string& to) {
+        size_t p = 0;
+        while ((p = str.find(from, p)) != std::string::npos) {
+            str.replace(p, from.size(), to);
+            p += to.size();
+        }
+    };
+    replaceAll(s, "\\ C [", "\\C[");
+    replaceAll(s, "\\ c [", "\\c[");
+    replaceAll(s, "\\ _ ", "");
+    replaceAll(s, "\\ _", "");
+
+    for (int pass = 0; pass < 3; pass++) {
         size_t pos = 0;
         while ((pos = s.find("\\N[", pos)) != std::string::npos || (pos = s.find("\\n[", pos)) != std::string::npos) {
             size_t end = s.find(']', pos + 3);
@@ -1202,9 +1578,16 @@ static void formatDialogText(const std::string& raw, std::string& faceOut, std::
         while ((pos = s.find("\\V[", pos)) != std::string::npos || (pos = s.find("\\v[", pos)) != std::string::npos) {
             size_t end = s.find(']', pos + 3);
             if (end == std::string::npos) break;
-            int id = atoi(s.substr(pos + 3, end - (pos + 3)).c_str());
-            int val = (id >= 0 && id < 512) ? g_game.variables[id] : 0;
-            s.replace(pos, end - pos + 1, std::to_string(val));
+            std::string inner = s.substr(pos + 3, end - (pos + 3));
+            if (!inner.empty() && (inner[0] == 'i' || inner[0] == 'I')) {
+                int itemId = atoi(inner.substr(1).c_str());
+                std::string iname = g_game.itemDefs.count(itemId) ? g_game.itemDefs[itemId].name : ("Item #" + std::to_string(itemId));
+                s.replace(pos, end - pos + 1, iname);
+            } else {
+                int id = atoi(inner.c_str());
+                int val = (id >= 0 && id < 512) ? g_game.variables[id] : 0;
+                s.replace(pos, end - pos + 1, std::to_string(val));
+            }
         }
     }
 
@@ -1212,7 +1595,10 @@ static void formatDialogText(const std::string& raw, std::string& faceOut, std::
     if (fpos != std::string::npos) {
         size_t fend = s.find(']', fpos + 3);
         if (fend != std::string::npos) {
-            faceOut = s.substr(fpos + 3, fend - (fpos + 3));
+            std::string baseFace = s.substr(fpos + 3, fend - (fpos + 3));
+            if (g_game.switches[47]) faceOut = baseFace + "s";
+            else if (g_game.switches[76]) faceOut = baseFace + "2";
+            else faceOut = baseFace;
             s.erase(fpos, fend - fpos + 1);
         }
     }
@@ -1239,10 +1625,23 @@ static void formatDialogText(const std::string& raw, std::string& faceOut, std::
     cleanOut = out;
 }
 
-static bool evalSingleTerm(const std::string& expr) {
-    int evId = 0, val = 0, varId = 0;
+static bool evalSingleTerm(const std::string& rawExpr) {
+    std::string expr = rawExpr;
+    while (!expr.empty() && (expr.front() == ' ' || expr.front() == '(')) expr.erase(expr.begin());
+    while (!expr.empty() && (expr.back() == ' ' || expr.back() == ')')) expr.pop_back();
+
+    int evId = 0, val = 0, varId = 0, modVal = 0;
     char prop[16] = {0}, op[8] = {0};
-    if (sscanf(expr.c_str(), " $game_map.events[%d].%15[xy] %7[<>=!] %d", &evId, prop, op, &val) == 4) {
+    if (sscanf(expr.c_str(), "$game_variables[%d] %% %d %7[<>=!] %d", &varId, &modVal, op, &val) == 4 && modVal != 0) {
+        int lhs = ((varId >= 0 && varId < 512) ? g_game.variables[varId] : 0) % modVal;
+        if (strcmp(op, "==") == 0) return lhs == val;
+        if (strcmp(op, "!=") == 0) return lhs != val;
+        if (strcmp(op, ">=") == 0) return lhs >= val;
+        if (strcmp(op, "<=") == 0) return lhs <= val;
+        if (strcmp(op, ">") == 0)  return lhs > val;
+        if (strcmp(op, "<") == 0)  return lhs < val;
+    }
+    if (sscanf(expr.c_str(), "$game_map.events[%d].%15[xy] %7[<>=!] %d", &evId, prop, op, &val) == 4) {
         MapEvent* ev = findEvent(evId);
         int lhs = ev ? (prop[0] == 'x' ? ev->x : ev->y) : -999;
         if (strcmp(op, "==") == 0) return lhs == val;
@@ -1253,7 +1652,7 @@ static bool evalSingleTerm(const std::string& expr) {
         if (strcmp(op, "<") == 0)  return lhs < val;
     }
     int evId2 = 0; char prop2[16] = {0};
-    if (sscanf(expr.c_str(), " $game_player.%15[xy] %7[<>=!] $game_map.events[%d].%15[xy]", prop, op, &evId2, prop2) == 4) {
+    if (sscanf(expr.c_str(), "$game_player.%15[xy] %7[<>=!] $game_map.events[%d].%15[xy]", prop, op, &evId2, prop2) == 4) {
         MapEvent* ev = findEvent(evId2);
         int lhs = (prop[0] == 'x') ? g_game.playerX : g_game.playerY;
         int rhs = ev ? (prop2[0] == 'x' ? ev->x : ev->y) : -999;
@@ -1261,8 +1660,10 @@ static bool evalSingleTerm(const std::string& expr) {
         if (strcmp(op, "!=") == 0) return lhs != rhs;
         if (strcmp(op, ">=") == 0) return lhs >= rhs;
         if (strcmp(op, "<=") == 0) return lhs <= rhs;
+        if (strcmp(op, ">") == 0)  return lhs > rhs;
+        if (strcmp(op, "<") == 0)  return lhs < rhs;
     }
-    if (sscanf(expr.c_str(), " $game_player.%15[xy] %7[<>=!] %d", prop, op, &val) == 3) {
+    if (sscanf(expr.c_str(), "$game_player.%15[xy] %7[<>=!] %d", prop, op, &val) == 3) {
         int lhs = (prop[0] == 'x') ? g_game.playerX : g_game.playerY;
         if (strcmp(op, "==") == 0) return lhs == val;
         if (strcmp(op, "!=") == 0) return lhs != val;
@@ -1271,7 +1672,7 @@ static bool evalSingleTerm(const std::string& expr) {
         if (strcmp(op, ">") == 0)  return lhs > val;
         if (strcmp(op, "<") == 0)  return lhs < val;
     }
-    if (sscanf(expr.c_str(), " $game_variables[%d] %7[<>=!] %d", &varId, op, &val) == 3) {
+    if (sscanf(expr.c_str(), "$game_variables[%d] %7[<>=!] %d", &varId, op, &val) == 3) {
         int lhs = (varId >= 0 && varId < 512) ? g_game.variables[varId] : 0;
         if (strcmp(op, "==") == 0) return lhs == val;
         if (strcmp(op, "!=") == 0) return lhs != val;
@@ -1283,13 +1684,34 @@ static bool evalSingleTerm(const std::string& expr) {
     return false;
 }
 
-static bool evalRubyCond(const std::string& expr) {
-    size_t orPos = expr.find(" or ");
-    if (orPos != std::string::npos)
-        return evalRubyCond(expr.substr(0, orPos)) || evalRubyCond(expr.substr(orPos + 4));
-    size_t andPos = expr.find(" and ");
-    if (andPos != std::string::npos)
-        return evalRubyCond(expr.substr(0, andPos)) && evalRubyCond(expr.substr(andPos + 5));
+static bool evalRubyCond(const std::string& rawExpr) {
+    std::string expr = rawExpr;
+    while (!expr.empty() && expr.front() == ' ') expr.erase(expr.begin());
+    while (!expr.empty() && expr.back() == ' ') expr.pop_back();
+    if (expr.size() >= 2 && expr.front() == '(' && expr.back() == ')') {
+        int depth = 0;
+        bool wrapsAll = true;
+        for (size_t i = 0; i < expr.size() - 1; i++) {
+            if (expr[i] == '(') depth++;
+            else if (expr[i] == ')') depth--;
+            if (depth == 0) { wrapsAll = false; break; }
+        }
+        if (wrapsAll) expr = expr.substr(1, expr.size() - 2);
+    }
+    int depth = 0;
+    for (size_t i = 0; i + 4 <= expr.size(); i++) {
+        if (expr[i] == '(') depth++;
+        else if (expr[i] == ')') depth--;
+        else if (depth == 0 && expr.compare(i, 4, " or ") == 0)
+            return evalRubyCond(expr.substr(0, i)) || evalRubyCond(expr.substr(i + 4));
+    }
+    depth = 0;
+    for (size_t i = 0; i + 5 <= expr.size(); i++) {
+        if (expr[i] == '(') depth++;
+        else if (expr[i] == ')') depth--;
+        else if (depth == 0 && expr.compare(i, 5, " and ") == 0)
+            return evalRubyCond(expr.substr(0, i)) && evalRubyCond(expr.substr(i + 5));
+    }
     return evalSingleTerm(expr);
 }
 
@@ -1384,7 +1806,9 @@ static void execControlVars(int evId, const JVal& p) {
     } else if (opType == 7) {
         int other = p[4].asInt(0);
         if (other == 0) val = g_game.mapId;
-        else if (other == 4) val = (int)g_game.frameCount;
+        // En RGSS (Interpreter 4, when 4): Play Time = Graphics.frame_count / Graphics.frame_rate (segundos)
+        else if (other == 4) val = (int)(g_game.frameCount / 60);
+        else if (other == 5) val = g_game.timerFrames / 60;
     }
     for (int id = sId; id <= eId; id++) {
         if (id < 0 || id >= 512) continue;
@@ -1400,11 +1824,21 @@ static void execControlVars(int evId, const JVal& p) {
 }
 
 static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, int evId, bool isForeground) {
+    int startPage = -2;
+    if (!isForeground && evId > 0) {
+        MapEvent* selfEv = findEvent(evId);
+        if (!selfEv || selfEv->erased || selfEv->activePage < 0) return;
+        startPage = selfEv->activePage;
+    }
     int steps = 0;
     while (ip < list.a.size() && steps < 160) {
+        if (!isForeground && evId > 0) {
+            MapEvent* selfEv = findEvent(evId);
+            if (!selfEv || selfEv->erased || selfEv->activePage != startPage) return;
+        }
         steps++;
         if (waitFrames > 0) { waitFrames--; return; }
-        if (isForeground && (g_game.msgActive || g_game.choiceActive || g_game.numInputActive || g_game.btnInputActive || g_game.pendingTransfer || g_game.transPhase == 1))
+        if (isForeground && (g_game.msgActive || g_game.choiceActive || g_game.numInputActive || g_game.btnInputActive || g_game.nameInputActive || g_game.pendingTransfer || g_game.transPhase == 1))
             return;
         if (isForeground && g_game.fgWaitForMove) {
             bool anyMoving = g_game.playerRouteActive || isPlayerMoving();
@@ -1434,8 +1868,11 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                 if (ip < list.a.size() && list[ip].get("c").asInt(0) == 102) {
                     const JVal& cp = list[ip].get("p");
                     g_game.choices.clear();
-                    for (size_t k = 0; k < cp[0].a.size(); k++)
-                        g_game.choices.push_back(cp[0][k].asStr());
+                    for (size_t k = 0; k < cp[0].a.size(); k++) {
+                        std::string fDummy, sDummy, cClean;
+                        formatDialogText(cp[0][k].asStr(), fDummy, sDummy, cClean);
+                        g_game.choices.push_back(cClean);
+                    }
                     g_game.choiceIndex = 0;
                     g_game.choiceIndent = list[ip].get("i").asInt(0);
                     g_game.choiceActive = true;
@@ -1446,8 +1883,11 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
             case 102: { // Show Choices
                 if (!isForeground) { ip++; break; }
                 g_game.choices.clear();
-                for (size_t k = 0; k < p[0].a.size(); k++)
-                    g_game.choices.push_back(p[0][k].asStr());
+                for (size_t k = 0; k < p[0].a.size(); k++) {
+                    std::string fDummy, sDummy, cClean;
+                    formatDialogText(p[0][k].asStr(), fDummy, sDummy, cClean);
+                    g_game.choices.push_back(cClean);
+                }
                 g_game.choiceIndex = 0;
                 g_game.choiceIndent = indent;
                 g_game.choiceActive = true;
@@ -1546,6 +1986,12 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
             case 117: { // Call Common Event
                 int ceId = p[0].asInt(0);
                 ip++;
+                if (!isForeground && ceId == 1) {
+                    // CE 1 (gameover) llamado desde evento paralelo (ej: CE 25 armario cuando Ao Oni te descubre)
+                    triggerPlayerDeathByAoOni();
+                    ip = list.a.size();
+                    return;
+                }
                 for (auto& ce : g_game.commonEvents) {
                     if (ce.id == ceId) {
                         if (isForeground) {
@@ -1563,8 +2009,15 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
             case 121: { // Control Switches
                 int sId = p[0].asInt(1), eId = p[1].asInt(1);
                 bool val = (p[2].asInt(0) == 0);
-                for (int id = sId; id <= eId; id++)
-                    if (id >= 0 && id < 512) g_game.switches[id] = val;
+                for (int id = sId; id <= eId; id++) {
+                    if (id >= 0 && id < 512) {
+                        if (id == 50 && val && !g_game.switches[50]) {
+                            triggerRumble(255, 255, 65);
+                            setPadLightbar(255, 0, 0);
+                        }
+                        g_game.switches[id] = val;
+                    }
+                }
                 refreshEvents();
                 ip++;
                 break;
@@ -1628,6 +2081,8 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                     g_game.nextY = g_game.variables[p[3].asInt(0)];
                     g_game.nextDir = p[4].asInt(0);
                 }
+                // En Interpreter 5 (command_201) de Ao Oni: añade 1 segundo al timer al cambiar de sala
+                if (g_game.timerWorking) g_game.timerFrames += 60;
                 g_game.pendingTransfer = true;
                 ip++;
                 return;
@@ -1643,6 +2098,14 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                     } else if (p[1].asInt(0) == 1) {
                         tev->x = g_game.variables[p[2].asInt(0)];
                         tev->y = g_game.variables[p[3].asInt(0)];
+                    } else if (p[1].asInt(0) == 2) {
+                        MapEvent* oev = findEvent(p[2].asInt(0));
+                        if (oev) {
+                            std::swap(tev->x, oev->x);
+                            std::swap(tev->y, oev->y);
+                            oev->realX = (float)(oev->x * TILE_SZ);
+                            oev->realY = (float)(oev->y * TILE_SZ);
+                        }
                     }
                     tev->realX = (float)(tev->x * TILE_SZ);
                     tev->realY = (float)(tev->y * TILE_SZ);
@@ -1799,15 +2262,27 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                 stopAllSe();
                 ip++;
                 break;
-            case 303: // Name Input Processing
-                g_game.actorNames[p[0].asInt(2)] = "Hiroshi";
+            case 303: { // Name Input Processing (Teclado interactivo + Easter Eggs oficiales de Ao Oni)
+                if (!isForeground) { ip++; break; }
+                g_game.nameInputActorId = p[0].asInt(2);
+                g_game.nameInputMaxLen = std::max(1, std::min(12, p[1].asInt(10)));
+                g_game.nameInputStr = g_game.actorNames.count(g_game.nameInputActorId)
+                                      ? g_game.actorNames[g_game.nameInputActorId]
+                                      : "Hiroshi";
+                if (g_game.nameInputStr.empty()) g_game.nameInputStr = "Hiroshi";
+                g_game.nameInputRow = 6; // Empezar en [CONFIRMAR] para inicio rápido o cambiar nombre/modos
+                g_game.nameInputCol = 0;
+                g_game.nameInputActive = true;
                 ip++;
-                break;
+                return;
+            }
             case 320: // Change Actor Name
                 g_game.actorNames[p[0].asInt(2)] = p[1].asStr();
                 ip++;
                 break;
             case 353: // Game Over
+                triggerRumble(255, 255, 65);
+                setPadLightbar(255, 0, 0);
                 g_game.gameOverTriggered = true;
                 ip = list.a.size();
                 return;
@@ -1819,12 +2294,16 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                 std::string s = p[0].asStr();
                 while (ip + 1 < list.a.size() && list[ip + 1].get("c").asInt(0) == 655) {
                     ip++;
-                    s += list[ip].get("p")[0].asStr();
+                    s += "\n" + list[ip].get("p")[0].asStr();
                 }
-                if (s.find("Graphics.frame_count = 0") != std::string::npos)
+                if (s.find("Graphics.frame_count = 0") != std::string::npos) {
                     g_game.frameCount = 0;
-                else if (s.find("$game_variables[45] = $game_variables[15] / 60 / 60") != std::string::npos)
-                    g_game.variables[45] = g_game.variables[15] / 3600;
+                } else if (s.find("$game_variables[45]") != std::string::npos) {
+                    int totalSec = g_game.variables[15];
+                    g_game.variables[45] = totalSec / 3600;
+                    g_game.variables[46] = (totalSec / 60) % 60;
+                    g_game.variables[47] = totalSec % 60;
+                }
                 ip++;
                 break;
             }
@@ -1860,11 +2339,15 @@ static void updatePictures() {
     }
 }
 
-static void updateSmoothPositions() {
-    // 1) Interpolación suave a 60 FPS del jugador
+static void updateSmoothPositions(bool sprinting) {
+    // 1) Interpolación suave a 60 FPS del jugador (con soporte QoL de Sprint L1/R1)
     float ptx = (float)(g_game.playerX * TILE_SZ);
     float pty = (float)(g_game.playerY * TILE_SZ);
-    float pspd = rmxpSpeedPxPerFrame(g_game.playerSpeed);
+    float effPlayerSpeed = g_game.playerSpeed;
+    if (sprinting && !g_game.playerRouteActive && g_game.fgStack.empty()) {
+        effPlayerSpeed = std::min(5.25f, g_game.playerSpeed + 0.65f);
+    }
+    float pspd = rmxpSpeedPxPerFrame(effPlayerSpeed);
     float pdx = ptx - g_game.playerRealX;
     float pdy = pty - g_game.playerRealY;
     if (std::fabs(pdx) <= pspd) g_game.playerRealX = ptx;
@@ -1874,7 +2357,8 @@ static void updateSmoothPositions() {
 
     if (isPlayerMoving()) {
         g_game.playerAnimTicks++;
-        if (g_game.playerAnimTicks >= 6) {
+        int pStride = sprinting ? 4 : 6;
+        if (g_game.playerAnimTicks >= pStride) {
             g_game.playerAnimTicks = 0;
             g_game.playerPattern = (g_game.playerPattern + 1) % 4;
         }
@@ -1916,8 +2400,10 @@ static void updateMoveRoutes(uint32_t now) {
             if (g_game.playerRouteWaitFrames > 0) {
                 g_game.playerRouteWaitFrames--;
             } else {
-                if (g_game.playerRouteIdx < g_game.playerForcedRoute.list.size()) {
-                    applyMoveCmd(-1, g_game.playerForcedRoute.list[g_game.playerRouteIdx++]);
+                int guard = 0;
+                while (g_game.playerRouteIdx < g_game.playerForcedRoute.list.size() && guard++ < 16) {
+                    bool consumes = applyMoveCmd(-1, g_game.playerForcedRoute.list[g_game.playerRouteIdx++]);
+                    if (consumes || g_game.playerRouteWaitFrames > 0 || isPlayerMoving()) break;
                 }
                 if (g_game.playerRouteIdx >= g_game.playerForcedRoute.list.size() && g_game.playerRouteWaitFrames <= 0 && !isPlayerMoving()) {
                     if (g_game.playerForcedRoute.repeat) g_game.playerRouteIdx = 0;
@@ -1933,8 +2419,10 @@ static void updateMoveRoutes(uint32_t now) {
                 if (ev.routeWaitFrames > 0) {
                     ev.routeWaitFrames--;
                 } else {
-                    if (ev.routeIdx < ev.forcedRoute.list.size()) {
-                        applyMoveCmd(ev.id, ev.forcedRoute.list[ev.routeIdx++]);
+                    int guard = 0;
+                    while (ev.routeIdx < ev.forcedRoute.list.size() && guard++ < 16) {
+                        bool consumes = applyMoveCmd(ev.id, ev.forcedRoute.list[ev.routeIdx++]);
+                        if (consumes || ev.routeWaitFrames > 0 || isEventMoving(ev)) break;
                     }
                     if (ev.routeIdx >= ev.forcedRoute.list.size() && ev.routeWaitFrames <= 0 && !isEventMoving(ev)) {
                         if (ev.forcedRoute.repeat) ev.routeIdx = 0;
@@ -1960,8 +2448,13 @@ static void updateMoveRoutes(uint32_t now) {
                 } else if (ev.move_type == 3) {
                     const auto& mr = ev.pages[ev.activePage].move_route;
                     if (!mr.list.empty()) {
-                        applyMoveCmd(ev.id, mr.list[ev.routeIdx % mr.list.size()]);
-                        ev.routeIdx++;
+                        int guard = 0;
+                        while (guard++ < 16) {
+                            const auto& mc = mr.list[ev.routeIdx % mr.list.size()];
+                            ev.routeIdx++;
+                            bool consumes = applyMoveCmd(ev.id, mc);
+                            if (consumes || ev.routeWaitFrames > 0 || isEventMoving(ev)) break;
+                        }
                     }
                 }
             }
@@ -2007,7 +2500,7 @@ static void initGameDb() {
     }
 }
 
-// Guardado / Carga de partida (en memoria y en /data/aooni_save.dat si está disponible)
+// Guardado / Carga de partida (en memoria, Auto-Save QoL y en /data/aooni_save.dat en disco)
 struct SaveSnapshot {
     bool valid = false;
     bool switches[512];
@@ -2016,41 +2509,149 @@ struct SaveSnapshot {
     std::map<int, int> inventory;
     int mapId = 4, playerX = 9, playerY = 8, playerDir = 2;
     std::string playerChar = "hirosi";
+    std::string heroName = "Hiroshi";
     bool playerTransparent = false;
     int toneR = 0, toneG = 0, toneB = 0;
     uint32_t frameCount = 0;
-} g_memorySave;
+} g_memorySave, g_autoSave;
 
-static void saveGame() {
-    g_memorySave.valid = true;
-    memcpy(g_memorySave.switches, g_game.switches, sizeof(g_game.switches));
-    memcpy(g_memorySave.variables, g_game.variables, sizeof(g_game.variables));
-    g_memorySave.selfSwitches = g_game.selfSwitches;
-    g_memorySave.inventory = g_game.inventory;
-    g_memorySave.mapId = g_game.mapId;
-    g_memorySave.playerX = g_game.playerX;
-    g_memorySave.playerY = g_game.playerY;
-    g_memorySave.playerDir = g_game.playerDir;
-    g_memorySave.playerChar = g_game.playerChar;
-    g_memorySave.playerTransparent = g_game.playerTransparent;
-    g_memorySave.toneR = g_game.toneR;
-    g_memorySave.toneG = g_game.toneG;
-    g_memorySave.toneB = g_game.toneB;
-    g_memorySave.frameCount = g_game.frameCount;
-    playSe("002-System02", 90, 100);
+static const char* SAVE_FILE_PATH = "/data/aooni_save.dat";
+static const uint32_t SAVE_MAGIC = 0x414F4E35; // "AON5"
+
+static void captureSnapshot(SaveSnapshot& snap) {
+    snap.valid = true;
+    memcpy(snap.switches, g_game.switches, sizeof(g_game.switches));
+    memcpy(snap.variables, g_game.variables, sizeof(g_game.variables));
+    snap.selfSwitches = g_game.selfSwitches;
+    snap.inventory = g_game.inventory;
+    snap.mapId = g_game.mapId;
+    snap.playerX = g_game.playerX;
+    snap.playerY = g_game.playerY;
+    snap.playerDir = g_game.playerDir;
+    snap.playerChar = g_game.playerChar;
+    snap.heroName = g_game.actorNames.count(2) ? g_game.actorNames[2] : "Hiroshi";
+    snap.playerTransparent = g_game.playerTransparent;
+    snap.toneR = g_game.toneR;
+    snap.toneG = g_game.toneG;
+    snap.toneB = g_game.toneB;
+    snap.frameCount = g_game.frameCount;
 }
 
-static bool loadSavedGame() {
-    if (!g_memorySave.valid) return false;
-    memcpy(g_game.switches, g_memorySave.switches, sizeof(g_game.switches));
-    memcpy(g_game.variables, g_memorySave.variables, sizeof(g_game.variables));
-    g_game.selfSwitches = g_memorySave.selfSwitches;
-    g_game.inventory = g_memorySave.inventory;
-    g_game.playerChar = g_memorySave.playerChar;
-    g_game.playerTransparent = g_memorySave.playerTransparent;
-    g_game.toneR = g_memorySave.toneR;
-    g_game.toneG = g_memorySave.toneG;
-    g_game.toneB = g_memorySave.toneB;
+static bool writeSnapshotToDisk(const SaveSnapshot& snap, const char* path) {
+    FILE* f = fopen(path, "wb");
+    if (!f) return false;
+    fwrite(&SAVE_MAGIC, 4, 1, f);
+    fwrite(snap.switches, sizeof(snap.switches), 1, f);
+    fwrite(snap.variables, sizeof(snap.variables), 1, f);
+    fwrite(&snap.mapId, 4, 1, f);
+    fwrite(&snap.playerX, 4, 1, f);
+    fwrite(&snap.playerY, 4, 1, f);
+    fwrite(&snap.playerDir, 4, 1, f);
+    fwrite(&snap.playerTransparent, sizeof(bool), 1, f);
+    fwrite(&snap.toneR, 4, 1, f);
+    fwrite(&snap.toneG, 4, 1, f);
+    fwrite(&snap.toneB, 4, 1, f);
+    fwrite(&snap.frameCount, 4, 1, f);
+    uint16_t pcLen = (uint16_t)snap.playerChar.size();
+    fwrite(&pcLen, 2, 1, f);
+    if (pcLen > 0) fwrite(snap.playerChar.data(), 1, pcLen, f);
+    uint16_t hnLen = (uint16_t)snap.heroName.size();
+    fwrite(&hnLen, 2, 1, f);
+    if (hnLen > 0) fwrite(snap.heroName.data(), 1, hnLen, f);
+    uint32_t ssCount = (uint32_t)snap.selfSwitches.size();
+    fwrite(&ssCount, 4, 1, f);
+    for (const auto& kv : snap.selfSwitches) {
+        uint16_t klen = (uint16_t)kv.first.size();
+        uint8_t v = kv.second ? 1 : 0;
+        fwrite(&klen, 2, 1, f);
+        fwrite(kv.first.data(), 1, klen, f);
+        fwrite(&v, 1, 1, f);
+    }
+    uint32_t invCount = (uint32_t)snap.inventory.size();
+    fwrite(&invCount, 4, 1, f);
+    for (const auto& kv : snap.inventory) {
+        fwrite(&kv.first, 4, 1, f);
+        fwrite(&kv.second, 4, 1, f);
+    }
+    fclose(f);
+    return true;
+}
+
+static bool readSnapshotFromDisk(SaveSnapshot& snap, const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;
+    uint32_t magic = 0;
+    if (fread(&magic, 4, 1, f) != 1 || (magic != SAVE_MAGIC && magic != 0x414F4E34)) { fclose(f); return false; }
+    fread(snap.switches, sizeof(snap.switches), 1, f);
+    fread(snap.variables, sizeof(snap.variables), 1, f);
+    fread(&snap.mapId, 4, 1, f);
+    fread(&snap.playerX, 4, 1, f);
+    fread(&snap.playerY, 4, 1, f);
+    fread(&snap.playerDir, 4, 1, f);
+    fread(&snap.playerTransparent, sizeof(bool), 1, f);
+    fread(&snap.toneR, 4, 1, f);
+    fread(&snap.toneG, 4, 1, f);
+    fread(&snap.toneB, 4, 1, f);
+    fread(&snap.frameCount, 4, 1, f);
+    uint16_t pcLen = 0;
+    fread(&pcLen, 2, 1, f);
+    snap.playerChar.assign(pcLen, '\0');
+    if (pcLen > 0) fread(&snap.playerChar[0], 1, pcLen, f);
+    if (magic == SAVE_MAGIC) {
+        uint16_t hnLen = 0;
+        fread(&hnLen, 2, 1, f);
+        snap.heroName.assign(hnLen, '\0');
+        if (hnLen > 0) fread(&snap.heroName[0], 1, hnLen, f);
+    } else {
+        snap.heroName = "Hiroshi";
+    }
+    uint32_t ssCount = 0;
+    fread(&ssCount, 4, 1, f);
+    snap.selfSwitches.clear();
+    for (uint32_t i = 0; i < ssCount && i < 4096; i++) {
+        uint16_t klen = 0; uint8_t v = 0;
+        if (fread(&klen, 2, 1, f) != 1 || klen > 128) break;
+        std::string k(klen, '\0');
+        fread(&k[0], 1, klen, f);
+        fread(&v, 1, 1, f);
+        snap.selfSwitches[k] = (v != 0);
+    }
+    uint32_t invCount = 0;
+    fread(&invCount, 4, 1, f);
+    snap.inventory.clear();
+    for (uint32_t i = 0; i < invCount && i < 512; i++) {
+        int id = 0, qty = 0;
+        if (fread(&id, 4, 1, f) != 1 || fread(&qty, 4, 1, f) != 1) break;
+        snap.inventory[id] = qty;
+    }
+    fclose(f);
+    snap.valid = true;
+    return true;
+}
+
+static void saveGame() {
+    captureSnapshot(g_memorySave);
+    g_autoSave = g_memorySave;
+    writeSnapshotToDisk(g_memorySave, SAVE_FILE_PATH);
+    playSe("002-System02", 90, 100);
+    triggerRumble(80, 0, 8);
+}
+
+static bool restoreFromSnapshot(const SaveSnapshot& snap) {
+    if (!snap.valid) return false;
+    playBgm("");
+    playBgs("");
+    stopAllSe();
+    memcpy(g_game.switches, snap.switches, sizeof(g_game.switches));
+    memcpy(g_game.variables, snap.variables, sizeof(g_game.variables));
+    g_game.selfSwitches = snap.selfSwitches;
+    g_game.inventory = snap.inventory;
+    g_game.playerChar = snap.playerChar;
+    g_game.actorNames[2] = snap.heroName.empty() ? "Hiroshi" : snap.heroName;
+    g_game.playerTransparent = snap.playerTransparent;
+    g_game.toneR = snap.toneR;
+    g_game.toneG = snap.toneG;
+    g_game.toneB = snap.toneB;
     g_game.curToneR = (float)g_game.toneR;
     g_game.curToneG = (float)g_game.toneG;
     g_game.curToneB = (float)g_game.toneB;
@@ -2058,19 +2659,27 @@ static bool loadSavedGame() {
     g_game.screenBlackout = false;
     g_game.transPhase = 2;
     g_game.fadeAlpha = 255;
-    g_game.frameCount = g_memorySave.frameCount;
+    g_game.frameCount = snap.frameCount;
     g_game.fgStack.clear();
-    g_game.msgActive = g_game.choiceActive = g_game.numInputActive = g_game.btnInputActive = false;
+    g_game.msgActive = g_game.choiceActive = g_game.numInputActive = g_game.btnInputActive = g_game.nameInputActive = false;
     g_game.pendingTransfer = g_game.gameOverTriggered = g_game.returnToTitleTriggered = false;
+    g_game.timerWorking = false;
     for (int i = 0; i < 52; i++) g_game.pictures[i].active = false;
-    loadMap(g_memorySave.mapId);
-    g_game.playerX = g_memorySave.playerX;
-    g_game.playerY = g_memorySave.playerY;
+    loadMap(snap.mapId);
+    g_game.playerX = snap.playerX;
+    g_game.playerY = snap.playerY;
     g_game.playerRealX = (float)(g_game.playerX * TILE_SZ);
     g_game.playerRealY = (float)(g_game.playerY * TILE_SZ);
-    g_game.playerDir = g_memorySave.playerDir;
+    g_game.playerDir = snap.playerDir;
     g_game.playerPattern = 0;
+    setPadLightbar(25, 45, 160);
     return true;
+}
+
+static bool loadSavedGame() {
+    if (g_memorySave.valid) return restoreFromSnapshot(g_memorySave);
+    if (g_autoSave.valid) return restoreFromSnapshot(g_autoSave);
+    return false;
 }
 
 static void resetNewGame() {
@@ -2083,6 +2692,7 @@ static void resetNewGame() {
     g_game.inventory.clear();
     for (int i = 0; i < 52; i++) g_game.pictures[i].active = false;
     g_game.playerChar = "hirosi";
+    g_game.actorNames[2] = "Hiroshi";
     g_game.playerTransparent = true;
     g_game.playerThrough = false;
     g_game.playerDirFix = false;
@@ -2100,6 +2710,7 @@ static void resetNewGame() {
     g_game.choiceActive = false;
     g_game.numInputActive = false;
     g_game.btnInputActive = false;
+    g_game.nameInputActive = false;
     g_game.pendingTransfer = false;
     g_game.gameOverTriggered = false;
     g_game.returnToTitleTriggered = false;
@@ -2108,15 +2719,42 @@ static void resetNewGame() {
     g_game.playerY = 8;
     g_game.playerRealX = (float)(9 * TILE_SZ);
     g_game.playerRealY = (float)(8 * TILE_SZ);
+    setPadLightbar(25, 45, 160);
     loadMap(75);
 }
+
+// Matriz de caracteres del teclado en pantalla (6 filas x 10 columnas) + fila 6 de botones rápidos
+static const char NAME_KB_ROWS[6][11] = {
+    "ABCDEFGHIJ",
+    "KLMNOPQRST",
+    "UVWXYZ0123",
+    "abcdefghij",
+    "klmnopqrst",
+    "uvwxyz4567"
+};
+struct QuickNameBtn {
+    const char* label;
+    const char* value; // NULL = acción especial (0=Confirmar, 1=Borrar, 2=Espacio)
+    const char* hint;
+};
+static const QuickNameBtn NAME_QUICK_BTNS[9] = {
+    { "CONFIRMAR", nullptr,     "Aceptar este nombre y comenzar la partida" },
+    { "BORRAR",    nullptr,     "Borrar el ultimo caracter (tambien con Cuadrado/Circulo)" },
+    { "Hiroshi",   "Hiroshi",   "Nombre original por defecto del protagonista" },
+    { "SOUTHPARK", "SOUTHPARK", "Easter Egg: Activa el Modo South Park (sprites y sonidos)" },
+    { "GODMODE",   "GODMODE",   "Easter Egg: Modo Invencible frente a Ao Oni" },
+    { "BLOCKMAN",  "BLOCKMAN",  "Easter Egg: Ao Oni se mueve al doble de velocidad" },
+    { "JMU",       "JMU",       "Easter Egg: Aspecto clasico de Ao Oni v1.0" },
+    { "HIROSI",    "HIROSI",    "Easter Egg: Retrato clasico de Hiroshi en dialogos" },
+    { "TIMER",     "TIMER",     "Easter Egg: Cronometro Speedrun en pantalla" }
+};
 
 enum AppState { STATE_TITLE = 0, STATE_MAP = 1, STATE_INVENTORY = 2, STATE_GAMEOVER = 3 };
 
 int main(int argc, char* argv[]) {
     setvbuf(stdout, NULL, _IONBF, 0);
     srand(12345);
-    printf("[AoOni] Iniciando interprete Ao Oni PS4 1:1 Optimizado...\n");
+    printf("[AoOni] Iniciando interprete Ao Oni PS4 / PS4 Pro 4K 1:1 Optimizado...\n");
 
     pthread_t audioThr;
     pthread_create(&audioThr, NULL, audioThreadFunc, NULL);
@@ -2126,53 +2764,199 @@ int main(int argc, char* argv[]) {
     if (!window) return -1;
     SDL_Surface* winSurf = SDL_GetWindowSurface(window);
     if (!winSurf) return -1;
+
+    // Superficie dedicada de juego a resolución nativa 640x480 (se escala por hardware/scanline a 720p, 1080p o 4K Nativo)
+    SDL_Surface* gameSurf = SDL_CreateRGBSurfaceWithFormat(0, GAME_W, GAME_H, 32, SDL_PIXELFORMAT_RGBA32);
+    if (!gameSurf) gameSurf = winSurf;
+
     if (SDL_NumJoysticks() >= 1) SDL_JoystickOpen(0);
 
+    initPadHandle();
+    setPadLightbar(25, 45, 160);
+
+    // Detectar automáticamente PS4 Pro (Neo Mode) o salida 4K/1080p activa
+    {
+        bool isPro = (sceKernelIsNeoMode() > 0);
+        PS4_VideoData* vd = getPs4VideoData();
+        OrbisVideoOutResolutionStatus resStat;
+        memset(&resStat, 0, sizeof(resStat));
+        if (vd && vd->handle > 0 && sceVideoOutGetResolutionStatus(vd->handle, &resStat) == 0) {
+            printf("[AoOni] Resolucion de sistema detectada: %ux%u (PS4 Pro NeoMode=%d)\n",
+                   resStat.width, resStat.height, isPro ? 1 : 0);
+            if (isPro || resStat.width >= 3840) {
+                if (setVideoOutputResolution(3840, 2160)) g_videoResIndex = 2;
+            } else if (resStat.width >= 1920) {
+                if (setVideoOutputResolution(1920, 1080)) g_videoResIndex = 1;
+            }
+        } else if (isPro) {
+            if (setVideoOutputResolution(3840, 2160)) g_videoResIndex = 2;
+        }
+    }
+
     initGameDb();
+    if (readSnapshotFromDisk(g_memorySave, SAVE_FILE_PATH)) {
+        g_autoSave = g_memorySave;
+        printf("[AoOni] Partida guardada cargada desde %s (Mapa %d)\n", SAVE_FILE_PATH, g_memorySave.mapId);
+    }
+
     SDL_Surface* titleSurf = getSurf("/app0/assets/images/title_title_black.png");
     SDL_Surface* goSurf    = getSurf("/app0/assets/images/go_gameover_3.jpg");
     SDL_Surface* aooniSurf = getSurf("/app0/assets/images/char_ao.png");
 
     AppState state = STATE_TITLE;
-    int menuIndex = 0;
+    int menuIndex = (g_memorySave.valid || g_autoSave.valid) ? 1 : 0;
     int invCursor = 0;
     std::string invStatusMsg;
-    const int offX = (SCREEN_W - GAME_W) / 2;
-    const int offY = (SCREEN_H - GAME_H) / 2;
+    const int offX = 0;
+    const int offY = 0;
 
     bool dpadUp = false, dpadDown = false, dpadLeft = false, dpadRight = false;
+    bool stickUp = false, stickDown = false, stickLeft = false, stickRight = false;
+    bool hatUp = false, hatDown = false, hatLeft = false, hatRight = false;
+    bool padL1 = false, padR1 = false;
     uint32_t lastStepTick = 0;
+    uint32_t autoSaveBannerFrames = 0;
+    uint32_t videoBannerFrames = 0;
+    std::string videoBannerText;
 
     for (uint32_t frame = 0;; frame++) {
         g_game.frameCount++;
         uint32_t now = SDL_GetTicks();
+        updateRumble();
+
+        // Actualizar Lightbar y latido háptico cuando Ao Oni persigue al jugador (switch 49)
+        if (state == STATE_MAP) {
+            if (g_game.switches[50]) {
+                setPadLightbar(255, 0, 0);
+            } else if (g_game.switches[49]) {
+                uint8_t pulse = (uint8_t)(120 + (int)(110.0f * std::sin(frame * 0.22f)));
+                setPadLightbar(pulse, 0, 220);
+                // Latido háptico en el mando cuando Ao Oni está a <= 4 casillas de Hiroshi
+                if (frame % 26 == 0 && g_rumbleFrames <= 0) {
+                    for (const auto& mev : g_game.events) {
+                        if (mev.activePage >= 0 && (mev.collisionAttack || mev.char_name.rfind("ao", 0) == 0)) {
+                            int dist = std::abs(mev.x - g_game.playerX) + std::abs(mev.y - g_game.playerY);
+                            if (dist <= 4) {
+                                uint8_t str = (uint8_t)std::min(190, (5 - dist) * 45);
+                                triggerRumble(str, (uint8_t)(str / 2), 6);
+                                break;
+                            }
+                        }
+                    }
+                }
+            } else if (frame % 60 == 0) {
+                setPadLightbar(25, 45, 160);
+            }
+        }
 
         // Construir lista de items actuales para el inventario
         std::vector<int> ownedItems;
         for (const auto& kv : g_game.inventory)
             if (kv.second > 0) ownedItems.push_back(kv.first);
 
+        auto pushSynthButton = [](int btn) {
+            SDL_Event sev;
+            memset(&sev, 0, sizeof(sev));
+            sev.type = SDL_JOYBUTTONDOWN;
+            sev.jbutton.button = (Uint8)btn;
+            SDL_PushEvent(&sev);
+        };
+
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
-            if (ev.type == SDL_JOYBUTTONDOWN) {
+            if (ev.type == SDL_JOYHATMOTION) {
+                bool nu = (ev.jhat.value & SDL_HAT_UP) != 0;
+                bool nd = (ev.jhat.value & SDL_HAT_DOWN) != 0;
+                bool nl = (ev.jhat.value & SDL_HAT_LEFT) != 0;
+                bool nr = (ev.jhat.value & SDL_HAT_RIGHT) != 0;
+                if (nu && !hatUp) pushSynthButton(PAD_UP);
+                if (nd && !hatDown) pushSynthButton(PAD_DOWN);
+                if (nl && !hatLeft) pushSynthButton(PAD_LEFT);
+                if (nr && !hatRight) pushSynthButton(PAD_RIGHT);
+                hatUp = nu; hatDown = nd; hatLeft = nl; hatRight = nr;
+                dpadUp = hatUp || stickUp;
+                dpadDown = hatDown || stickDown;
+                dpadLeft = hatLeft || stickLeft;
+                dpadRight = hatRight || stickRight;
+            } else if (ev.type == SDL_JOYAXISMOTION) {
+                if (ev.jaxis.axis == 0) {
+                    bool nl = (ev.jaxis.value < -14000);
+                    bool nr = (ev.jaxis.value >  14000);
+                    if (nl && !stickLeft) pushSynthButton(PAD_LEFT);
+                    if (nr && !stickRight) pushSynthButton(PAD_RIGHT);
+                    stickLeft = nl; stickRight = nr;
+                } else if (ev.jaxis.axis == 1) {
+                    bool nu = (ev.jaxis.value < -14000);
+                    bool nd = (ev.jaxis.value >  14000);
+                    if (nu && !stickUp) pushSynthButton(PAD_UP);
+                    if (nd && !stickDown) pushSynthButton(PAD_DOWN);
+                    stickUp = nu; stickDown = nd;
+                }
+                dpadUp = hatUp || stickUp;
+                dpadDown = hatDown || stickDown;
+                dpadLeft = hatLeft || stickLeft;
+                dpadRight = hatRight || stickRight;
+            } else if (ev.type == SDL_JOYBUTTONDOWN) {
                 int b = ev.jbutton.button;
+                if (b == PAD_L1) padL1 = true;
+                if (b == PAD_R1) padR1 = true;
+
+                // Atajos globales PS4 / PS4 Pro: R2 cambia resolución (720p / 1080p / 4K Nativo), L2 cambia aspecto (4:3 / 16:9 / Pixel-Perfect)
+                if (b == PAD_R2) {
+                    cycleVideoResolution();
+                    playSe("001-System01", 80, 100);
+                    videoBannerText = std::string("RESOLUCION: ") + getVideoResLabel();
+                    videoBannerFrames = 110;
+                    continue;
+                } else if (b == PAD_L2) {
+                    g_videoScaleMode = (g_videoScaleMode + 1) % 3;
+                    g_videoClearNeeded = true;
+                    playSe("001-System01", 80, 100);
+                    videoBannerText = std::string("ESCALADO: ") + getVideoScaleLabel();
+                    videoBannerFrames = 110;
+                    continue;
+                }
+
                 if (state == STATE_TITLE) {
-                    if (b == PAD_UP)   { menuIndex = (menuIndex + 2) % 3; playSe("001-System01", 80, 100); }
-                    if (b == PAD_DOWN) { menuIndex = (menuIndex + 1) % 3; playSe("001-System01", 80, 100); }
+                    if (b == PAD_UP)   { menuIndex = (menuIndex + 3) % 4; playSe("001-System01", 80, 100); }
+                    if (b == PAD_DOWN) { menuIndex = (menuIndex + 1) % 4; playSe("001-System01", 80, 100); }
+                    if (b == PAD_LEFT || b == PAD_RIGHT) {
+                        if (menuIndex == 2) {
+                            cycleVideoResolution();
+                            playSe("001-System01", 80, 100);
+                        } else if (menuIndex == 3) {
+                            g_videoScaleMode = (g_videoScaleMode + (b == PAD_RIGHT ? 1 : 2)) % 3;
+                            g_videoClearNeeded = true;
+                            playSe("001-System01", 80, 100);
+                        }
+                    }
                     if (b == PAD_CROSS || b == PAD_OPTIONS) {
-                        if (menuIndex == 1 && g_memorySave.valid) {
-                            playSe("002-System02", 90, 100);
-                            loadSavedGame();
-                            state = STATE_MAP;
-                        } else if (menuIndex == 0 || !g_memorySave.valid) {
+                        bool hasSave = g_memorySave.valid || g_autoSave.valid;
+                        if (menuIndex == 0) {
                             playSe("002-System02", 90, 100);
                             resetNewGame();
                             state = STATE_MAP;
+                        } else if (menuIndex == 1 && hasSave) {
+                            playSe("002-System02", 90, 100);
+                            loadSavedGame();
+                            state = STATE_MAP;
+                        } else if (menuIndex == 2) {
+                            cycleVideoResolution();
+                            playSe("002-System02", 85, 100);
+                        } else if (menuIndex == 3) {
+                            g_videoScaleMode = (g_videoScaleMode + 1) % 3;
+                            g_videoClearNeeded = true;
+                            playSe("002-System02", 85, 100);
                         }
                     }
                 } else if (state == STATE_GAMEOVER) {
-                    if (b == PAD_CROSS || b == PAD_OPTIONS) {
+                    if (b == PAD_CROSS && (g_autoSave.valid || g_memorySave.valid)) {
                         playSe("002-System02", 90, 100);
+                        restoreFromSnapshot(g_autoSave.valid ? g_autoSave : g_memorySave);
+                        state = STATE_MAP;
+                    } else if (b == PAD_CROSS || b == PAD_CIRCLE || b == PAD_OPTIONS) {
+                        playSe("002-System02", 90, 100);
+                        setPadLightbar(25, 45, 160);
                         state = STATE_TITLE;
                     }
                 } else if (state == STATE_INVENTORY) {
@@ -2181,7 +2965,7 @@ int main(int argc, char* argv[]) {
                         state = STATE_MAP;
                     } else if (b == PAD_SQUARE) {
                         saveGame();
-                        invStatusMsg = "Partida guardada correctamente!";
+                        invStatusMsg = "Partida guardada en consola y memoria!";
                     } else if (b == PAD_UP && !ownedItems.empty()) {
                         invCursor = (invCursor + (int)ownedItems.size() - 1) % (int)ownedItems.size();
                         playSe("001-System01", 80, 100);
@@ -2207,7 +2991,63 @@ int main(int argc, char* argv[]) {
                         }
                     }
                 } else if (state == STATE_MAP) {
-                    if (g_game.numInputActive) {
+                    if (g_game.nameInputActive) {
+                        int maxCols = (g_game.nameInputRow == 6) ? 9 : 10;
+                        if (b == PAD_UP) {
+                            g_game.nameInputRow = (g_game.nameInputRow + 6) % 7;
+                            int newMaxCols = (g_game.nameInputRow == 6) ? 9 : 10;
+                            if (g_game.nameInputCol >= newMaxCols) g_game.nameInputCol = newMaxCols - 1;
+                            playSe("001-System01", 80, 100);
+                        } else if (b == PAD_DOWN) {
+                            g_game.nameInputRow = (g_game.nameInputRow + 1) % 7;
+                            int newMaxCols = (g_game.nameInputRow == 6) ? 9 : 10;
+                            if (g_game.nameInputCol >= newMaxCols) g_game.nameInputCol = newMaxCols - 1;
+                            playSe("001-System01", 80, 100);
+                        } else if (b == PAD_LEFT) {
+                            g_game.nameInputCol = (g_game.nameInputCol + maxCols - 1) % maxCols;
+                            playSe("001-System01", 80, 100);
+                        } else if (b == PAD_RIGHT) {
+                            g_game.nameInputCol = (g_game.nameInputCol + 1) % maxCols;
+                            playSe("001-System01", 80, 100);
+                        } else if (b == PAD_SQUARE || b == PAD_CIRCLE) {
+                            if (!g_game.nameInputStr.empty()) {
+                                g_game.nameInputStr.pop_back();
+                                playSe("003-System03", 80, 100);
+                            }
+                        } else if (b == PAD_OPTIONS) {
+                            if (g_game.nameInputStr.empty()) g_game.nameInputStr = "Hiroshi";
+                            g_game.actorNames[g_game.nameInputActorId] = g_game.nameInputStr;
+                            g_game.nameInputActive = false;
+                            playSe("002-System02", 90, 100);
+                        } else if (b == PAD_CROSS) {
+                            if (g_game.nameInputRow < 6) {
+                                char ch = NAME_KB_ROWS[g_game.nameInputRow][g_game.nameInputCol];
+                                if ((int)g_game.nameInputStr.size() < g_game.nameInputMaxLen) {
+                                    g_game.nameInputStr.push_back(ch);
+                                    playSe("001-System01", 85, 100);
+                                } else {
+                                    playSe("004-System04", 80, 100);
+                                }
+                            } else {
+                                int qb = g_game.nameInputCol;
+                                if (qb == 0) { // CONFIRMAR
+                                    if (g_game.nameInputStr.empty()) g_game.nameInputStr = "Hiroshi";
+                                    g_game.actorNames[g_game.nameInputActorId] = g_game.nameInputStr;
+                                    g_game.nameInputActive = false;
+                                    playSe("002-System02", 90, 100);
+                                } else if (qb == 1) { // BORRAR
+                                    if (!g_game.nameInputStr.empty()) {
+                                        g_game.nameInputStr.pop_back();
+                                        playSe("003-System03", 80, 100);
+                                    }
+                                } else if (qb >= 2 && qb < 9 && NAME_QUICK_BTNS[qb].value) {
+                                    g_game.nameInputStr = NAME_QUICK_BTNS[qb].value;
+                                    g_game.nameInputCol = 0; // Mover foco a [CONFIRMAR] tras elegir un nombre rápido
+                                    playSe("002-System02", 85, 100);
+                                }
+                            }
+                        }
+                    } else if (g_game.numInputActive) {
                         if (b == PAD_LEFT) {
                             g_game.numInputCursor = (g_game.numInputCursor + g_game.numInputDigits - 1) % g_game.numInputDigits;
                             playSe("001-System01", 80, 100);
@@ -2287,6 +3127,10 @@ int main(int argc, char* argv[]) {
                                     }
                                 }
                             }
+                        } else if (b == PAD_SQUARE && !g_game.menuDisabled && !g_game.switches[49]) {
+                            // Guardado rápido QoL con Cuadrado directamente en el mapa (si no te persigue Ao Oni)
+                            saveGame();
+                            autoSaveBannerFrames = 90;
                         } else if ((b == PAD_TRIANGLE || b == PAD_CIRCLE) && !g_game.menuDisabled) {
                             playSe("002-System02", 80, 100);
                             invCursor = 0;
@@ -2303,30 +3147,31 @@ int main(int argc, char* argv[]) {
                 }
             } else if (ev.type == SDL_JOYBUTTONUP) {
                 int b = ev.jbutton.button;
-                if (b == PAD_UP)    dpadUp = false;
-                if (b == PAD_DOWN)  dpadDown = false;
-                if (b == PAD_LEFT)  dpadLeft = false;
-                if (b == PAD_RIGHT) dpadRight = false;
-            } else if (ev.type == SDL_JOYAXISMOTION) {
-                if (ev.jaxis.axis == 0) {
-                    dpadLeft  = (ev.jaxis.value < -12000);
-                    dpadRight = (ev.jaxis.value >  12000);
-                } else if (ev.jaxis.axis == 1) {
-                    dpadUp   = (ev.jaxis.value < -12000);
-                    dpadDown = (ev.jaxis.value >  12000);
-                }
+                if (b == PAD_UP)    dpadUp = hatUp || stickUp;
+                if (b == PAD_DOWN)  dpadDown = hatDown || stickDown;
+                if (b == PAD_LEFT)  dpadLeft = hatLeft || stickLeft;
+                if (b == PAD_RIGHT) dpadRight = hatRight || stickRight;
+                if (b == PAD_L1)    padL1 = false;
+                if (b == PAD_R1)    padR1 = false;
             }
         }
 
+        // QoL: Avance rápido de diálogos manteniendo R1 pulsado
+        if (state == STATE_MAP && g_game.msgActive && !g_game.choiceActive && padR1 && (frame % 4 == 0)) {
+            g_game.msgActive = false;
+        }
+        if (videoBannerFrames > 0) videoBannerFrames--;
+
         if (state == STATE_MAP) {
             if (g_game.timerWorking && g_game.timerFrames > 0) g_game.timerFrames--;
+            if (autoSaveBannerFrames > 0) autoSaveBannerFrames--;
 
             updatePictures();
             updateMoveRoutes(now);
 
             // Movimiento manual fluido del jugador (inicia paso solo cuando alcanza su tile actual)
             if (g_game.fgStack.empty() && !g_game.msgActive && !g_game.numInputActive && !g_game.btnInputActive &&
-                !g_game.playerRouteActive && !g_game.pendingTransfer && g_game.transPhase == 0 && !isPlayerMoving()) {
+                !g_game.nameInputActive && !g_game.playerRouteActive && !g_game.pendingTransfer && g_game.transPhase == 0 && !isPlayerMoving()) {
                 int d = 0;
                 if (dpadDown) d = 2;
                 else if (dpadLeft) d = 4;
@@ -2344,11 +3189,19 @@ int main(int argc, char* argv[]) {
                     for (const auto& mev : g_game.events) {
                         if (mev.activePage < 0) continue;
                         const auto& pg = mev.pages[mev.activePage];
-                        if ((pg.trigger == 1 || pg.trigger == 2) && mev.x == nx && mev.y == ny && pg.list.a.size() > 1) {
-                            if (canPassTile(nx, ny, true)) { g_game.playerX = nx; g_game.playerY = ny; }
-                            startForegroundEvent(mev.id, pg.list);
-                            triggeredTouch = true;
-                            break;
+                        if (mev.x == nx && mev.y == ny) {
+                            // Si el jugador choca contra Ao Oni (attack_on / sprite ao*), muere y vibra el mando
+                            if (mev.collisionAttack || mev.char_name.rfind("ao", 0) == 0) {
+                                triggerPlayerDeathByAoOni();
+                                triggeredTouch = true;
+                                break;
+                            }
+                            if ((pg.trigger == 1 || pg.trigger == 2) && pg.list.a.size() > 1) {
+                                if (canPassTile(nx, ny, true)) { g_game.playerX = nx; g_game.playerY = ny; }
+                                startForegroundEvent(mev.id, pg.list);
+                                triggeredTouch = true;
+                                break;
+                            }
                         }
                     }
                     if (!triggeredTouch && (g_game.playerThrough || canPassTile(nx, ny, true))) {
@@ -2366,21 +3219,21 @@ int main(int argc, char* argv[]) {
                 }
             }
 
-            // Actualizar posiciones sub-tile a 60 FPS (movimiento suave pixel a pixel)
-            updateSmoothPositions();
+            // Actualizar posiciones sub-tile a 60 FPS (con soporte de Sprint QoL con L1 o R1)
+            updateSmoothPositions(padL1 || padR1);
 
-            // Contacto de Ao Oni o eventos Event Touch
+            // Contacto de Ao Oni o eventos Event Touch en la misma casilla
             if (g_game.fgStack.empty() && !g_game.pendingTransfer && g_game.transPhase == 0) {
                 for (const auto& mev : g_game.events) {
                     if (mev.activePage < 0) continue;
                     const auto& pg = mev.pages[mev.activePage];
                     if (mev.x == g_game.playerX && mev.y == g_game.playerY) {
-                        if (pg.trigger == 2 && pg.list.a.size() > 1) {
+                        if (mev.collisionAttack || mev.char_name.rfind("ao", 0) == 0) {
+                            triggerPlayerDeathByAoOni();
+                            break;
+                        } else if (pg.trigger == 2 && pg.list.a.size() > 1) {
                             startForegroundEvent(mev.id, pg.list);
                             break;
-                        } else if (mev.char_name.rfind("ao", 0) == 0) {
-                            g_game.switches[50] = true;
-                            refreshEvents();
                         }
                     }
                 }
@@ -2412,7 +3265,8 @@ int main(int argc, char* argv[]) {
                 size_t prevDepth = g_game.fgStack.size();
                 runInterpreterSlice(top.list, top.ip, g_game.fgWaitFrames, top.evId, true);
                 if (g_game.fgStack.size() != prevDepth) continue; // Se hizo push de un CommonEvent (cmd 117)
-                if (top.ip >= top.list.a.size() && !g_game.msgActive && !g_game.choiceActive && !g_game.numInputActive && !g_game.btnInputActive && !g_game.fgWaitForMove) {
+                if (top.ip >= top.list.a.size() && !g_game.msgActive && !g_game.choiceActive &&
+                    !g_game.numInputActive && !g_game.btnInputActive && !g_game.nameInputActive && !g_game.fgWaitForMove) {
                     g_game.fgStack.pop_back();
                 } else {
                     break;
@@ -2448,6 +3302,10 @@ int main(int argc, char* argv[]) {
                         g_game.playerRealY = (float)(ty * TILE_SZ);
                         g_game.playerPattern = 0;
                         if (td > 0) g_game.playerDir = td;
+                        // QoL: Auto-guardado de punto de control al entrar a una sala segura (fuera de persecución)
+                        if (tm != 75 && tm != 35 && !g_game.switches[49] && !g_game.switches[50] && !g_game.playerTransparent) {
+                            captureSnapshot(g_autoSave);
+                        }
                     }
                     if (!g_game.screenBlackout) {
                         g_game.fadeAlpha = 255;
@@ -2468,58 +3326,69 @@ int main(int argc, char* argv[]) {
             } else if (g_game.returnToTitleTriggered) {
                 playBgm("");
                 playBgs("");
+                setPadLightbar(25, 45, 160);
                 state = STATE_TITLE;
             }
         }
 
-        // ==================== RENDERIZADO DIRECTO ULTRARRÁPIDO ====================
-        clearSurfFast(winSurf);
+        // ==================== RENDERIZADO EN LIENZO 640x480 + ESCALADOR 4K PS4 PRO ====================
+        clearSurfFast(gameSurf);
 
         if (state == STATE_TITLE) {
             if (titleSurf) {
                 SDL_Rect dst = { offX, offY, GAME_W, GAME_H };
-                blitSurf(titleSurf, NULL, winSurf, &dst);
+                blitSurf(titleSurf, NULL, gameSurf, &dst);
             }
-            drawText(winSurf, offX + 140, offY + 90, "AO ONI - PS4 PORT", 3, 220, 220, 255);
-            fillRectFast(winSurf, offX + 200, offY + 220, 240, 140, 20, 30, 80);
-            drawRectFast(winSurf, offX + 200, offY + 220, 240, 140, 220, 220, 255);
+            drawText(gameSurf, offX + 140, offY + 64, "AO ONI - PS4 PORT", 3, 220, 220, 255);
+            drawText(gameSurf, offX + 148, offY + 98, "Edicion 1:1 PS4 / PS4 Pro 4K Nativo", 2, 160, 195, 255);
 
-            const char* opts[3] = { "NUEVA PARTIDA", "CONTINUAR", "SALIR" };
-            for (int i = 0; i < 3; i++) {
+            fillRectFast(gameSurf, offX + 150, offY + 156, 360, 184, 20, 30, 80, 235);
+            drawRectFast(gameSurf, offX + 150, offY + 156, 360, 184, 220, 220, 255);
+
+            std::string opt2 = std::string("VIDEO: ") + getVideoResLabel();
+            std::string opt3 = std::string("ASPECTO: ") + getVideoScaleLabel();
+            const char* opts[4] = { "NUEVA PARTIDA", "CONTINUAR", opt2.c_str(), opt3.c_str() };
+            bool hasSave = g_memorySave.valid || g_autoSave.valid;
+            for (int i = 0; i < 4; i++) {
                 if (i == menuIndex) {
-                    fillRectFast(winSurf, offX + 210, offY + 234 + i * 38, 220, 30, 60, 90, 160);
+                    fillRectFast(gameSurf, offX + 160, offY + 170 + i * 40, 340, 32, 60, 90, 160);
                 }
-                uint8_t tc = (i == 1 && !g_memorySave.valid) ? 120 : 255;
-                drawText(winSurf, offX + 222, offY + 240 + i * 38, opts[i], 2, tc, tc, tc);
+                uint8_t tc = (i == 1 && !hasSave) ? 120 : 255;
+                drawText(gameSurf, offX + 170, offY + 178 + i * 40, opts[i], 2, tc, tc, tc);
             }
             if (aooniSurf) {
                 int cw = aooniSurf->w / 4, ch = aooniSurf->h / 4;
                 SDL_Rect src = { (int)((frame / 15) % 4) * cw, 0, cw, ch };
-                SDL_Rect dst = { offX + 60, offY + 200, cw * 2, ch * 2 };
-                blitSurf(aooniSurf, &src, winSurf, &dst);
+                SDL_Rect dst = { offX + 34, offY + 188, cw * 2, ch * 2 };
+                blitSurf(aooniSurf, &src, gameSurf, &dst);
             }
-            drawText(winSurf, offX + 110, offY + 420, "Pulsa X para iniciar la historia", 2, 180, 180, 200);
+            drawText(gameSurf, offX + 40, offY + 412, "X: Aceptar | R2: Resolucion 4K/1080p | L2: Aspecto", 2, 190, 205, 235);
+            drawText(gameSurf, offX + 68, offY + 438, "L1/R1: Correr | Cuadrado: Guardar Partida", 2, 165, 175, 205);
         } else if (state == STATE_GAMEOVER) {
             if (goSurf) {
                 SDL_Rect dst = { offX, offY, GAME_W, GAME_H };
-                blitSurf(goSurf, NULL, winSurf, &dst);
+                blitSurf(goSurf, NULL, gameSurf, &dst);
             } else {
-                drawText(winSurf, offX + 200, offY + 210, "GAME OVER", 4, 220, 40, 40);
+                drawText(gameSurf, offX + 200, offY + 210, "GAME OVER", 4, 220, 40, 40);
             }
-            drawText(winSurf, offX + 140, offY + 420, "Pulsa X para volver al titulo", 2, 220, 220, 220);
+            if (g_autoSave.valid || g_memorySave.valid) {
+                drawText(gameSurf, offX + 64, offY + 424, "X: Reintentar desde ultima sala | Circulo: Titulo", 2, 240, 220, 220);
+            } else {
+                drawText(gameSurf, offX + 140, offY + 424, "Pulsa X para volver al titulo", 2, 220, 220, 220);
+            }
         } else if (state == STATE_INVENTORY) {
-            fillRectFast(winSurf, offX + 24, offY + 24, GAME_W - 48, GAME_H - 48, 18, 26, 70);
-            drawRectFast(winSurf, offX + 24, offY + 24, GAME_W - 48, GAME_H - 48, 220, 220, 255);
-            drawText(winSurf, offX + 44, offY + 40, "OBJETOS (X: Usar | Cuadrado: Guardar | Circulo: Volver)", 2, 255, 235, 140);
+            fillRectFast(gameSurf, offX + 24, offY + 24, GAME_W - 48, GAME_H - 48, 18, 26, 70);
+            drawRectFast(gameSurf, offX + 24, offY + 24, GAME_W - 48, GAME_H - 48, 220, 220, 255);
+            drawText(gameSurf, offX + 44, offY + 40, "OBJETOS (X: Usar | Cuadrado: Guardar | Circulo: Volver)", 2, 255, 235, 140);
 
             int iy = offY + 82;
             if (ownedItems.empty()) {
-                drawText(winSurf, offX + 48, iy, "(No tienes objetos todavia)", 2, 180, 180, 180);
+                drawText(gameSurf, offX + 48, iy, "(No tienes objetos todavia)", 2, 180, 180, 180);
             } else {
                 for (size_t idx = 0; idx < ownedItems.size(); idx++) {
                     int id = ownedItems[idx];
                     if ((int)idx == invCursor) {
-                        fillRectFast(winSurf, offX + 36, iy - 4, GAME_W - 72, 28, 60, 90, 165);
+                        fillRectFast(gameSurf, offX + 36, iy - 4, GAME_W - 72, 28, 60, 90, 165);
                     }
                     std::string iname = g_game.itemDefs.count(id) ? g_game.itemDefs[id].name : ("Item #" + std::to_string(id));
                     std::string iicon = g_game.itemDefs.count(id) ? g_game.itemDefs[id].icon : "";
@@ -2528,23 +3397,23 @@ int main(int argc, char* argv[]) {
                         SDL_Surface* icSurf = getSurf(std::string("/app0/assets/images/icon_") + iicon + ".png");
                         if (icSurf) {
                             SDL_Rect idst = { offX + 44, iy - 2, 24, 24 };
-                            blitSurf(icSurf, NULL, winSurf, &idst);
+                            blitSurf(icSurf, NULL, gameSurf, &idst);
                             textX = offX + 76;
                         }
                     }
-                    drawText(winSurf, textX, iy + 2, iname, 2, 255, 255, 255);
+                    drawText(gameSurf, textX, iy + 2, iname, 2, 255, 255, 255);
                     iy += 30;
                 }
                 if (invCursor >= 0 && invCursor < (int)ownedItems.size()) {
                     int selId = ownedItems[invCursor];
                     std::string desc = g_game.itemDefs.count(selId) ? g_game.itemDefs[selId].desc : "";
-                    fillRectFast(winSurf, offX + 36, offY + GAME_H - 96, GAME_W - 72, 56, 12, 18, 48);
-                    drawRectFast(winSurf, offX + 36, offY + GAME_H - 96, GAME_W - 72, 56, 160, 170, 220);
-                    drawText(winSurf, offX + 46, offY + GAME_H - 84, desc, 2, 210, 220, 255);
+                    fillRectFast(gameSurf, offX + 36, offY + GAME_H - 96, GAME_W - 72, 56, 12, 18, 48);
+                    drawRectFast(gameSurf, offX + 36, offY + GAME_H - 96, GAME_W - 72, 56, 160, 170, 220);
+                    drawText(gameSurf, offX + 46, offY + GAME_H - 84, desc, 2, 210, 220, 255);
                 }
             }
             if (!invStatusMsg.empty()) {
-                drawText(winSurf, offX + 46, offY + GAME_H - 122, invStatusMsg, 2, 140, 255, 160);
+                drawText(gameSurf, offX + 46, offY + GAME_H - 122, invStatusMsg, 2, 140, 255, 160);
             }
         } else if (state == STATE_MAP) {
             int pPxX = (int)std::round(g_game.playerRealX);
@@ -2562,7 +3431,7 @@ int main(int argc, char* argv[]) {
             if (g_game.mapLowerSurf) {
                 SDL_Rect src = { camX, camY, GAME_W, GAME_H };
                 SDL_Rect dst = { offX, offY, GAME_W, GAME_H };
-                blitSurf(g_game.mapLowerSurf, &src, winSurf, &dst);
+                blitSurf(g_game.mapLowerSurf, &src, gameSurf, &dst);
             }
 
             // 2) Ordenar por coordenada Y sub-píxel y dibujar eventos + jugador
@@ -2591,7 +3460,7 @@ int main(int argc, char* argv[]) {
                     int px = offX + (pPxX - camX) - (cw - TILE_SZ) / 2;
                     int py = offY + (pPxY - camY) - (ch - TILE_SZ);
                     SDL_Rect dst = { px, py, cw, ch };
-                    blitSurf(ps, &src, winSurf, &dst);
+                    blitSurf(ps, &src, gameSurf, &dst);
                 } else if (sd.ev) {
                     int evPxX = (int)std::round(sd.ev->realX);
                     int evPxY = (int)std::round(sd.ev->realY);
@@ -2603,7 +3472,7 @@ int main(int argc, char* argv[]) {
                         int ex = offX + (evPxX - camX) - (cw - TILE_SZ) / 2;
                         int ey = offY + (evPxY - camY) - (ch - TILE_SZ);
                         SDL_Rect dst = { ex, ey, cw, ch };
-                        blitSurf(es, &src, winSurf, &dst, (uint8_t)sd.ev->opacity);
+                        blitSurf(es, &src, gameSurf, &dst, (uint8_t)sd.ev->opacity);
                     } else if (sd.ev->tile_id >= 384) {
                         if (!tsSurf && g_game.tilesetFile[0])
                             tsSurf = getSurf(std::string("/app0/assets/images/ts_") + g_game.tilesetFile + ".png");
@@ -2611,7 +3480,7 @@ int main(int argc, char* argv[]) {
                             int tIndex = sd.ev->tile_id - 384;
                             SDL_Rect src = { (tIndex % 8) * TILE_SZ, (tIndex / 8) * TILE_SZ, TILE_SZ, TILE_SZ };
                             SDL_Rect dst = { offX + (evPxX - camX), offY + (evPxY - camY), TILE_SZ, TILE_SZ };
-                            blitSurf(tsSurf, &src, winSurf, &dst, (uint8_t)sd.ev->opacity);
+                            blitSurf(tsSurf, &src, gameSurf, &dst, (uint8_t)sd.ev->opacity);
                         }
                     }
                 }
@@ -2621,7 +3490,7 @@ int main(int argc, char* argv[]) {
             if (g_game.mapUpperSurf) {
                 SDL_Rect src = { camX, camY, GAME_W, GAME_H };
                 SDL_Rect dst = { offX, offY, GAME_W, GAME_H };
-                blitSurf(g_game.mapUpperSurf, &src, winSurf, &dst);
+                blitSurf(g_game.mapUpperSurf, &src, gameSurf, &dst);
             }
 
             // 4) Aplicar tono de pantalla (cmd 223, ej: -85,-85,-85 en el interior de la mansión)
@@ -2629,7 +3498,7 @@ int main(int argc, char* argv[]) {
             int tg = (int)std::round(g_game.curToneG);
             int tb = (int)std::round(g_game.curToneB);
             if (tr != 0 || tg != 0 || tb != 0) {
-                applyToneRectFast(winSurf, offX, offY, GAME_W, GAME_H, tr, tg, tb);
+                applyToneRectFast(gameSurf, offX, offY, GAME_W, GAME_H, tr, tg, tb);
             }
 
             // 5) Dibujar Pictures activas (1..50, con soporte de origin y zoom)
@@ -2643,37 +3512,56 @@ int main(int argc, char* argv[]) {
                 int dx = offX + (int)pic.x - (pic.origin == 1 ? dw / 2 : 0);
                 int dy = offY + (int)pic.y - (pic.origin == 1 ? dh / 2 : 0);
                 SDL_Rect dst = { dx, dy, dw, dh };
-                blitSurf(ps, NULL, winSurf, &dst, (uint8_t)std::min(255.0f, pic.opacity));
+                blitSurf(ps, NULL, gameSurf, &dst, (uint8_t)std::min(255.0f, pic.opacity));
             }
 
             // 5.5) Aplicar fundido a negro de transición entre habitaciones o cmd 221/222
             if (g_game.screenBlackout) {
-                fillRectFast(winSurf, offX, offY, GAME_W, GAME_H, 0, 0, 0, 255);
+                fillRectFast(gameSurf, offX, offY, GAME_W, GAME_H, 0, 0, 0, 255);
             } else if (g_game.fadeAlpha > 0) {
-                fillRectFast(winSurf, offX, offY, GAME_W, GAME_H, 0, 0, 0, (uint8_t)std::min(255, g_game.fadeAlpha));
+                fillRectFast(gameSurf, offX, offY, GAME_W, GAME_H, 0, 0, 0, (uint8_t)std::min(255, g_game.fadeAlpha));
+            }
+
+            // 5.6) Cronómetro en pantalla si el Easter Egg "TIMER" (switch 43) está activo
+            if (g_game.switches[43]) {
+                uint32_t totalFrames = g_game.frameCount;
+                int mins = (int)((totalFrames / 3600) % 100);
+                int secs = (int)((totalFrames / 60) % 60);
+                int cent = (int)(((totalFrames % 60) * 100) / 60);
+                char tbuf[32];
+                snprintf(tbuf, sizeof(tbuf), "%02d:%02d.%02d", mins, secs, cent);
+                fillRectFast(gameSurf, offX + 12, offY + 12, 116, 26, 15, 22, 68, 210);
+                drawRectFast(gameSurf, offX + 12, offY + 12, 116, 26, 190, 210, 255);
+                drawText(gameSurf, offX + 20, offY + 18, tbuf, 2, 255, 240, 130);
+            }
+
+            if (autoSaveBannerFrames > 0) {
+                fillRectFast(gameSurf, offX + GAME_W - 210, offY + 12, 198, 28, 18, 30, 82, 220);
+                drawRectFast(gameSurf, offX + GAME_W - 210, offY + 12, 198, 28, 180, 220, 255);
+                drawText(gameSurf, offX + GAME_W - 198, offY + 19, "PARTIDA GUARDADA", 2, 140, 255, 160);
             }
 
             // 6) Cuadro de diálogo
             if (g_game.msgActive) {
                 int boxY = (g_game.msgPos == 0) ? (offY + 12) : ((g_game.msgPos == 1) ? (offY + 170) : (offY + GAME_H - 132));
-                fillRectFast(winSurf, offX + 16, boxY, GAME_W - 32, 120, 15, 22, 68, 235);
-                drawRectFast(winSurf, offX + 16, boxY, GAME_W - 32, 120, 230, 230, 255);
+                fillRectFast(gameSurf, offX + 16, boxY, GAME_W - 32, 120, 15, 22, 68, 235);
+                drawRectFast(gameSurf, offX + 16, boxY, GAME_W - 32, 120, 230, 230, 255);
 
                 int textX = offX + 32;
                 if (!g_game.msgFace.empty()) {
                     SDL_Surface* faceSurf = getSurf(std::string("/app0/assets/images/pic_") + g_game.msgFace + ".png");
                     if (faceSurf) {
                         SDL_Rect fdst = { offX + 26, boxY + 12, faceSurf->w, faceSurf->h };
-                        blitSurf(faceSurf, NULL, winSurf, &fdst);
+                        blitSurf(faceSurf, NULL, gameSurf, &fdst);
                         textX = offX + 26 + faceSurf->w + 14;
                     }
                 }
                 int textY = boxY + 14;
                 if (!g_game.msgSpeaker.empty()) {
-                    drawText(winSurf, textX, textY, "[" + g_game.msgSpeaker + "]", 2, 255, 230, 120);
+                    drawText(gameSurf, textX, textY, "[" + g_game.msgSpeaker + "]", 2, 255, 230, 120);
                     textY += 24;
                 }
-                drawText(winSurf, textX, textY, g_game.msgText, 2, 255, 255, 255);
+                drawText(gameSurf, textX, textY, g_game.msgText, 2, 255, 255, 255);
             }
 
             // 7) Cuadro de elecciones (cmd 102)
@@ -2681,13 +3569,13 @@ int main(int argc, char* argv[]) {
                 int chH = (int)g_game.choices.size() * 28 + 20;
                 int cx = offX + GAME_W - 220;
                 int cy = offY + GAME_H - 132 - chH - 8;
-                fillRectFast(winSurf, cx, cy, 204, chH, 18, 28, 78, 240);
-                drawRectFast(winSurf, cx, cy, 204, chH, 230, 230, 255);
+                fillRectFast(gameSurf, cx, cy, 204, chH, 18, 28, 78, 240);
+                drawRectFast(gameSurf, cx, cy, 204, chH, 230, 230, 255);
                 for (size_t i = 0; i < g_game.choices.size(); i++) {
                     if ((int)i == g_game.choiceIndex) {
-                        fillRectFast(winSurf, cx + 6, cy + 8 + (int)i * 28, 192, 24, 65, 95, 175);
+                        fillRectFast(gameSurf, cx + 6, cy + 8 + (int)i * 28, 192, 24, 65, 95, 175);
                     }
-                    drawText(winSurf, cx + 14, cy + 12 + (int)i * 28, g_game.choices[i], 2, 255, 255, 255);
+                    drawText(gameSurf, cx + 14, cy + 12 + (int)i * 28, g_game.choices[i], 2, 255, 255, 255);
                 }
             }
 
@@ -2697,21 +3585,97 @@ int main(int argc, char* argv[]) {
                 int bh = 76;
                 int bx = offX + (GAME_W - bw) / 2;
                 int by = offY + (GAME_H - bh) / 2;
-                fillRectFast(winSurf, bx, by, bw, bh, 18, 28, 78, 245);
-                drawRectFast(winSurf, bx, by, bw, bh, 230, 230, 255);
+                fillRectFast(gameSurf, bx, by, bw, bh, 18, 28, 78, 245);
+                drawRectFast(gameSurf, bx, by, bw, bh, 230, 230, 255);
                 for (int d = 0; d < g_game.numInputDigits; d++) {
                     int dx = bx + 20 + d * 44;
                     if (d == g_game.numInputCursor) {
-                        fillRectFast(winSurf, dx - 4, by + 18, 32, 40, 70, 105, 190);
+                        fillRectFast(gameSurf, dx - 4, by + 18, 32, 40, 70, 105, 190);
                     }
                     char digStr[4];
                     snprintf(digStr, sizeof(digStr), "%d", g_game.numInputVals[d]);
-                    drawText(winSurf, dx, by + 26, digStr, 3, 255, 255, 255);
+                    drawText(gameSurf, dx, by + 26, digStr, 3, 255, 255, 255);
                 }
+            }
+
+            // 9) Pantalla interactiva de Nombre del Personaje (cmd 303 + Easter Eggs Oficiales)
+            if (g_game.nameInputActive) {
+                fillRectFast(gameSurf, 28, 22, GAME_W - 56, GAME_H - 44, 15, 22, 66, 248);
+                drawRectFast(gameSurf, 28, 22, GAME_W - 56, GAME_H - 44, 225, 230, 255);
+
+                drawText(gameSurf, 48, 36, "NOMBRE DEL PROTAGONISTA (X: Elegir | Cuadrado: Borrar | OPTIONS: OK)", 2, 255, 235, 130);
+
+                // Caja del nombre actual con sprite de Hiroshi
+                fillRectFast(gameSurf, 48, 66, GAME_W - 96, 52, 10, 15, 44, 255);
+                drawRectFast(gameSurf, 48, 66, GAME_W - 96, 52, 180, 195, 255);
+                SDL_Surface* hSurf = getSurf("/app0/assets/images/char_hirosi.png");
+                if (hSurf) {
+                    int cw = hSurf->w / 4, ch = hSurf->h / 4;
+                    SDL_Rect src = { 0, 0, cw, ch };
+                    SDL_Rect dst = { 62, 68, cw, ch };
+                    blitSurf(hSurf, &src, gameSurf, &dst);
+                }
+                std::string dispName = g_game.nameInputStr + ((frame / 15) % 2 == 0 ? "_" : " ");
+                drawText(gameSurf, 114, 80, dispName, 3, 255, 255, 255);
+
+                // Cuadrícula de caracteres (6 filas x 10 columnas)
+                for (int r = 0; r < 6; r++) {
+                    for (int c = 0; c < 10; c++) {
+                        int kx = 54 + c * 53;
+                        int ky = 132 + r * 34;
+                        bool sel = (g_game.nameInputRow == r && g_game.nameInputCol == c);
+                        if (sel) {
+                            fillRectFast(gameSurf, kx - 6, ky - 4, 38, 28, 70, 108, 195);
+                            drawRectFast(gameSurf, kx - 6, ky - 4, 38, 28, 255, 240, 150);
+                        }
+                        char chStr[2] = { NAME_KB_ROWS[r][c], '\0' };
+                        drawText(gameSurf, kx + 4, ky + 2, chStr, 2, 255, 255, 255);
+                    }
+                }
+
+                // Fila 6: Botones de acción rápida y Nombres Truco / Easter Eggs Oficiales
+                drawText(gameSurf, 48, 342, "BOTONES RAPIDOS Y MODOS SECRETOS (EASTER EGGS OFICIALES):", 2, 175, 210, 255);
+                int bx = 46;
+                int by = 366;
+                for (int q = 0; q < 9; q++) {
+                    int bw = (int)strlen(NAME_QUICK_BTNS[q].label) * 12 + 14;
+                    if (bx + bw > GAME_W - 44) {
+                        bx = 46;
+                        by += 32;
+                    }
+                    bool sel = (g_game.nameInputRow == 6 && g_game.nameInputCol == q);
+                    if (sel) {
+                        fillRectFast(gameSurf, bx, by, bw, 26, 75, 115, 205);
+                        drawRectFast(gameSurf, bx, by, bw, 26, 255, 240, 140);
+                    } else {
+                        fillRectFast(gameSurf, bx, by, bw, 26, 28, 42, 105);
+                        drawRectFast(gameSurf, bx, by, bw, 26, 130, 150, 210);
+                    }
+                    uint8_t rCol = (q == 0) ? 150 : ((q >= 3) ? 255 : 235);
+                    uint8_t gCol = (q == 0) ? 255 : ((q >= 3) ? 230 : 235);
+                    uint8_t bCol = (q == 0) ? 170 : ((q >= 3) ? 140 : 255);
+                    drawText(gameSurf, bx + 7, by + 5, NAME_QUICK_BTNS[q].label, 2, rCol, gCol, bCol);
+                    bx += bw + 8;
+                }
+
+                // Descripción inferior de la tecla o Easter Egg seleccionado
+                std::string hintText = "Selecciona letras con X o elige un nombre rapido abajo.";
+                if (g_game.nameInputRow == 6 && g_game.nameInputCol >= 0 && g_game.nameInputCol < 9) {
+                    hintText = NAME_QUICK_BTNS[g_game.nameInputCol].hint;
+                }
+                drawText(gameSurf, 48, 434, hintText, 2, 200, 235, 190);
             }
         }
 
-        SDL_UpdateWindowSurface(window);
+        if (videoBannerFrames > 0 && !videoBannerText.empty()) {
+            int bw = (int)videoBannerText.size() * 12 + 24;
+            int bx = std::max(8, (GAME_W - bw) / 2);
+            fillRectFast(gameSurf, bx, 10, bw, 28, 16, 26, 78, 235);
+            drawRectFast(gameSurf, bx, 10, bw, 28, 220, 230, 255);
+            drawText(gameSurf, bx + 12, 17, videoBannerText, 2, 255, 240, 140);
+        }
+
+        presentScaledCanvas(window, gameSurf);
     }
 
     g_audioRunning = false;
