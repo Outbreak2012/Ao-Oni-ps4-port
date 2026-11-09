@@ -1504,10 +1504,10 @@ static bool applyMoveCmd(int targetId, const MoveCmd& mc) {
             else if (ev) ev->routeWaitFrames = wf;
             break;
         }
-        case 16: *pdir = 2; break;
-        case 17: *pdir = 4; break;
-        case 18: *pdir = 6; break;
-        case 19: *pdir = 8; break;
+        case 16: *pdir = 2; consumesStep = false; break;
+        case 17: *pdir = 4; consumesStep = false; break;
+        case 18: *pdir = 6; consumesStep = false; break;
+        case 19: *pdir = 8; consumesStep = false; break;
         case 25: if (ev) {
             int dx = g_game.playerX - ev->x, dy = g_game.playerY - ev->y;
             ev->dir = (std::abs(dx) >= std::abs(dy)) ? (dx >= 0 ? 6 : 4) : (dy >= 0 ? 2 : 8);
@@ -2037,6 +2037,12 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
         MapEvent* selfEv = findEvent(evId);
         if (!selfEv || selfEv->erased || selfEv->activePage < 0) return;
         startPage = selfEv->activePage;
+    }
+    if (isForeground && g_game.fgWaitForMove) {
+        bool anyMoving = g_game.playerRouteActive;
+        for (const auto& ev : g_game.events) if (ev.routeActive) anyMoving = true;
+        if (anyMoving) return;
+        g_game.fgWaitForMove = false;
     }
     int steps = 0;
     while (ip < list.a.size() && steps < 1024) {
@@ -2737,12 +2743,6 @@ static void updateMoveRoutes(uint32_t now) {
     }
     for (auto& ev : g_game.events) {
         if (ev.activePage < 0) continue;
-        bool isAo = (ev.char_name.rfind("ao", 0) == 0 || ev.collisionAttack || ev.isBattler);
-        bool inInspection = (!g_game.fgStack.empty() || g_game.btnInputActive || g_game.msgActive || g_game.choiceActive || g_game.numInputActive || g_game.nameInputActive);
-        if (isAo && inInspection) {
-            // Congelar persecución mientras el jugador está viendo una imagen/acertijo (ej: piano, armarios) o en un diálogo
-            continue;
-        }
         if (ev.routeActive) {
             if (!isEventMoving(ev)) {
                 if (ev.routeWaitFrames > 0) {
@@ -2759,7 +2759,8 @@ static void updateMoveRoutes(uint32_t now) {
                     }
                 }
             }
-        } else if (g_game.fgStack.empty() && !g_game.btnInputActive && !g_game.msgActive && !g_game.choiceActive && ev.move_type > 0 && !isEventMoving(ev)) {
+        } else if (g_game.fgStack.empty() && !g_game.btnInputActive && !g_game.msgActive && !g_game.choiceActive &&
+                   !g_game.numInputActive && !g_game.nameInputActive && ev.move_type > 0 && !isEventMoving(ev)) {
             if (ev.routeWaitFrames > 0) {
                 ev.routeWaitFrames--;
                 continue;
