@@ -156,17 +156,6 @@ static bool setVideoOutputResolution(int targetW, int targetH) {
     return true;
 }
 
-static bool isMapTileCounter(int tx, int ty) {
-    if (tx < 0 || ty < 0 || tx >= g_game.mapW || ty >= g_game.mapH) return false;
-    for (int z = 2; z >= 0; z--) {
-        int16_t tid = g_game.layers[tx + ty * g_game.mapW + z * g_game.mapW * g_game.mapH];
-        if (tid <= 0) continue;
-        if ((size_t)tid < g_game.passable.size() && (g_game.passable[tid] & 0x80) == 0x80)
-            return true;
-    }
-    return false;
-}
-
 static void cycleVideoResolution() {
     const int resTable[3][2] = { {1280, 720}, {1920, 1080}, {3840, 2160} };
     for (int attempt = 0; attempt < 3; attempt++) {
@@ -232,6 +221,12 @@ static void presentScaledCanvas(SDL_Window* window, SDL_Surface* gameSurf) {
     const uint32_t* srcBase = (const uint32_t*)gameSurf->pixels;
     const int srcPitch = gameSurf->pitch / 4;
 
+    // Limpieza de bordes fuera del área de juego (barras negras superior e inferior si hay letterbox)
+    if (dstY > 0) {
+        memset(dstBase, 0, (size_t)dstY * outW * sizeof(uint32_t));
+        memset(dstBase + (size_t)(dstY + dstH) * outW, 0, (size_t)(outH - dstY - dstH) * outW * sizeof(uint32_t));
+    }
+
     static int s_cachedDstW = 0;
     static int s_xMap[4096];
     if (s_cachedDstW != dstW) {
@@ -248,6 +243,11 @@ static void presentScaledCanvas(SDL_Window* window, SDL_Surface* gameSurf) {
     for (int y = 0; y < dstH; y++) {
         int sy = (y * GAME_H) / dstH;
         uint32_t* dstRow = dstBase + (size_t)(dstY + y) * outW + dstX;
+        // Limpieza de bordes laterales (barras negras 4:3 en 1080p/4K) para que no se vea nada fuera del mapa
+        if (dstX > 0) {
+            memset(dstRow - dstX, 0, (size_t)dstX * sizeof(uint32_t));
+            memset(dstRow + dstW, 0, (size_t)(outW - dstX - dstW) * sizeof(uint32_t));
+        }
         if (sy == prevSy && prevDstRow) {
             memcpy(dstRow, prevDstRow, rowBytes);
         } else {
@@ -1123,8 +1123,9 @@ struct GameRuntime {
     int nameInputActorId = 2;
     int nameInputMaxLen = 10;
     std::string nameInputStr = "Hiroshi";
-    int nameInputRow = 6; // Fila 6 = botones rápidos ([CONFIRMAR], [BORRAR], Hiroshi, SOUTHPARK, GODMODE...)
+    int nameInputRow = 0; // Fila 0, Col 0 = letra 'A' para selección directa
     int nameInputCol = 0;
+    int nameInputCooldown = 0;
 
     bool pendingTransfer = false;
     int nextMapId = 0, nextX = 0, nextY = 0, nextDir = 0;
@@ -1146,8 +1147,10 @@ static inline bool isEventMoving(const MapEvent& ev) {
 
 static inline float rmxpSpeedPxPerFrame(float spd) {
     float s = std::max(1.0f, std::min(7.0f, spd));
-    // En RPG Maker XP (ajustado a 60 FPS): speed 3 = 2 px/frame, speed 4 = 4 px/frame (8 frames por tile de 32px)
-    return std::pow(2.0f, s) * 0.25f;
+    // En RPG Maker XP nativo (40 FPS): velocidad 4 = 4 px/frame (160 px/s = 5 tiles/s).
+    // Para reproducir la velocidad y balance de persecución 1:1 original en PS4 a 60 FPS:
+    // px/frame = (2^s / 4) * (40 / 60) = (2^s) / 6.0f
+    return std::pow(2.0f, s) / 6.0f;
 }
 
 static int rmDirToRow(int d) {
@@ -1175,17 +1178,6 @@ static bool checkPageCond(int mapId, int evId, const EventPage& p) {
         if (!g_game.selfSwitches[key]) return false;
     }
     return true;
-}
-
-static bool isMapTileCounter(int tx, int ty) {
-    if (tx < 0 || ty < 0 || tx >= g_game.mapW || ty >= g_game.mapH) return false;
-    for (int z = 2; z >= 0; z--) {
-        int16_t tid = g_game.layers[tx + ty * g_game.mapW + z * g_game.mapW * g_game.mapH];
-        if (tid <= 0) continue;
-        if ((size_t)tid < g_game.passable.size() && (g_game.passable[tid] & 0x80) == 0x80)
-            return true;
-    }
-    return false;
 }
 
 // Implementación 1:1 de Game_Event#refresh (021_Game_Event.rb:141-163) y Game_Character#move_type_custom (019_Game_Character_2.rb:322-344)
@@ -1311,18 +1303,8 @@ static bool isMapTilePassable(int tx, int ty, int d, int selfEvId = -1) {
     return true;
 }
 
-// Implementación 1:1 de Game_Map#counter?(x, y) de RGSS1 (bit 0x80 en pasajes para mesas y mostradores)
-static bool isMapTileCounter(int tx, int ty) {
-    if (tx < 0 || ty < 0 || tx >= g_game.mapW || ty >= g_game.mapH) return false;
-    for (int z = 2; z >= 0; z--) {
-        int16_t tid = g_game.layers[tx + ty * g_game.mapW + z * g_game.mapW * g_game.mapH];
-        if (tid <= 0) continue;
-        if ((size_t)tid < g_game.passable.size() && (g_game.passable[tid] & 0x80) == 0x80)
-            return true;
-    }
-    return false;
-}
 
+// Implementación 1:1 de Game_Map#counter?(x, y) de RGSS1 (bit 0x80 en pasajes para mesas y mostradores)
 static bool isMapTileCounter(int tx, int ty) {
     if (tx < 0 || ty < 0 || tx >= g_game.mapW || ty >= g_game.mapH) return false;
     for (int z = 2; z >= 0; z--) {
@@ -1360,17 +1342,6 @@ static bool canPassMove(int fx, int fy, int d, bool isPlayer, int selfEvId = -1)
     // Solo exigir bit de salida del tile actual si el tile actual es transitable base (evita quedarse atrapado si un evento te coloca sobre un borde)
     if (isMapTilePassable(fx, fy, 0, selfEvId) && !isMapTilePassable(fx, fy, d, selfEvId)) return false;
     return true;
-}
-
-static bool isMapTileCounter(int tx, int ty) {
-    if (tx < 0 || ty < 0 || tx >= g_game.mapW || ty >= g_game.mapH) return false;
-    for (int z = 2; z >= 0; z--) {
-        int16_t tid = g_game.layers[tx + ty * g_game.mapW + z * g_game.mapW * g_game.mapH];
-        if (tid <= 0) continue;
-        if ((size_t)tid < g_game.passable.size() && (g_game.passable[tid] & 0x80) == 0x80)
-            return true;
-    }
-    return false;
 }
 
 static bool canPassTile(int tx, int ty, bool isPlayer, int selfEvId = -1) {
@@ -1741,17 +1712,6 @@ static bool loadMap(int mapId) {
 
     printf("[AoOni] Mapa %03d cargado y cacheado (%dx%d, eventos=%zu)\n", mapId, g_game.mapW, g_game.mapH, g_game.events.size());
     return true;
-}
-
-static bool isMapTileCounter(int tx, int ty) {
-    if (tx < 0 || ty < 0 || tx >= g_game.mapW || ty >= g_game.mapH) return false;
-    for (int z = 2; z >= 0; z--) {
-        int16_t tid = g_game.layers[tx + ty * g_game.mapW + z * g_game.mapW * g_game.mapH];
-        if (tid <= 0) continue;
-        if ((size_t)tid < g_game.passable.size() && (g_game.passable[tid] & 0x80) == 0x80)
-            return true;
-    }
-    return false;
 }
 
 static void formatDialogText(const std::string& raw, std::string& faceOut, std::string& speakerOut, std::string& cleanOut) {
@@ -2528,8 +2488,9 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                                       ? g_game.actorNames[g_game.nameInputActorId]
                                       : "Hiroshi";
                 if (g_game.nameInputStr.empty()) g_game.nameInputStr = "Hiroshi";
-                g_game.nameInputRow = 6; // Empezar en [CONFIRMAR] para inicio rápido o cambiar nombre/modos
+                g_game.nameInputRow = 0; // Iniciar en 'A' (Fila 0, Col 0) para que el jugador elija letras libremente
                 g_game.nameInputCol = 0;
+                g_game.nameInputCooldown = 20; // Debounce de 20 frames para no consumir la X del diálogo anterior
                 g_game.nameInputActive = true;
                 ip++;
                 return;
@@ -2873,17 +2834,6 @@ static bool writeSnapshotToDisk(const SaveSnapshot& snap, const char* path) {
     return true;
 }
 
-static bool isMapTileCounter(int tx, int ty) {
-    if (tx < 0 || ty < 0 || tx >= g_game.mapW || ty >= g_game.mapH) return false;
-    for (int z = 2; z >= 0; z--) {
-        int16_t tid = g_game.layers[tx + ty * g_game.mapW + z * g_game.mapW * g_game.mapH];
-        if (tid <= 0) continue;
-        if ((size_t)tid < g_game.passable.size() && (g_game.passable[tid] & 0x80) == 0x80)
-            return true;
-    }
-    return false;
-}
-
 static bool readSnapshotFromDisk(SaveSnapshot& snap, const char* path) {
     FILE* f = fopen(path, "rb");
     if (!f) return false;
@@ -2936,17 +2886,6 @@ static bool readSnapshotFromDisk(SaveSnapshot& snap, const char* path) {
     return true;
 }
 
-static bool isMapTileCounter(int tx, int ty) {
-    if (tx < 0 || ty < 0 || tx >= g_game.mapW || ty >= g_game.mapH) return false;
-    for (int z = 2; z >= 0; z--) {
-        int16_t tid = g_game.layers[tx + ty * g_game.mapW + z * g_game.mapW * g_game.mapH];
-        if (tid <= 0) continue;
-        if ((size_t)tid < g_game.passable.size() && (g_game.passable[tid] & 0x80) == 0x80)
-            return true;
-    }
-    return false;
-}
-
 static void saveGame() {
     captureSnapshot(g_memorySave);
     g_autoSave = g_memorySave;
@@ -2992,17 +2931,6 @@ static bool restoreFromSnapshot(const SaveSnapshot& snap) {
     g_game.playerPattern = 0;
     setPadLightbar(25, 45, 160);
     return true;
-}
-
-static bool isMapTileCounter(int tx, int ty) {
-    if (tx < 0 || ty < 0 || tx >= g_game.mapW || ty >= g_game.mapH) return false;
-    for (int z = 2; z >= 0; z--) {
-        int16_t tid = g_game.layers[tx + ty * g_game.mapW + z * g_game.mapW * g_game.mapH];
-        if (tid <= 0) continue;
-        if ((size_t)tid < g_game.passable.size() && (g_game.passable[tid] & 0x80) == 0x80)
-            return true;
-    }
-    return false;
 }
 
 static bool loadSavedGame() {
@@ -3411,6 +3339,10 @@ int main(int argc, char* argv[]) {
                 }
             } else if (state == STATE_MAP) {
                 if (g_game.nameInputActive) {
+                    if (g_game.nameInputCooldown > 0) {
+                        g_game.nameInputCooldown--;
+                        continue;
+                    }
                     int maxCols = (g_game.nameInputRow == 6) ? 9 : 10;
                     if (b == PAD_UP) {
                         g_game.nameInputRow = (g_game.nameInputRow + 6) % 7;
@@ -3433,6 +3365,10 @@ int main(int argc, char* argv[]) {
                             g_game.nameInputStr.pop_back();
                             playSe("003-System03", 80, 100);
                         }
+                    } else if (b == PAD_TRIANGLE) {
+                        // Limpiar nombre completo con Triángulo
+                        g_game.nameInputStr.clear();
+                        playSe("003-System03", 85, 100);
                     } else if (b == PAD_OPTIONS) {
                         if (g_game.nameInputStr.empty()) g_game.nameInputStr = "Hiroshi";
                         g_game.actorNames[g_game.nameInputActorId] = g_game.nameInputStr;
@@ -3461,7 +3397,6 @@ int main(int argc, char* argv[]) {
                                 }
                             } else if (qb >= 2 && qb < 9 && NAME_QUICK_BTNS[qb].value) {
                                 g_game.nameInputStr = NAME_QUICK_BTNS[qb].value;
-                                g_game.nameInputCol = 0; // Mover foco a [CONFIRMAR] tras elegir un nombre rápido
                                 playSe("002-System02", 85, 100);
                             }
                         }
@@ -3585,7 +3520,7 @@ int main(int argc, char* argv[]) {
                         // Guardado rápido QoL con Cuadrado directamente en el mapa (si no te persigue Ao Oni)
                         saveGame();
                         autoSaveBannerFrames = 90;
-                    } else if ((b == PAD_TRIANGLE || b == PAD_CIRCLE || b == PAD_OPTIONS) && !g_game.menuDisabled) {
+                    } else if ((b == PAD_TRIANGLE || b == PAD_OPTIONS) && !g_game.menuDisabled) {
                         playSe("002-System02", 80, 100);
                         invCursor = 0;
                         invStatusMsg.clear();
@@ -3623,7 +3558,7 @@ int main(int argc, char* argv[]) {
             updatePictures();
 
             // 1) Avanzar primero el sub-píxel del jugador hacia su casilla actual para que no haya ni 1 frame de pausa al llegar a una casilla
-            bool sprinting = (padL1 || padR1);
+            bool sprinting = (padL1 || padR1 || ((curPadMask & (1u << PAD_CIRCLE)) != 0));
             float remMovePx = advancePlayerSubPixel(sprinting);
 
             updateMoveRoutes(now);
@@ -4043,13 +3978,20 @@ int main(int argc, char* argv[]) {
                 fillRectFast(gameSurf, offX + 12, offY + 12, 116, 26, 15, 22, 68, 210);
                 drawRectFast(gameSurf, offX + 12, offY + 12, 116, 26, 190, 210, 255);
                 drawText(gameSurf, offX + 20, offY + 18, tbuf, 2, 255, 240, 130);
+                bool isSprinting = (padL1 || padR1 || ((curPadMask & (1u << PAD_CIRCLE)) != 0));
+                if (isSprinting && isPlayerMoving()) {
+                    fillRectFast(gameSurf, offX + 134, offY + 12, 98, 26, 20, 60, 110, 220);
+                    drawRectFast(gameSurf, offX + 134, offY + 12, 98, 26, 140, 210, 255);
+                    drawText(gameSurf, offX + 142, offY + 18, "CORRER", 2, 180, 240, 255);
+                }
                 if (g_game.timerWorking) {
                     int chaseSec = g_game.timerFrames / 60;
                     char cbuf[32];
                     snprintf(cbuf, sizeof(cbuf), "ONI %02d:%02d", chaseSec / 60, chaseSec % 60);
-                    fillRectFast(gameSurf, offX + 134, offY + 12, 126, 26, 55, 16, 48, 220);
-                    drawRectFast(gameSurf, offX + 134, offY + 12, 126, 26, 255, 160, 210);
-                    drawText(gameSurf, offX + 142, offY + 18, cbuf, 2, 255, 190, 220);
+                    int oniBoxX = (isSprinting && isPlayerMoving()) ? (offX + 240) : (offX + 134);
+                    fillRectFast(gameSurf, oniBoxX, offY + 12, 126, 26, 55, 16, 48, 220);
+                    drawRectFast(gameSurf, oniBoxX, offY + 12, 126, 26, 255, 160, 210);
+                    drawText(gameSurf, oniBoxX + 8, offY + 18, cbuf, 2, 255, 190, 220);
                 }
             }
 
