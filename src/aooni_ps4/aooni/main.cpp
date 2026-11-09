@@ -156,6 +156,17 @@ static bool setVideoOutputResolution(int targetW, int targetH) {
     return true;
 }
 
+static bool isMapTileCounter(int tx, int ty) {
+    if (tx < 0 || ty < 0 || tx >= g_game.mapW || ty >= g_game.mapH) return false;
+    for (int z = 2; z >= 0; z--) {
+        int16_t tid = g_game.layers[tx + ty * g_game.mapW + z * g_game.mapW * g_game.mapH];
+        if (tid <= 0) continue;
+        if ((size_t)tid < g_game.passable.size() && (g_game.passable[tid] & 0x80) == 0x80)
+            return true;
+    }
+    return false;
+}
+
 static void cycleVideoResolution() {
     const int resTable[3][2] = { {1280, 720}, {1920, 1080}, {3840, 2160} };
     for (int attempt = 0; attempt < 3; attempt++) {
@@ -1123,8 +1134,9 @@ struct GameRuntime {
 } g_game;
 
 static inline bool isPlayerMoving() {
-    return std::fabs(g_game.playerRealX - g_game.playerX * (float)TILE_SZ) > 0.05f ||
-           std::fabs(g_game.playerRealY - g_game.playerY * (float)TILE_SZ) > 0.05f;
+    float dx = std::fabs(g_game.playerRealX - g_game.playerX * (float)TILE_SZ);
+    float dy = std::fabs(g_game.playerRealY - g_game.playerY * (float)TILE_SZ);
+    return dx > 0.08f || dy > 0.08f;
 }
 
 static inline bool isEventMoving(const MapEvent& ev) {
@@ -1163,6 +1175,17 @@ static bool checkPageCond(int mapId, int evId, const EventPage& p) {
         if (!g_game.selfSwitches[key]) return false;
     }
     return true;
+}
+
+static bool isMapTileCounter(int tx, int ty) {
+    if (tx < 0 || ty < 0 || tx >= g_game.mapW || ty >= g_game.mapH) return false;
+    for (int z = 2; z >= 0; z--) {
+        int16_t tid = g_game.layers[tx + ty * g_game.mapW + z * g_game.mapW * g_game.mapH];
+        if (tid <= 0) continue;
+        if ((size_t)tid < g_game.passable.size() && (g_game.passable[tid] & 0x80) == 0x80)
+            return true;
+    }
+    return false;
 }
 
 // Implementación 1:1 de Game_Event#refresh (021_Game_Event.rb:141-163) y Game_Character#move_type_custom (019_Game_Character_2.rb:322-344)
@@ -1288,6 +1311,29 @@ static bool isMapTilePassable(int tx, int ty, int d, int selfEvId = -1) {
     return true;
 }
 
+// Implementación 1:1 de Game_Map#counter?(x, y) de RGSS1 (bit 0x80 en pasajes para mesas y mostradores)
+static bool isMapTileCounter(int tx, int ty) {
+    if (tx < 0 || ty < 0 || tx >= g_game.mapW || ty >= g_game.mapH) return false;
+    for (int z = 2; z >= 0; z--) {
+        int16_t tid = g_game.layers[tx + ty * g_game.mapW + z * g_game.mapW * g_game.mapH];
+        if (tid <= 0) continue;
+        if ((size_t)tid < g_game.passable.size() && (g_game.passable[tid] & 0x80) == 0x80)
+            return true;
+    }
+    return false;
+}
+
+static bool isMapTileCounter(int tx, int ty) {
+    if (tx < 0 || ty < 0 || tx >= g_game.mapW || ty >= g_game.mapH) return false;
+    for (int z = 2; z >= 0; z--) {
+        int16_t tid = g_game.layers[tx + ty * g_game.mapW + z * g_game.mapW * g_game.mapH];
+        if (tid <= 0) continue;
+        if ((size_t)tid < g_game.passable.size() && (g_game.passable[tid] & 0x80) == 0x80)
+            return true;
+    }
+    return false;
+}
+
 static bool hasBlockingCharacterAt(int tx, int ty, bool isPlayer, int selfEvId = -1) {
     for (const auto& ev : g_game.events) {
         if (ev.id == selfEvId || ev.activePage < 0 || ev.through) continue;
@@ -1314,6 +1360,17 @@ static bool canPassMove(int fx, int fy, int d, bool isPlayer, int selfEvId = -1)
     // Solo exigir bit de salida del tile actual si el tile actual es transitable base (evita quedarse atrapado si un evento te coloca sobre un borde)
     if (isMapTilePassable(fx, fy, 0, selfEvId) && !isMapTilePassable(fx, fy, d, selfEvId)) return false;
     return true;
+}
+
+static bool isMapTileCounter(int tx, int ty) {
+    if (tx < 0 || ty < 0 || tx >= g_game.mapW || ty >= g_game.mapH) return false;
+    for (int z = 2; z >= 0; z--) {
+        int16_t tid = g_game.layers[tx + ty * g_game.mapW + z * g_game.mapW * g_game.mapH];
+        if (tid <= 0) continue;
+        if ((size_t)tid < g_game.passable.size() && (g_game.passable[tid] & 0x80) == 0x80)
+            return true;
+    }
+    return false;
 }
 
 static bool canPassTile(int tx, int ty, bool isPlayer, int selfEvId = -1) {
@@ -1686,6 +1743,17 @@ static bool loadMap(int mapId) {
     return true;
 }
 
+static bool isMapTileCounter(int tx, int ty) {
+    if (tx < 0 || ty < 0 || tx >= g_game.mapW || ty >= g_game.mapH) return false;
+    for (int z = 2; z >= 0; z--) {
+        int16_t tid = g_game.layers[tx + ty * g_game.mapW + z * g_game.mapW * g_game.mapH];
+        if (tid <= 0) continue;
+        if ((size_t)tid < g_game.passable.size() && (g_game.passable[tid] & 0x80) == 0x80)
+            return true;
+    }
+    return false;
+}
+
 static void formatDialogText(const std::string& raw, std::string& faceOut, std::string& speakerOut, std::string& cleanOut) {
     std::string s = raw;
     // Normalizar códigos con espacios de la traducción al español (Map035: "\ C [2]", "\ _ ")
@@ -1985,8 +2053,8 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
         if (isForeground && (g_game.msgActive || g_game.choiceActive || g_game.numInputActive || g_game.btnInputActive || g_game.nameInputActive || g_game.pendingTransfer || g_game.transPhase == 1))
             return;
         if (isForeground && g_game.fgWaitForMove) {
-            bool anyMoving = g_game.playerRouteActive || isPlayerMoving();
-            for (const auto& ev : g_game.events) if (ev.routeActive || isEventMoving(ev)) anyMoving = true;
+            bool anyMoving = g_game.playerRouteActive;
+            for (const auto& ev : g_game.events) if (ev.routeActive) anyMoving = true;
             if (anyMoving) return;
             g_game.fgWaitForMove = false;
         }
@@ -2545,7 +2613,7 @@ static float advancePlayerSubPixel(bool sprinting) {
     float pdx = ptx - g_game.playerRealX;
     float pdy = pty - g_game.playerRealY;
     float dist = std::max(std::fabs(pdx), std::fabs(pdy));
-    if (dist <= 0.001f) {
+    if (dist <= 0.25f) {
         g_game.playerRealX = ptx;
         g_game.playerRealY = pty;
         return 0.0f;
@@ -2554,6 +2622,8 @@ static float advancePlayerSubPixel(bool sprinting) {
     else g_game.playerRealX += (pdx > 0.0f ? pspd : -pspd);
     if (std::fabs(pdy) <= pspd) g_game.playerRealY = pty;
     else g_game.playerRealY += (pdy > 0.0f ? pspd : -pspd);
+    if (std::fabs(ptx - g_game.playerRealX) < 0.25f) g_game.playerRealX = ptx;
+    if (std::fabs(pty - g_game.playerRealY) < 0.25f) g_game.playerRealY = pty;
     return (pspd > dist) ? (pspd - dist) : 0.0f;
 }
 
@@ -2803,6 +2873,17 @@ static bool writeSnapshotToDisk(const SaveSnapshot& snap, const char* path) {
     return true;
 }
 
+static bool isMapTileCounter(int tx, int ty) {
+    if (tx < 0 || ty < 0 || tx >= g_game.mapW || ty >= g_game.mapH) return false;
+    for (int z = 2; z >= 0; z--) {
+        int16_t tid = g_game.layers[tx + ty * g_game.mapW + z * g_game.mapW * g_game.mapH];
+        if (tid <= 0) continue;
+        if ((size_t)tid < g_game.passable.size() && (g_game.passable[tid] & 0x80) == 0x80)
+            return true;
+    }
+    return false;
+}
+
 static bool readSnapshotFromDisk(SaveSnapshot& snap, const char* path) {
     FILE* f = fopen(path, "rb");
     if (!f) return false;
@@ -2855,6 +2936,17 @@ static bool readSnapshotFromDisk(SaveSnapshot& snap, const char* path) {
     return true;
 }
 
+static bool isMapTileCounter(int tx, int ty) {
+    if (tx < 0 || ty < 0 || tx >= g_game.mapW || ty >= g_game.mapH) return false;
+    for (int z = 2; z >= 0; z--) {
+        int16_t tid = g_game.layers[tx + ty * g_game.mapW + z * g_game.mapW * g_game.mapH];
+        if (tid <= 0) continue;
+        if ((size_t)tid < g_game.passable.size() && (g_game.passable[tid] & 0x80) == 0x80)
+            return true;
+    }
+    return false;
+}
+
 static void saveGame() {
     captureSnapshot(g_memorySave);
     g_autoSave = g_memorySave;
@@ -2900,6 +2992,17 @@ static bool restoreFromSnapshot(const SaveSnapshot& snap) {
     g_game.playerPattern = 0;
     setPadLightbar(25, 45, 160);
     return true;
+}
+
+static bool isMapTileCounter(int tx, int ty) {
+    if (tx < 0 || ty < 0 || tx >= g_game.mapW || ty >= g_game.mapH) return false;
+    for (int z = 2; z >= 0; z--) {
+        int16_t tid = g_game.layers[tx + ty * g_game.mapW + z * g_game.mapW * g_game.mapH];
+        if (tid <= 0) continue;
+        if ((size_t)tid < g_game.passable.size() && (g_game.passable[tid] & 0x80) == 0x80)
+            return true;
+    }
+    return false;
 }
 
 static bool loadSavedGame() {
@@ -3081,18 +3184,44 @@ int main(int argc, char* argv[]) {
         for (const auto& kv : g_game.inventory)
             if (kv.second > 0) ownedItems.push_back(kv.first);
 
-        // 1) Drenar cola de eventos SDL (y capturar pulsaciones ultra-rápidas intra-frame)
+        // 1) Drenar cola de eventos SDL (y capturar pulsaciones ultra-rápidas intra-frame de joystick y teclado)
         uint32_t eventPressedMask = 0;
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_JOYBUTTONDOWN && ev.jbutton.button < 24) {
                 eventPressedMask |= (1u << ev.jbutton.button);
+            } else if (ev.type == SDL_KEYDOWN && !ev.key.repeat) {
+                SDL_Scancode sc = ev.key.keysym.scancode;
+                if (sc == SDL_SCANCODE_UP || sc == SDL_SCANCODE_W) eventPressedMask |= (1u << PAD_UP);
+                else if (sc == SDL_SCANCODE_DOWN || sc == SDL_SCANCODE_S) eventPressedMask |= (1u << PAD_DOWN);
+                else if (sc == SDL_SCANCODE_LEFT || sc == SDL_SCANCODE_A) eventPressedMask |= (1u << PAD_LEFT);
+                else if (sc == SDL_SCANCODE_RIGHT || sc == SDL_SCANCODE_D) eventPressedMask |= (1u << PAD_RIGHT);
+                else if (sc == SDL_SCANCODE_Z || sc == SDL_SCANCODE_RETURN || sc == SDL_SCANCODE_SPACE) eventPressedMask |= (1u << PAD_CROSS);
+                else if (sc == SDL_SCANCODE_X || sc == SDL_SCANCODE_ESCAPE || sc == SDL_SCANCODE_BACKSPACE) eventPressedMask |= (1u << PAD_CIRCLE);
+                else if (sc == SDL_SCANCODE_C) eventPressedMask |= (1u << PAD_SQUARE);
+                else if (sc == SDL_SCANCODE_V) eventPressedMask |= (1u << PAD_TRIANGLE);
+                else if (sc == SDL_SCANCODE_LSHIFT || sc == SDL_SCANCODE_RSHIFT) eventPressedMask |= (1u << PAD_L1);
+                else if (sc == SDL_SCANCODE_TAB) eventPressedMask |= (1u << PAD_OPTIONS);
             }
         }
 
-        // 2) Sondeo directo por hardware de DualShock 4 (scePadReadState + SDL_Joystick) libre de pérdidas de estado
+        // 2) Sondeo directo por hardware de DualShock 4 (scePadReadState + SDL_Joystick + Keyboard) libre de pérdidas de estado
         uint32_t curPadMask = 0;
         float stickX = 0.0f, stickY = 0.0f;
+
+        const Uint8* kstate = SDL_GetKeyboardState(NULL);
+        if (kstate) {
+            if (kstate[SDL_SCANCODE_UP]    || kstate[SDL_SCANCODE_W]) curPadMask |= (1u << PAD_UP);
+            if (kstate[SDL_SCANCODE_DOWN]  || kstate[SDL_SCANCODE_S]) curPadMask |= (1u << PAD_DOWN);
+            if (kstate[SDL_SCANCODE_LEFT]  || kstate[SDL_SCANCODE_A]) curPadMask |= (1u << PAD_LEFT);
+            if (kstate[SDL_SCANCODE_RIGHT] || kstate[SDL_SCANCODE_D]) curPadMask |= (1u << PAD_RIGHT);
+            if (kstate[SDL_SCANCODE_Z] || kstate[SDL_SCANCODE_RETURN] || kstate[SDL_SCANCODE_SPACE]) curPadMask |= (1u << PAD_CROSS);
+            if (kstate[SDL_SCANCODE_X] || kstate[SDL_SCANCODE_ESCAPE] || kstate[SDL_SCANCODE_BACKSPACE]) curPadMask |= (1u << PAD_CIRCLE);
+            if (kstate[SDL_SCANCODE_C]) curPadMask |= (1u << PAD_SQUARE);
+            if (kstate[SDL_SCANCODE_V]) curPadMask |= (1u << PAD_TRIANGLE);
+            if (kstate[SDL_SCANCODE_LSHIFT] || kstate[SDL_SCANCODE_RSHIFT]) curPadMask |= (1u << PAD_L1);
+            if (kstate[SDL_SCANCODE_TAB]) curPadMask |= (1u << PAD_OPTIONS);
+        }
 
         if (g_padHandle >= 0) {
             OrbisPadData pdata;
@@ -3143,8 +3272,8 @@ int main(int argc, char* argv[]) {
             if (std::fabs(jy) > std::fabs(stickY)) stickY = jy;
         }
 
-        // Zona muerta radial limpia (0.34f) para el stick izquierdo
-        const float STICK_DEADZONE = 0.34f;
+        // Zona muerta radial limpia (0.48f) para el stick izquierdo (evita drift y falsos movimientos)
+        const float STICK_DEADZONE = 0.48f;
         if (stickX < -STICK_DEADZONE) curPadMask |= (1u << PAD_LEFT);
         if (stickX >  STICK_DEADZONE) curPadMask |= (1u << PAD_RIGHT);
         if (stickY < -STICK_DEADZONE) curPadMask |= (1u << PAD_UP);
@@ -3413,14 +3542,41 @@ int main(int argc, char* argv[]) {
                     }
                 } else if (g_game.fgStack.empty()) {
                     if (b == PAD_CROSS) {
-                        int fx = g_game.playerX + (g_game.playerDir == 4 ? -1 : (g_game.playerDir == 6 ? 1 : 0));
-                        int fy = g_game.playerY + (g_game.playerDir == 8 ? -1 : (g_game.playerDir == 2 ? 1 : 0));
+                        bool triggered = false;
+                        // 1) check_event_trigger_here([0])
                         for (const auto& mev : g_game.events) {
                             if (mev.activePage < 0) continue;
                             const auto& pg = mev.pages[mev.activePage];
-                            if (pg.trigger <= 2 && ((mev.x == fx && mev.y == fy) || (mev.x == g_game.playerX && mev.y == g_game.playerY))) {
-                                if (pg.list.a.size() > 1) {
+                            if (pg.trigger == 0 && mev.x == g_game.playerX && mev.y == g_game.playerY && pg.list.a.size() > 1) {
+                                startForegroundEvent(mev.id, pg.list);
+                                triggered = true;
+                                break;
+                            }
+                        }
+                        // 2) check_event_trigger_there([0, 1, 2])
+                        int fx = g_game.playerX + (g_game.playerDir == 4 ? -1 : (g_game.playerDir == 6 ? 1 : 0));
+                        int fy = g_game.playerY + (g_game.playerDir == 8 ? -1 : (g_game.playerDir == 2 ? 1 : 0));
+                        if (!triggered) {
+                            for (const auto& mev : g_game.events) {
+                                if (mev.activePage < 0) continue;
+                                const auto& pg = mev.pages[mev.activePage];
+                                if (pg.trigger <= 2 && mev.x == fx && mev.y == fy && pg.list.a.size() > 1) {
                                     startForegroundEvent(mev.id, pg.list);
+                                    triggered = true;
+                                    break;
+                                }
+                            }
+                        }
+                        // 3) Mostrador / Mesa (counter tile): si la casilla frontal es counter, revisar 2 casillas al frente
+                        if (!triggered && isMapTileCounter(fx, fy)) {
+                            int f2x = fx + (g_game.playerDir == 4 ? -1 : (g_game.playerDir == 6 ? 1 : 0));
+                            int f2y = fy + (g_game.playerDir == 8 ? -1 : (g_game.playerDir == 2 ? 1 : 0));
+                            for (const auto& mev : g_game.events) {
+                                if (mev.activePage < 0) continue;
+                                const auto& pg = mev.pages[mev.activePage];
+                                if (pg.trigger <= 2 && mev.x == f2x && mev.y == f2y && pg.list.a.size() > 1) {
+                                    startForegroundEvent(mev.id, pg.list);
+                                    triggered = true;
                                     break;
                                 }
                             }
@@ -3484,18 +3640,14 @@ int main(int argc, char* argv[]) {
                 int dirCandidates[2] = { 0, 0 };
 
                 if (dirH != 0 && dirV != 0) {
-                    // Si se mantienen 2 direcciones (diagonal en stick o cruceta), priorizar eje dominante o última tecla pulsada
                     bool preferH = (std::fabs(stickX) > std::fabs(stickY) + 0.08f) ||
                                    (std::fabs(stickX) >= std::fabs(stickY) - 0.08f && (lastPressedDir == 4 || lastPressedDir == 6));
                     dirCandidates[0] = preferH ? dirH : dirV;
                     dirCandidates[1] = preferH ? dirV : dirH;
                 } else if (dirH != 0) {
                     dirCandidates[0] = dirH;
-                    // Asistencia de esquina suave con stick analógico si el usuario inclina ligeramente en el eje perpendicular
-                    if (std::fabs(stickY) > 0.20f) dirCandidates[1] = (stickY > 0.0f) ? 2 : 8;
                 } else if (dirV != 0) {
                     dirCandidates[0] = dirV;
-                    if (std::fabs(stickX) > 0.20f) dirCandidates[1] = (stickX > 0.0f) ? 6 : 4;
                 }
 
                 if (dirCandidates[0] != 0) {
@@ -3506,82 +3658,54 @@ int main(int argc, char* argv[]) {
                     for (int ci = 0; ci < 2 && !stepTaken; ci++) {
                         int d = dirCandidates[ci];
                         if (d == 0) continue;
-                        if (ci == 0 && !g_game.playerDirFix) g_game.playerDir = d;
+                        if (!g_game.playerDirFix) g_game.playerDir = d;
 
                         int nx = g_game.playerX + (d == 4 ? -1 : (d == 6 ? 1 : 0));
                         int ny = g_game.playerY + (d == 8 ? -1 : (d == 2 ? 1 : 0));
 
-                        bool triggeredTouch = false;
+                        // Muerte inmediata si choca con Ao Oni en la casilla de destino
                         for (const auto& mev : g_game.events) {
                             if (mev.activePage < 0) continue;
-                            const auto& pg = mev.pages[mev.activePage];
                             if (mev.x == nx && mev.y == ny) {
-                                if (!g_game.playerDirFix) g_game.playerDir = d;
-                                // Si el jugador choca contra Ao Oni (attack_on / sprite ao*), muere y vibra el mando
                                 if (mev.collisionAttack || mev.char_name.rfind("ao", 0) == 0) {
                                     triggerPlayerDeathByAoOni();
-                                    triggeredTouch = true;
-                                    stepTaken = true;
-                                    break;
-                                }
-                                if ((pg.trigger == 1 || pg.trigger == 2) && pg.list.a.size() > 1) {
-                                    if (g_game.playerThrough || canPassMove(g_game.playerX, g_game.playerY, d, true)) {
-                                        g_game.playerX = nx;
-                                        g_game.playerY = ny;
-                                    }
-                                    startForegroundEvent(mev.id, pg.list);
-                                    triggeredTouch = true;
                                     stepTaken = true;
                                     break;
                                 }
                             }
                         }
+                        if (g_game.gameOverTriggered) break;
 
-                        if (!triggeredTouch &&
-                            ((g_game.playerThrough && nx >= 0 && ny >= 0 && nx < g_game.mapW && ny < g_game.mapH) ||
-                             canPassMove(g_game.playerX, g_game.playerY, d, true))) {
-                            if (!g_game.playerDirFix) g_game.playerDir = d;
+                        bool canPass = (g_game.playerThrough && nx >= 0 && ny >= 0 && nx < g_game.mapW && ny < g_game.mapH) ||
+                                       canPassMove(g_game.playerX, g_game.playerY, d, true);
+
+                        if (canPass) {
                             g_game.playerX = nx;
                             g_game.playerY = ny;
                             stepTaken = true;
+                            // Contacto al entrar a la casilla destino (Player Touch / Event Touch)
                             for (const auto& mev : g_game.events) {
                                 if (mev.activePage < 0) continue;
                                 const auto& pg = mev.pages[mev.activePage];
-                                if ((pg.trigger == 1 || pg.trigger == 2) && mev.x == g_game.playerX && mev.y == g_game.playerY && pg.list.a.size() > 1) {
+                                if ((pg.trigger == 1 || pg.trigger == 2) && mev.x == nx && mev.y == ny && pg.list.a.size() > 1) {
                                     startForegroundEvent(mev.id, pg.list);
+                                    break;
+                                }
+                            }
+                        } else {
+                            // check_event_trigger_touch(nx, ny) en casilla intransitable (puertas cerradas, puertas de transición)
+                            for (const auto& mev : g_game.events) {
+                                if (mev.activePage < 0) continue;
+                                const auto& pg = mev.pages[mev.activePage];
+                                if ((pg.trigger == 1 || pg.trigger == 2) && mev.x == nx && mev.y == ny && pg.list.a.size() > 1) {
+                                    startForegroundEvent(mev.id, pg.list);
+                                    stepTaken = true;
                                     break;
                                 }
                             }
                         }
                     }
 
-                    // 3) Asistencia de esquina (Corner-Slide de 1 casilla) al embestir el borde de una puerta/pasillo
-                    if (!stepTaken && dirCandidates[1] == 0) {
-                        int d = dirCandidates[0];
-                        int nx = g_game.playerX + (d == 4 ? -1 : (d == 6 ? 1 : 0));
-                        int ny = g_game.playerY + (d == 8 ? -1 : (d == 2 ? 1 : 0));
-                        const int perpDirs[2] = { (d == 4 || d == 6) ? 8 : 4, (d == 4 || d == 6) ? 2 : 6 };
-                        int slideDir = 0;
-                        int openCount = 0;
-                        for (int pd : perpDirs) {
-                            int sx = g_game.playerX + (pd == 4 ? -1 : (pd == 6 ? 1 : 0));
-                            int sy = g_game.playerY + (pd == 8 ? -1 : (pd == 2 ? 1 : 0));
-                            if (canPassMove(g_game.playerX, g_game.playerY, pd, true) && canPassMove(sx, sy, d, true)) {
-                                slideDir = pd;
-                                openCount++;
-                            }
-                        }
-                        // Deslizar automáticamente si solo uno de los dos lados contiguos tiene paso abierto hacia adelante
-                        if (openCount == 1 && slideDir != 0) {
-                            g_game.playerX += (slideDir == 4 ? -1 : (slideDir == 6 ? 1 : 0));
-                            g_game.playerY += (slideDir == 8 ? -1 : (slideDir == 2 ? 1 : 0));
-                            stepTaken = true;
-                        }
-                        (void)nx; (void)ny;
-                    }
-
-                    if (g_game.playerPattern == 0) g_game.playerPattern = 1;
-                    // Si la casilla cambió en el mismo frame en que terminamos la casilla previa, arrastrar el sub-píxel sobrante
                     if ((g_game.playerX != prevX || g_game.playerY != prevY) && remMovePx > 0.0f) {
                         applyCarryoverPlayerSubPixel(remMovePx);
                     }
