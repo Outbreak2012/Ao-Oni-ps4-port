@@ -20,4 +20,7 @@ src/aooni_ps4/pkg.gp4
 src/aooni_ps4/aooni/x64/
 src/aooni_ps4/assets/
 src/aooni_ps4/sce_module/
-src/aooni_ps4/sce_sys/
+src/aooni_ps4/sce_sys/param.sfo
+!src/aooni_ps4/sce_sys/icon0.png
+!src/aooni_ps4/sce_sys/pic1.png
+!src/aooni_ps4/sce_sys/about/

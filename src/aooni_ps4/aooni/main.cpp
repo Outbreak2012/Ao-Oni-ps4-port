@@ -3316,18 +3316,20 @@ int main(int argc, char* argv[]) {
                     state = STATE_TITLE;
                 }
             } else if (state == STATE_INVENTORY) {
-                if (b == PAD_TRIANGLE || b == PAD_CIRCLE) {
-                    playSe("003-System03", 80, 100);
-                    state = STATE_MAP;
-                } else if (g_game.switches[178]) {
-                    // En 072_Scene_Menu.rb:134-137 (evento del sótano del anexo en Map 67), cuando se activa switch 178 en el menú, solo permite salir con Círculo
-                    if (b == PAD_CROSS || b == PAD_SQUARE || b == PAD_OPTIONS) {
+                if (b == PAD_TRIANGLE || b == PAD_CIRCLE || b == PAD_OPTIONS) {
+                    if (g_game.switches[178] && b != PAD_CIRCLE) {
+                        // En 072_Scene_Menu.rb:134-137 (evento del sótano del anexo en Map 67), cuando se activa switch 178 en el menú, solo permite salir con Círculo
                         playSe("004-System04", 80, 100);
+                    } else if (b == PAD_OPTIONS && padL1 && padR1) {
+                        // Salir al título solo si se mantiene intencionalmente L1 + R1 + OPTIONS
+                        playSe("003-System03", 80, 100);
+                        setPadLightbar(25, 45, 160);
+                        state = STATE_TITLE;
+                    } else {
+                        // Cerrar menú y volver al mapa con OPTIONS, Triángulo o Círculo
+                        playSe("003-System03", 80, 100);
+                        state = STATE_MAP;
                     }
-                } else if (b == PAD_OPTIONS) {
-                    playSe("003-System03", 80, 100);
-                    setPadLightbar(25, 45, 160);
-                    state = STATE_TITLE;
                 } else if (b == PAD_SQUARE) {
                     saveGame();
                     invStatusMsg = "Partida guardada en consola y memoria!";
@@ -3850,8 +3852,8 @@ int main(int argc, char* argv[]) {
         } else if (state == STATE_INVENTORY) {
             fillRectFast(gameSurf, offX + 24, offY + 24, GAME_W - 48, GAME_H - 48, 18, 26, 70);
             drawRectFast(gameSurf, offX + 24, offY + 24, GAME_W - 48, GAME_H - 48, 220, 220, 255);
-            drawText(gameSurf, offX + 44, offY + 40, "OBJETOS (X: Usar | Cuadrado: Guardar | Circulo: Volver)", 2, 255, 235, 140);
-            drawText(gameSurf, offX + 44, offY + GAME_H - 54, "OPTIONS: Volver a la pantalla de titulo", 2, 160, 175, 210);
+            drawText(gameSurf, offX + 44, offY + 40, "OBJETOS (X: Usar | Cuadrado: Guardar | OPTIONS / Circulo: Volver)", 2, 255, 235, 140);
+            drawText(gameSurf, offX + 44, offY + GAME_H - 54, "L1 + R1 + OPTIONS: Salir a la pantalla de titulo", 2, 160, 175, 210);
 
             int iy = offY + 82;
             if (ownedItems.empty()) {
