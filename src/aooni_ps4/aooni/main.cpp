@@ -3198,7 +3198,7 @@ int main(int argc, char* argv[]) {
         if (g_padHandle >= 0) {
             OrbisPadData pdata;
             memset(&pdata, 0, sizeof(pdata));
-            if (scePadReadState(g_padHandle, &pdata) >= 0) {
+            if (scePadReadState(g_padHandle, &pdata) >= 0 && pdata.connected) {
                 uint32_t ob = pdata.buttons;
                 if (ob & ORBIS_PAD_BUTTON_CROSS)     curPadMask |= (1u << PAD_CROSS);
                 if (ob & ORBIS_PAD_BUTTON_CIRCLE)    curPadMask |= (1u << PAD_CIRCLE);
@@ -3216,10 +3216,13 @@ int main(int argc, char* argv[]) {
                 if (ob & ORBIS_PAD_BUTTON_DOWN)      curPadMask |= (1u << PAD_DOWN);
                 if (ob & ORBIS_PAD_BUTTON_LEFT)      curPadMask |= (1u << PAD_LEFT);
                 if (ob & ORBIS_PAD_BUTTON_RIGHT)     curPadMask |= (1u << PAD_RIGHT);
-                float sx = ((int)pdata.leftStick.x - 128) / 127.0f;
-                float sy = ((int)pdata.leftStick.y - 128) / 127.0f;
-                if (std::fabs(sx) > std::fabs(stickX)) stickX = sx;
-                if (std::fabs(sy) > std::fabs(stickY)) stickY = sy;
+                // Evitar lecturas erróneas de ceros no inicializados si el stick no está calibrado
+                if (pdata.leftStick.x != 0 || pdata.leftStick.y != 0 || pdata.rightStick.x != 0 || pdata.rightStick.y != 0) {
+                    float sx = ((int)pdata.leftStick.x - 128) / 127.0f;
+                    float sy = ((int)pdata.leftStick.y - 128) / 127.0f;
+                    if (std::fabs(sx) > std::fabs(stickX)) stickX = sx;
+                    if (std::fabs(sy) > std::fabs(stickY)) stickY = sy;
+                }
             }
         }
 
@@ -3238,18 +3241,27 @@ int main(int argc, char* argv[]) {
             if (hat & SDL_HAT_LEFT)  curPadMask |= (1u << PAD_LEFT);
             if (hat & SDL_HAT_RIGHT) curPadMask |= (1u << PAD_RIGHT);
 
-            float jx = SDL_JoystickGetAxis(joy, 0) / 32767.0f;
-            float jy = SDL_JoystickGetAxis(joy, 1) / 32767.0f;
-            if (std::fabs(jx) > std::fabs(stickX)) stickX = jx;
-            if (std::fabs(jy) > std::fabs(stickY)) stickY = jy;
+            if (SDL_JoystickNumAxes(joy) >= 2) {
+                float jx = SDL_JoystickGetAxis(joy, 0) / 32767.0f;
+                float jy = SDL_JoystickGetAxis(joy, 1) / 32767.0f;
+                if (std::fabs(jx) > std::fabs(stickX)) stickX = jx;
+                if (std::fabs(jy) > std::fabs(stickY)) stickY = jy;
+            }
         }
 
-        // Zona muerta radial limpia (0.48f) para el stick izquierdo (evita drift y falsos movimientos)
-        const float STICK_DEADZONE = 0.48f;
-        if (stickX < -STICK_DEADZONE) curPadMask |= (1u << PAD_LEFT);
-        if (stickX >  STICK_DEADZONE) curPadMask |= (1u << PAD_RIGHT);
-        if (stickY < -STICK_DEADZONE) curPadMask |= (1u << PAD_UP);
-        if (stickY >  STICK_DEADZONE) curPadMask |= (1u << PAD_DOWN);
+        // Zona muerta radial (0.55f) con resolución de eje dominante estricto para el stick izquierdo
+        // Evita drift, snap-back involuntario y que se disparen dos direcciones simultáneamente
+        float stickMag = std::sqrt(stickX * stickX + stickY * stickY);
+        const float STICK_DEADZONE = 0.55f;
+        if (stickMag >= STICK_DEADZONE) {
+            if (std::fabs(stickX) > std::fabs(stickY)) {
+                if (stickX > 0.0f) curPadMask |= (1u << PAD_RIGHT);
+                else               curPadMask |= (1u << PAD_LEFT);
+            } else {
+                if (stickY > 0.0f) curPadMask |= (1u << PAD_DOWN);
+                else               curPadMask |= (1u << PAD_UP);
+            }
+        }
 
         dpadUp    = (curPadMask & (1u << PAD_UP))    != 0;
         dpadDown  = (curPadMask & (1u << PAD_DOWN))  != 0;
@@ -3639,71 +3651,67 @@ int main(int argc, char* argv[]) {
             if (canManualMove && !isPlayerMoving()) {
                 int dirH = dpadLeft ? 4 : (dpadRight ? 6 : 0);
                 int dirV = dpadDown ? 2 : (dpadUp ? 8 : 0);
-                int dirCandidates[2] = { 0, 0 };
+                int targetDir = 0;
 
                 if (dirH != 0 && dirV != 0) {
-                    bool preferH = (std::fabs(stickX) > std::fabs(stickY) + 0.08f) ||
-                                   (std::fabs(stickX) >= std::fabs(stickY) - 0.08f && (lastPressedDir == 4 || lastPressedDir == 6));
-                    dirCandidates[0] = preferH ? dirH : dirV;
-                    dirCandidates[1] = preferH ? dirV : dirH;
+                    // Si se pulsa en diagonal (cruceta o teclado), dar prioridad a la última dirección pulsada (1:1 RGSS1 Input.dir4)
+                    if (lastPressedDir == dirH) targetDir = dirH;
+                    else if (lastPressedDir == dirV) targetDir = dirV;
+                    else targetDir = dirV; // Desempate estándar RPG Maker XP (Vertical)
                 } else if (dirH != 0) {
-                    dirCandidates[0] = dirH;
+                    targetDir = dirH;
                 } else if (dirV != 0) {
-                    dirCandidates[0] = dirV;
+                    targetDir = dirV;
                 }
 
-                if (dirCandidates[0] != 0) {
-                    lastStepTick = now;
-                    int prevX = g_game.playerX, prevY = g_game.playerY;
-                    bool stepTaken = false;
+                if (targetDir != 0) {
+                    int d = targetDir;
+                    if (!g_game.playerDirFix) g_game.playerDir = d;
 
-                    for (int ci = 0; ci < 2 && !stepTaken; ci++) {
-                        int d = dirCandidates[ci];
-                        if (d == 0) continue;
-                        if (!g_game.playerDirFix) g_game.playerDir = d;
+                    int nx = g_game.playerX + (d == 4 ? -1 : (d == 6 ? 1 : 0));
+                    int ny = g_game.playerY + (d == 8 ? -1 : (d == 2 ? 1 : 0));
 
-                        int nx = g_game.playerX + (d == 4 ? -1 : (d == 6 ? 1 : 0));
-                        int ny = g_game.playerY + (d == 8 ? -1 : (d == 2 ? 1 : 0));
-
-                        // Muerte inmediata si choca con Ao Oni en la casilla de destino
-                        for (const auto& mev : g_game.events) {
-                            if (mev.activePage < 0) continue;
-                            if (mev.x == nx && mev.y == ny) {
-                                if (mev.collisionAttack || mev.char_name.rfind("ao", 0) == 0) {
-                                    triggerPlayerDeathByAoOni();
-                                    stepTaken = true;
-                                    break;
-                                }
+                    // Muerte inmediata si choca con Ao Oni en la casilla de destino
+                    for (const auto& mev : g_game.events) {
+                        if (mev.activePage < 0) continue;
+                        if (mev.x == nx && mev.y == ny) {
+                            if (mev.collisionAttack || mev.char_name.rfind("ao", 0) == 0) {
+                                triggerPlayerDeathByAoOni();
+                                break;
                             }
                         }
-                        if (g_game.gameOverTriggered) break;
+                    }
+                    if (g_game.gameOverTriggered) break;
 
-                        bool canPass = (g_game.playerThrough && nx >= 0 && ny >= 0 && nx < g_game.mapW && ny < g_game.mapH) ||
-                                       canPassMove(g_game.playerX, g_game.playerY, d, true);
+                    bool canPass = (g_game.playerThrough && nx >= 0 && ny >= 0 && nx < g_game.mapW && ny < g_game.mapH) ||
+                                   canPassMove(g_game.playerX, g_game.playerY, d, true);
 
-                        if (canPass) {
-                            g_game.playerX = nx;
-                            g_game.playerY = ny;
-                            stepTaken = true;
-                            // Contacto al entrar a la casilla destino (Player Touch / Event Touch)
-                            for (const auto& mev : g_game.events) {
-                                if (mev.activePage < 0) continue;
-                                const auto& pg = mev.pages[mev.activePage];
-                                if ((pg.trigger == 1 || pg.trigger == 2) && mev.x == nx && mev.y == ny && pg.list.a.size() > 1) {
-                                    startForegroundEvent(mev.id, pg.list);
-                                    break;
-                                }
+                    int prevX = g_game.playerX, prevY = g_game.playerY;
+
+                    if (canPass) {
+                        g_game.playerX = nx;
+                        g_game.playerY = ny;
+                        lastStepTick = now;
+
+                        // Contacto al entrar a la casilla destino (Player Touch / Event Touch)
+                        for (const auto& mev : g_game.events) {
+                            if (mev.activePage < 0) continue;
+                            const auto& pg = mev.pages[mev.activePage];
+                            if ((pg.trigger == 1 || pg.trigger == 2) && mev.x == nx && mev.y == ny && pg.list.a.size() > 1) {
+                                startForegroundEvent(mev.id, pg.list);
+                                break;
                             }
-                        } else {
-                            // check_event_trigger_touch(nx, ny) en casilla intransitable (puertas cerradas, puertas de transición)
-                            for (const auto& mev : g_game.events) {
-                                if (mev.activePage < 0) continue;
-                                const auto& pg = mev.pages[mev.activePage];
-                                if ((pg.trigger == 1 || pg.trigger == 2) && mev.x == nx && mev.y == ny && pg.list.a.size() > 1) {
-                                    startForegroundEvent(mev.id, pg.list);
-                                    stepTaken = true;
-                                    break;
-                                }
+                        }
+                    } else {
+                        // Casilla intransitable (pared, puerta cerrada, objeto sólido):
+                        // Comprobar eventos touch en la casilla frontal (puertas, transiciones)
+                        // y DETENERSE encarando el obstáculo (comportamiento 1:1 RGSS1: sin desvíos ni giros indeseados).
+                        for (const auto& mev : g_game.events) {
+                            if (mev.activePage < 0) continue;
+                            const auto& pg = mev.pages[mev.activePage];
+                            if ((pg.trigger == 1 || pg.trigger == 2) && mev.x == nx && mev.y == ny && pg.list.a.size() > 1) {
+                                startForegroundEvent(mev.id, pg.list);
+                                break;
                             }
                         }
                     }
