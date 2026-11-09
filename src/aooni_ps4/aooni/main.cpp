@@ -2132,19 +2132,37 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
             case 112: // Loop
                 ip++;
                 break;
-            case 413: { // Repeat Above
+            case 413: { // Repeat Above (RGSS1 1:1: repite hacia el 112 coincidente)
+                int depth = 0;
                 while (ip > 0) {
                     ip--;
-                    if (list[ip].get("i").asInt(0) == indent && list[ip].get("c").asInt(0) == 112)
-                        break;
+                    int c = list[ip].get("c").asInt(0);
+                    int ci = list[ip].get("i").asInt(0);
+                    if (c == 413) depth++;
+                    else if (c == 112) {
+                        if (depth == 0 && ci == indent) break;
+                        depth--;
+                    }
                 }
                 ip++;
                 break;
             }
-            case 113: { // Break Loop
+            case 113: { // Break Loop (RGSS1 1:1: rompe el bucle contenedor más cercano donde 413 tiene indent < break_indent)
+                int depth = 0;
                 while (ip < list.a.size()) {
-                    if (list[ip].get("i").asInt(0) == indent && list[ip].get("c").asInt(0) == 413) { ip++; break; }
                     ip++;
+                    if (ip >= list.a.size()) break;
+                    int c = list[ip].get("c").asInt(0);
+                    int ci = list[ip].get("i").asInt(0);
+                    if (c == 112) {
+                        depth++;
+                    } else if (c == 413) {
+                        if (depth == 0 && ci < indent) {
+                            ip++; // Saltar el 413 correspondiente y reanudar en la instrucción siguiente
+                            break;
+                        }
+                        depth--;
+                    }
                 }
                 break;
             }
@@ -3567,6 +3585,15 @@ int main(int argc, char* argv[]) {
             bool canManualMove = g_game.fgStack.empty() && !g_game.msgActive && !g_game.numInputActive &&
                                  !g_game.btnInputActive && !g_game.nameInputActive && !g_game.playerRouteActive &&
                                  !g_game.pendingTransfer && g_game.transPhase != 1;
+            if (canManualMove) {
+                // Red de seguridad: si el jugador puede moverse libremente por el mapa fuera de cutscenes, el sprite DEBE ser visible
+                if (g_game.playerTransparent && g_game.mapId != 75) {
+                    g_game.playerTransparent = false;
+                }
+                if (g_game.playerChar.empty()) {
+                    g_game.playerChar = "hirosi";
+                }
+            }
             bool holdingMoveInput = canManualMove && (dpadUp || dpadDown || dpadLeft || dpadRight);
 
             if (canManualMove && !isPlayerMoving()) {
