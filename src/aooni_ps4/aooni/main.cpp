@@ -1398,7 +1398,9 @@ static bool stepCharacterDir(int& x, int& y, int& dir, int d, bool dirFix, bool 
         MapEvent* selfEv = findEvent(evId);
         if (selfEv && selfEv->activePage >= 0) {
             if (selfEv->collisionAttack || selfEv->char_name.rfind("ao", 0) == 0) {
-                triggerPlayerDeathByAoOni();
+                if (selfEv->routeWaitFrames <= 0 && !g_game.playerTransparent) {
+                    triggerPlayerDeathByAoOni();
+                }
             } else if (g_game.fgStack.empty() && !g_game.pendingTransfer) {
                 const auto& pg = selfEv->pages[selfEv->activePage];
                 if (pg.trigger == 2 && pg.list.a.size() > 1) {
@@ -1500,6 +1502,7 @@ static bool applyMoveCmd(int targetId, const MoveCmd& mc) {
             break;
         case 15: { // Wait inside Move Route
             int wf = std::max(1, mc.params[0].asInt(1));
+            if (g_frameRateMode == FPS_60_REMASTER) wf = (wf * 3) / 2;
             if (targetId == -1) g_game.playerRouteWaitFrames = wf;
             else if (ev) ev->routeWaitFrames = wf;
             break;
@@ -2141,7 +2144,7 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                 return;
             }
             case 106: // Wait
-                waitFrames = p[0].asInt(1);
+                waitFrames = (g_frameRateMode == FPS_60_REMASTER) ? ((p[0].asInt(1) * 3) / 2) : p[0].asInt(1);
                 ip++;
                 return;
             case 111: { // Conditional Branch
@@ -2364,12 +2367,25 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                     tev->realX = (float)(tev->x * TILE_SZ);
                     tev->realY = (float)(tev->y * TILE_SZ);
                     if (p[4].asInt(0) > 0) tev->dir = p[4].asInt(2);
-                    // Ventana de gracia para emboscada/aparición de Ao Oni (ej. sala del piano, var 5 == 100):
+                    // Ventana de gracia para emboscada/aparición de Ao Oni (ej. sala del piano, entradas de sala):
                     if (tev->char_name.rfind("ao", 0) == 0 || tev->collisionAttack || tev->isBattler) {
                         int dist = std::abs(tev->x - g_game.playerX) + std::abs(tev->y - g_game.playerY);
-                        if (dist <= 6) {
-                            tev->routeWaitFrames = std::max(tev->routeWaitFrames, (int)(45 * getFpsTarget() / 60));
-                            triggerRumble(220, 150, 18);
+                        // Si spawnea encima o a <= 2 casillas del jugador, separar para evitar muerte instantánea injusta
+                        if (dist <= 2) {
+                            if (tev->x == g_game.playerX) {
+                                if (tev->y <= g_game.playerY && tev->y - 2 >= 0) tev->y -= 2;
+                                else if (tev->y + 2 < g_game.mapH) tev->y += 2;
+                            } else if (tev->y == g_game.playerY) {
+                                if (tev->x <= g_game.playerX && tev->x - 2 >= 0) tev->x -= 2;
+                                else if (tev->x + 2 < g_game.mapW) tev->x += 2;
+                            }
+                            tev->realX = (float)(tev->x * TILE_SZ);
+                            tev->realY = (float)(tev->y * TILE_SZ);
+                            dist = std::abs(tev->x - g_game.playerX) + std::abs(tev->y - g_game.playerY);
+                        }
+                        if (dist <= 7) {
+                            tev->routeWaitFrames = std::max(tev->routeWaitFrames, (int)(80 * getFpsTarget() / 60));
+                            triggerRumble(240, 180, 25);
                             setPadLightbar(255, 0, 50);
                         }
                     }
@@ -2633,7 +2649,7 @@ static void updatePictures() {
 static float getEffectivePlayerStepPx(bool sprinting) {
     float effPlayerSpeed = g_game.playerSpeed;
     if (sprinting && !g_game.playerRouteActive && g_game.fgStack.empty()) {
-        effPlayerSpeed = std::min(5.25f, g_game.playerSpeed + (g_frameRateMode == FPS_40_ORIGINAL ? 0.75f : 0.65f));
+        effPlayerSpeed = std::min(5.25f, g_game.playerSpeed + (g_frameRateMode == FPS_40_ORIGINAL ? 0.85f : 0.75f));
     }
     return rmxpSpeedPxPerFrame(effPlayerSpeed);
 }
@@ -3660,7 +3676,9 @@ int main(int argc, char* argv[]) {
             updatePictures();
 
             // 1) Avanzar primero el sub-píxel del jugador hacia su casilla actual para que no haya ni 1 frame de pausa al llegar a una casilla
-            bool sprinting = (padL1 || padR1 || ((curPadMask & (1u << PAD_CIRCLE)) != 0));
+            bool sprinting = (padL1 || padR1 || ((curPadMask & (1u << PAD_CIRCLE)) != 0) ||
+                              ((curPadMask & (1u << PAD_L2)) != 0) || ((curPadMask & (1u << PAD_R2)) != 0) ||
+                              g_game.switches[49]);
             float remMovePx = advancePlayerSubPixel(sprinting);
 
             updateMoveRoutes(now);
@@ -3703,13 +3721,15 @@ int main(int argc, char* argv[]) {
                     int nx = g_game.playerX + (d == 4 ? -1 : (d == 6 ? 1 : 0));
                     int ny = g_game.playerY + (d == 8 ? -1 : (d == 2 ? 1 : 0));
 
-                    // Muerte inmediata si choca con Ao Oni en la casilla de destino
+                    // Muerte inmediata si choca con Ao Oni en la casilla de destino (fuera de tiempo de gracia o armario)
                     for (const auto& mev : g_game.events) {
                         if (mev.activePage < 0) continue;
                         if (mev.x == nx && mev.y == ny) {
                             if (mev.collisionAttack || mev.char_name.rfind("ao", 0) == 0) {
-                                triggerPlayerDeathByAoOni();
-                                break;
+                                if (mev.routeWaitFrames <= 0 && !g_game.playerTransparent) {
+                                    triggerPlayerDeathByAoOni();
+                                    break;
+                                }
                             }
                         }
                     }
@@ -3764,8 +3784,10 @@ int main(int argc, char* argv[]) {
                     const auto& pg = mev.pages[mev.activePage];
                     if (mev.x == g_game.playerX && mev.y == g_game.playerY) {
                         if (mev.collisionAttack || mev.char_name.rfind("ao", 0) == 0) {
-                            triggerPlayerDeathByAoOni();
-                            break;
+                            if (mev.routeWaitFrames <= 0 && !g_game.playerTransparent) {
+                                triggerPlayerDeathByAoOni();
+                                break;
+                            }
                         } else if (pg.trigger == 2 && pg.list.a.size() > 1) {
                             startForegroundEvent(mev.id, pg.list);
                             break;
@@ -3824,20 +3846,22 @@ int main(int argc, char* argv[]) {
                 }
             }
 
-            // Ejecutar eventos paralelos (trigger == 4) y CommonEvents paralelos (trigger == 2)
-            for (size_t i = 0; i < g_game.events.size(); i++) {
-                auto& mev = g_game.events[i];
-                if (mev.activePage < 0) continue;
-                const auto& pg = mev.pages[mev.activePage];
-                if (pg.trigger == 4 && pg.list.a.size() > 1) {
-                    runInterpreterSlice(pg.list, mev.parIp, mev.parWait, mev.id, false);
-                    if (mev.parIp >= pg.list.a.size()) mev.parIp = 0;
+            // Ejecutar eventos paralelos (trigger == 4) y CommonEvents paralelos (trigger == 2) SOLO fuera de transiciones/pantallas negras
+            if (g_game.transPhase == 0 && !g_game.pendingTransfer) {
+                for (size_t i = 0; i < g_game.events.size(); i++) {
+                    auto& mev = g_game.events[i];
+                    if (mev.activePage < 0) continue;
+                    const auto& pg = mev.pages[mev.activePage];
+                    if (pg.trigger == 4 && pg.list.a.size() > 1) {
+                        runInterpreterSlice(pg.list, mev.parIp, mev.parWait, mev.id, false);
+                        if (mev.parIp >= pg.list.a.size()) mev.parIp = 0;
+                    }
                 }
-            }
-            for (auto& ce : g_game.commonEvents) {
-                if (ce.trigger == 2 && g_game.switches[ce.switch_id]) {
-                    runInterpreterSlice(ce.list, ce.parIp, ce.parWait, 0, false);
-                    if (ce.parIp >= ce.list.a.size()) ce.parIp = 0;
+                for (auto& ce : g_game.commonEvents) {
+                    if (ce.trigger == 2 && g_game.switches[ce.switch_id]) {
+                        runInterpreterSlice(ce.list, ce.parIp, ce.parWait, 0, false);
+                        if (ce.parIp >= ce.list.a.size()) ce.parIp = 0;
+                    }
                 }
             }
 
@@ -4086,7 +4110,9 @@ int main(int argc, char* argv[]) {
                 fillRectFast(gameSurf, offX + 12, offY + 12, 116, 26, 15, 22, 68, 210);
                 drawRectFast(gameSurf, offX + 12, offY + 12, 116, 26, 190, 210, 255);
                 drawText(gameSurf, offX + 20, offY + 18, tbuf, 2, 255, 240, 130);
-                bool isSprinting = (padL1 || padR1 || ((curPadMask & (1u << PAD_CIRCLE)) != 0));
+                bool isSprinting = (padL1 || padR1 || ((curPadMask & (1u << PAD_CIRCLE)) != 0) ||
+                                    ((curPadMask & (1u << PAD_L2)) != 0) || ((curPadMask & (1u << PAD_R2)) != 0) ||
+                                    g_game.switches[49]);
                 if (isSprinting && isPlayerMoving()) {
                     fillRectFast(gameSurf, offX + 134, offY + 12, 98, 26, 20, 60, 110, 220);
                     drawRectFast(gameSurf, offX + 134, offY + 12, 98, 26, 140, 210, 255);
