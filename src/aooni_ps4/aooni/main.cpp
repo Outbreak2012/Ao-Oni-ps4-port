@@ -77,9 +77,27 @@ enum VideoScaleMode {
     SCALE_PIXEL_PERFECT = 2  // Entero Pixel-Perfect (4x = 2560x1920 en 4K, 2x = 1280x960 en 1080p)
 };
 
+enum FrameRateMode {
+    FPS_40_ORIGINAL = 0, // 40 FPS (1:1 Original RGSS1 / RPG Maker XP)
+    FPS_60_REMASTER = 1  // 60 FPS (Remaster Fluido)
+};
+
+static int g_frameRateMode = FPS_40_ORIGINAL; // Por defecto: 40 FPS 1:1 original fiel al clásico
 static int g_videoScaleMode = SCALE_4_3_FIT;
 static int g_videoResIndex = 0; // 0 = 720p (1280x720), 1 = 1080p (1920x1080), 2 = 4K Nativo PS4 Pro (3840x2160)
 static bool g_videoClearNeeded = true;
+
+static inline const char* getFrameRateLabel() {
+    return (g_frameRateMode == FPS_40_ORIGINAL) ? "40 FPS (Original 1:1 RGSS1)" : "60 FPS (Remaster Fluido)";
+}
+
+static inline void cycleFrameRateMode() {
+    g_frameRateMode = (g_frameRateMode == FPS_40_ORIGINAL) ? FPS_60_REMASTER : FPS_40_ORIGINAL;
+}
+
+static inline int getFpsTarget() {
+    return (g_frameRateMode == FPS_40_ORIGINAL) ? 40 : 60;
+}
 
 static PS4_VideoData* getPs4VideoData() {
     void* dev = SDL_GetVideoDevice();
@@ -1147,10 +1165,17 @@ static inline bool isEventMoving(const MapEvent& ev) {
 
 static inline float rmxpSpeedPxPerFrame(float spd) {
     float s = std::max(1.0f, std::min(7.0f, spd));
-    // En RPG Maker XP nativo (40 FPS): velocidad 4 = 4 px/frame (160 px/s = 5 tiles/s).
-    // Para reproducir la velocidad y balance de persecución 1:1 original en PS4 a 60 FPS:
-    // px/frame = (2^s / 4) * (40 / 60) = (2^s) / 6.0f
-    return std::pow(2.0f, s) / 6.0f;
+    if (g_frameRateMode == FPS_40_ORIGINAL) {
+        // En RPG Maker XP nativo (40 FPS 1:1 RGSS1):
+        // Velocidad s: px/frame = (2^s) / 4.0f
+        // Velocidad 4 (Hiroshi normal): 16 / 4 = 4.0 px/frame exactos (8 frames = 0.20s por casilla de 32px)
+        // Velocidad 5 (Ao Oni persecución): 32 / 4 = 8.0 px/frame exactos (4 frames = 0.10s por casilla de 32px)
+        return std::pow(2.0f, s) / 4.0f;
+    } else {
+        // Modo Remaster a 60 FPS:
+        // px/frame = (2^s / 4) * (40 / 60) = (2^s) / 6.0f
+        return std::pow(2.0f, s) / 6.0f;
+    }
 }
 
 static int rmDirToRow(int d) {
@@ -1919,7 +1944,7 @@ static bool evalConditionCmd(int evId, const JVal& p) {
         case 3: {
             int sec = p[1].asInt(0);
             int cmp = p[2].asInt(0);
-            int curSec = g_game.timerFrames / 60;
+            int curSec = g_game.timerFrames / getFpsTarget();
             return (cmp == 0) ? (curSec >= sec) : (curSec <= sec);
         }
         case 4: {
@@ -1979,8 +2004,8 @@ static void execControlVars(int evId, const JVal& p) {
         int other = p[4].asInt(0);
         if (other == 0) val = g_game.mapId;
         // En RGSS (Interpreter 4, when 4): Play Time = Graphics.frame_count / Graphics.frame_rate (segundos)
-        else if (other == 4) val = (int)(g_game.frameCount / 60);
-        else if (other == 5) val = g_game.timerFrames / 60;
+        else if (other == 4) val = (int)(g_game.frameCount / getFpsTarget());
+        else if (other == 5) val = g_game.timerFrames / getFpsTarget();
     }
     for (int id = sId; id <= eId; id++) {
         if (id < 0 || id >= 512) continue;
@@ -2247,7 +2272,7 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
             case 124: { // Control Timer
                 if (p[0].asInt(0) == 0) {
                     g_game.timerWorking = true;
-                    g_game.timerFrames = p[1].asInt(0) * 60;
+                    g_game.timerFrames = p[1].asInt(0) * getFpsTarget();
                 } else {
                     g_game.timerWorking = false;
                 }
@@ -2290,7 +2315,7 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                     g_game.nextDir = p[4].asInt(0);
                 }
                 // En Interpreter 5 (command_201) de Ao Oni: añade 1 segundo al timer al cambiar de sala
-                if (g_game.timerWorking) g_game.timerFrames += 60;
+                if (g_game.timerWorking) g_game.timerFrames += getFpsTarget();
                 g_game.pendingTransfer = true;
                 ip++;
                 while (ip < list.a.size() && list[ip].get("c").asInt(0) == 0) ip++;
@@ -2579,7 +2604,7 @@ static void updatePictures() {
 static float getEffectivePlayerStepPx(bool sprinting) {
     float effPlayerSpeed = g_game.playerSpeed;
     if (sprinting && !g_game.playerRouteActive && g_game.fgStack.empty()) {
-        effPlayerSpeed = std::min(5.25f, g_game.playerSpeed + 0.65f);
+        effPlayerSpeed = std::min(5.25f, g_game.playerSpeed + (g_frameRateMode == FPS_40_ORIGINAL ? 0.75f : 0.65f));
     }
     return rmxpSpeedPxPerFrame(effPlayerSpeed);
 }
@@ -3096,8 +3121,9 @@ int main(int argc, char* argv[]) {
     std::string videoBannerText;
 
     for (uint32_t frame = 0;; frame++) {
+        uint32_t frameStart = SDL_GetTicks();
         g_game.frameCount++;
-        uint32_t now = SDL_GetTicks();
+        uint32_t now = frameStart;
         updateRumble();
 
         // Actualizar Lightbar y latido háptico cuando Ao Oni persigue al jugador (switch 49)
@@ -3257,7 +3283,7 @@ int main(int argc, char* argv[]) {
         for (int b = 0; b <= 20; b++) {
             if (!(justPressedMask & (1u << b))) continue;
 
-            // Atajos globales PS4 / PS4 Pro: R2 cambia resolución (720p / 1080p / 4K Nativo), L2 cambia aspecto (4:3 / 16:9 / Pixel-Perfect)
+            // Atajos globales PS4 / PS4 Pro: R2 cambia resolución (720p / 1080p / 4K Nativo), L2 cambia aspecto (4:3 / 16:9 / Pixel-Perfect), R3 cambia tasa de frames (40 FPS / 60 FPS)
             if (b == PAD_R2) {
                 cycleVideoResolution();
                 playSe("001-System01", 80, 100);
@@ -3271,11 +3297,17 @@ int main(int argc, char* argv[]) {
                 videoBannerText = std::string("ESCALADO: ") + getVideoScaleLabel();
                 videoBannerFrames = 110;
                 continue;
+            } else if (b == PAD_R3) {
+                cycleFrameRateMode();
+                playSe("001-System01", 80, 100);
+                videoBannerText = std::string("TASA: ") + getFrameRateLabel();
+                videoBannerFrames = 110;
+                continue;
             }
 
             if (state == STATE_TITLE) {
-                if (b == PAD_UP)   { menuIndex = (menuIndex + 3) % 4; playSe("001-System01", 80, 100); }
-                if (b == PAD_DOWN) { menuIndex = (menuIndex + 1) % 4; playSe("001-System01", 80, 100); }
+                if (b == PAD_UP)   { menuIndex = (menuIndex + 4) % 5; playSe("001-System01", 80, 100); }
+                if (b == PAD_DOWN) { menuIndex = (menuIndex + 1) % 5; playSe("001-System01", 80, 100); }
                 if (b == PAD_LEFT || b == PAD_RIGHT) {
                     if (menuIndex == 2) {
                         cycleVideoResolution();
@@ -3283,6 +3315,9 @@ int main(int argc, char* argv[]) {
                     } else if (menuIndex == 3) {
                         g_videoScaleMode = (g_videoScaleMode + (b == PAD_RIGHT ? 1 : 2)) % 3;
                         g_videoClearNeeded = true;
+                        playSe("001-System01", 80, 100);
+                    } else if (menuIndex == 4) {
+                        cycleFrameRateMode();
                         playSe("001-System01", 80, 100);
                     }
                 }
@@ -3302,6 +3337,9 @@ int main(int argc, char* argv[]) {
                     } else if (menuIndex == 3) {
                         g_videoScaleMode = (g_videoScaleMode + 1) % 3;
                         g_videoClearNeeded = true;
+                        playSe("002-System02", 85, 100);
+                    } else if (menuIndex == 4) {
+                        cycleFrameRateMode();
                         playSe("002-System02", 85, 100);
                     }
                 }
@@ -3815,28 +3853,29 @@ int main(int argc, char* argv[]) {
             drawText(gameSurf, offX + 140, offY + 64, "AO ONI - PS4 PORT", 3, 220, 220, 255);
             drawText(gameSurf, offX + 148, offY + 98, "Edicion 1:1 PS4 / PS4 Pro 4K Nativo", 2, 160, 195, 255);
 
-            fillRectFast(gameSurf, offX + 150, offY + 156, 360, 184, 20, 30, 80, 235);
-            drawRectFast(gameSurf, offX + 150, offY + 156, 360, 184, 220, 220, 255);
+            fillRectFast(gameSurf, offX + 130, offY + 140, 395, 228, 20, 30, 80, 235);
+            drawRectFast(gameSurf, offX + 130, offY + 140, 395, 228, 220, 220, 255);
 
             std::string opt2 = std::string("VIDEO: ") + getVideoResLabel();
             std::string opt3 = std::string("ASPECTO: ") + getVideoScaleLabel();
-            const char* opts[4] = { "NUEVA PARTIDA", "CONTINUAR", opt2.c_str(), opt3.c_str() };
+            std::string opt4 = std::string("TASA: ") + getFrameRateLabel();
+            const char* opts[5] = { "NUEVA PARTIDA", "CONTINUAR", opt2.c_str(), opt3.c_str(), opt4.c_str() };
             bool hasSave = g_memorySave.valid || g_autoSave.valid;
-            for (int i = 0; i < 4; i++) {
+            for (int i = 0; i < 5; i++) {
                 if (i == menuIndex) {
-                    fillRectFast(gameSurf, offX + 160, offY + 170 + i * 40, 340, 32, 60, 90, 160);
+                    fillRectFast(gameSurf, offX + 138, offY + 148 + i * 42, 379, 34, 60, 90, 160);
                 }
                 uint8_t tc = (i == 1 && !hasSave) ? 120 : 255;
-                drawText(gameSurf, offX + 170, offY + 178 + i * 40, opts[i], 2, tc, tc, tc);
+                drawText(gameSurf, offX + 148, offY + 156 + i * 42, opts[i], 2, tc, tc, tc);
             }
             if (aooniSurf) {
                 int cw = aooniSurf->w / 4, ch = aooniSurf->h / 4;
                 SDL_Rect src = { (int)((frame / 15) % 4) * cw, 0, cw, ch };
-                SDL_Rect dst = { offX + 34, offY + 188, cw * 2, ch * 2 };
+                SDL_Rect dst = { offX + 24, offY + 188, cw * 2, ch * 2 };
                 blitSurf(aooniSurf, &src, gameSurf, &dst);
             }
-            drawText(gameSurf, offX + 40, offY + 412, "X: Aceptar | R2: Resolucion 4K/1080p | L2: Aspecto", 2, 190, 205, 235);
-            drawText(gameSurf, offX + 68, offY + 438, "L1/R1: Correr | Cuadrado: Guardar Partida", 2, 165, 175, 205);
+            drawText(gameSurf, offX + 24, offY + 412, "X: Aceptar | R3: 40/60 FPS | R2: Res | L2: Aspecto", 2, 190, 205, 235);
+            drawText(gameSurf, offX + 44, offY + 438, "L1/R1: Correr | Cuadrado: Guardar | OPTIONS: Inventario", 2, 165, 175, 205);
         } else if (state == STATE_GAMEOVER) {
             if (goSurf) {
                 SDL_Rect dst = { offX, offY, GAME_W, GAME_H };
@@ -4168,6 +4207,13 @@ int main(int argc, char* argv[]) {
             fillRectFast(gameSurf, bx, 10, bw, 28, 16, 26, 78, 235);
             drawRectFast(gameSurf, bx, 10, bw, 28, 220, 230, 255);
             drawText(gameSurf, bx + 12, 17, videoBannerText, 2, 255, 240, 140);
+        }
+
+        if (g_frameRateMode == FPS_40_ORIGINAL) {
+            uint32_t elapsed = SDL_GetTicks() - frameStart;
+            if (elapsed < 25) {
+                SDL_Delay(25 - elapsed);
+            }
         }
 
         presentScaledCanvas(window, gameSurf);
