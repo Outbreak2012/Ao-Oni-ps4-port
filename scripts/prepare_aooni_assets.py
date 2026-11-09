@@ -9,6 +9,7 @@ import sys
 import glob
 import json
 import math
+import base64
 import shutil
 import struct
 import wave
@@ -313,6 +314,36 @@ def main():
             "bgm": bgm_obj if isinstance(bgm_obj, dict) else {},
             "events": ev_list
         }
+        # Parches PS4: interacciones faltantes en los datos originales (estanteria alta Map 17 y cuerpo de Mika Map 25)
+        if mid == 17:
+            for ev in ev_list:
+                if ev["id"] == 8 and ev["pages"] and len(ev["pages"][0]["list"]) <= 1:
+                    ev["pages"][0]["list"] = [
+                        {"c": 111, "i": 0, "p": [0, 49, 1]},
+                        {"c": 104, "i": 1, "p": [2, 0]},
+                        {"c": 101, "i": 1, "p": ["\\f[hirosif]\\name[\\N[2]]Algo brilla en lo alto"]},
+                        {"c": 401, "i": 1, "p": ["de la estantería..."]},
+                        {"c": 101, "i": 1, "p": ["\\f[hirosif]\\name[\\N[2]]Necesito una silla aquí"]},
+                        {"c": 401, "i": 1, "p": ["para poder alcanzarlo."]},
+                        {"c": 0, "i": 1, "p": []},
+                        {"c": 412, "i": 0, "p": []},
+                        {"c": 0, "i": 0, "p": []},
+                    ]
+                    break
+        elif mid == 25:
+            for ev in ev_list:
+                if ev["id"] == 9 and ev["pages"] and len(ev["pages"][0]["list"]) <= 1:
+                    ev["pages"][0]["list"] = [
+                        {"c": 111, "i": 0, "p": [0, 49, 1]},
+                        {"c": 104, "i": 1, "p": [2, 0]},
+                        {"c": 101, "i": 1, "p": ["\\f[hirosif]\\name[\\N[2]]Es el cuerpo de Mika..."]},
+                        {"c": 401, "i": 1, "p": ["Ya no puedo hacer nada."]},
+                        {"c": 0, "i": 1, "p": []},
+                        {"c": 412, "i": 0, "p": []},
+                        {"c": 0, "i": 0, "p": []},
+                    ]
+                    break
+
         with open(os.path.join(out_data, f"map_{mid:03d}.json"), "w", encoding="utf-8") as f:
             json.dump(map_meta, f, ensure_ascii=False, separators=(",", ":"))
         converted += 1
@@ -338,6 +369,23 @@ def main():
                 if fn.lower().endswith((".png", ".jpg", ".jpeg")):
                     shutil.copy2(os.path.join(src_sub, fn), os.path.join(out_img, prefix + fn))
     make_fallback_rtp_images(out_img)
+
+    # Parche PS4 para el tileset del puzzle de la muñeca (Map 060): cartel localizado "Volver: Pulsa ○ (Círculo)"
+    puzzle_ts_b64 = (
+        "iVBORw0KGgoAAAANSUhEUgAAAQAAAACACAMAAADTa0c4AAAADFBMVEVTU1N4eHi7u7v////77XmaAAAABHRSTlP/////bShGeQAAAxNJREFUeNrt3Nt2gjAQ"
+        "BdD05P//uasKYW5BEMROOLxUNK2dbW5kMKX88+Pnw0chAAEIQAACEIAABCAAAQhAAALcGwC1VswnVZ4sx9/T49YAGV0n0tsA4JYAog10WsDgACI8Wxmg"
+        "SixS+pEpZsomAYCOq84HJEzzmR+0YuIP1XwAkPHo+KcophcgXocuVoxHKoBiAeZ67WSmqLB4zMWak2skWQBsIOqBgRA/YAGRsBOcP2nXxFsVkFVDt4A"
+        "inj5zsLh4Kvz4z/Ea4Bk6bBdoK0o+AMzdN14DVD8G5AcowXAW9QFNCmGNHwagOwq0gnbijBrMo5AIAHLa050HtIJwxbIDFFkBujPB9krxUEMAwNYJ+M"
+        "atoXyNyAqQbUUIBw8CEIAABCAAAQhAAAIQgAAEIAABzj8Ov01uAGBeT8IQADsXd1r4RwguBTALgAcBVPxvC3wHoBPoLoAp/se7HBC4HGAtt7kPQAQNvJ"
+        "0u/QrAyi1S2Bd/7zQJQJD1hl8DR9hoEKyuDwPgkiAmmxJ94u9Wgf8IgHaTwONJbPvAkQhA5IIjgDASUwXyAphUaAdADmqI2kByAOheP2gCOmE8EkA07N"
+        "lOUAp0bgoZG2CZ5/k768YYBTQAAoA2GHQAks8D9Hm1fYC8WUK0hDrOTFD37+h1grXfCSa/FlBBbJkKI/jdhFeDH1oOyrMe8EmBFCtCXBPkqjDzAgQgAAE"
+        "IQAACEIAABCAAAQhwR4DOzimvneALnfPdyWsBYPaNwOZAQoCaDsDtG9FywG8A4JSv0F8KAJEdf37421d+gmhPqQJXL4svKR8VGaZvy8sUB1pSUABA51Z"
+        "zAtiUDpZcSGsdiAGq+U41sgFgBQCidiAGQNs3JSUA1gGKTRB7AHcv0UgAsO16PIByMkDGPmB1FNjbBNICqHmAAdCdYJV7KblOMN8wCLNBSPUAxewVs8wX"
+        "/TCYD6Co+v28FrAARe+yg/5ECAmvBXDmboEZL4bKaVuAJb0c5oIIAQhAAAIQgAAEIAABCEAAAhCAAAQgAAEIQAACEIAABCAAAQgwKsAvek1dSLehWOsAAAA"
+        "ASUVORK5CYII="
+    )
+    with open(os.path.join(out_img, "ts_puzzle_e.png"), "wb") as f:
+        f.write(base64.b64decode(puzzle_ts_b64))
 
     # 4) Convertir Audio WAV (8-bit y 16-bit) a PCM 48000 Hz 16-bit estereo
     out_aud = os.path.join(out_assets, "audio")

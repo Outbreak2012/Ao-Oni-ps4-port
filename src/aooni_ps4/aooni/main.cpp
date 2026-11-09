@@ -1008,9 +1008,9 @@ struct MapEvent {
     int x = 0, y = 0;
     float realX = 0.0f, realY = 0.0f;
     int animTicks = 0;
-    int dir = 2, pattern = 0, opacity = 255, tile_id = 0;
+    int dir = 2, pattern = 0, original_pattern = 0, opacity = 255, tile_id = 0;
     std::string char_name;
-    bool through = false, always_top = false, dir_fix = false, step_anime = false, erased = false;
+    bool walk_anime = true, through = false, always_top = false, dir_fix = false, step_anime = false, erased = false;
     bool collisionAttack = false; // Activado por MoveCmd 45 "attack_on" (XAS_BA)
     bool isBattler = false;       // Identificado por página dummy con variable_id == 25 (XAS_BA::ENEMY_ID_VARIABLE_ID)
     int move_type = 0;
@@ -1146,7 +1146,9 @@ struct GameRuntime {
     int nameInputCooldown = 0;
 
     bool pendingTransfer = false;
+    bool nextNoFade = false;
     int nextMapId = 0, nextX = 0, nextY = 0, nextDir = 0;
+    uint32_t parBtnJustPressedMask = 0;
     bool gameOverTriggered = false;
     bool returnToTitleTriggered = false;
     uint32_t frameCount = 0;
@@ -1241,10 +1243,13 @@ static void refreshEvents() {
             ev.collisionAttack = false;
             if (found >= 0) {
                 const auto& pg = ev.pages[found];
+                ev.animTicks = 0;
                 ev.char_name = resolveAoOniCharName(pg.char_name);
                 ev.tile_id = pg.tile_id;
                 ev.dir = pg.dir;
-                ev.pattern = pg.pattern;
+                ev.original_pattern = pg.pattern % 4;
+                ev.pattern = ev.original_pattern;
+                ev.walk_anime = pg.walk_anime;
                 ev.opacity = pg.opacity;
                 ev.through = pg.through;
                 ev.always_top = pg.always_top;
@@ -1442,17 +1447,31 @@ static bool stepTowardCoords(int& x, int& y, int& dir, int tx, int ty, bool dirF
     return false;
 }
 
-static void stepTowardPlayer(MapEvent& ev) {
-    stepTowardCoords(ev.x, ev.y, ev.dir, g_game.playerX, g_game.playerY, ev.dir_fix, ev.through, false, ev.id);
+static bool stepTowardPlayer(MapEvent& ev) {
+    return stepTowardCoords(ev.x, ev.y, ev.dir, g_game.playerX, g_game.playerY, ev.dir_fix, ev.through, false, ev.id);
 }
 
-static void stepAwayFromPlayer(MapEvent& ev) {
-    int dx = g_game.playerX - ev.x;
-    int dy = g_game.playerY - ev.y;
-    int d1 = (std::abs(dx) >= std::abs(dy)) ? (dx > 0 ? 4 : 6) : (dy > 0 ? 8 : 2);
-    int d2 = (std::abs(dx) >= std::abs(dy)) ? (dy > 0 ? 8 : 2) : (dx > 0 ? 4 : 6);
-    if (!stepCharacterDir(ev.x, ev.y, ev.dir, d1, ev.dir_fix, ev.through, false, ev.id) && (dx != 0 || dy != 0))
-        stepCharacterDir(ev.x, ev.y, ev.dir, d2, ev.dir_fix, ev.through, false, ev.id);
+static bool stepAwayFromPlayer(MapEvent& ev) {
+    int sx = ev.x - g_game.playerX;
+    int sy = ev.y - g_game.playerY;
+    if (sx == 0 && sy == 0) return false;
+    int abs_sx = std::abs(sx);
+    int abs_sy = std::abs(sy);
+    if (abs_sx == abs_sy) {
+        if (rand() % 2 == 0) abs_sx++; else abs_sy++;
+    }
+    if (abs_sx > abs_sy) {
+        int d1 = (sx > 0) ? 6 : 4;
+        int d2 = (sy > 0) ? 2 : 8;
+        if (stepCharacterDir(ev.x, ev.y, ev.dir, d1, ev.dir_fix, ev.through, false, ev.id)) return true;
+        if (sy != 0 && stepCharacterDir(ev.x, ev.y, ev.dir, d2, ev.dir_fix, ev.through, false, ev.id)) return true;
+    } else {
+        int d1 = (sy > 0) ? 2 : 8;
+        int d2 = (sx > 0) ? 6 : 4;
+        if (stepCharacterDir(ev.x, ev.y, ev.dir, d1, ev.dir_fix, ev.through, false, ev.id)) return true;
+        if (sx != 0 && stepCharacterDir(ev.x, ev.y, ev.dir, d2, ev.dir_fix, ev.through, false, ev.id)) return true;
+    }
+    return false;
 }
 
 // Devuelve true si el comando consume un paso/turno/espera de movimiento, o false si es instantáneo (código 27..45 modificador)
@@ -1485,8 +1504,8 @@ static bool applyMoveCmd(int targetId, const MoveCmd& mc) {
         case 7: (*px)--; (*py)--; if (!*pdfix) *pdir = 4; walked = true; break;
         case 8: (*px)++; (*py)--; if (!*pdfix) *pdir = 6; walked = true; break;
         case 9: walked = stepCharacterDir(*px, *py, *pdir, (rand() % 4 + 1) * 2, *pdfix, *pthr, targetId == -1, targetId); break;
-        case 10: if (ev) { stepTowardPlayer(*ev); walked = true; } break;
-        case 11: if (ev) { stepAwayFromPlayer(*ev); walked = true; } break;
+        case 10: if (ev) { walked = stepTowardPlayer(*ev); } break;
+        case 11: if (ev) { walked = stepAwayFromPlayer(*ev); } break;
         case 12: walked = stepCharacterDir(*px, *py, *pdir, *pdir, *pdfix, *pthr, targetId == -1, targetId); break;
         case 13: {
             int od = *pdir;
@@ -1527,6 +1546,8 @@ static bool applyMoveCmd(int targetId, const MoveCmd& mc) {
             else if (ev) ev->move_speed = (float)mc.params[0].asNum(3.0);
             consumesStep = false;
             break;
+        case 31: if (ev) ev->walk_anime = true; consumesStep = false; break;
+        case 32: if (ev) ev->walk_anime = false; consumesStep = false; break;
         case 33: if (ev) ev->step_anime = true; consumesStep = false; break;
         case 34: if (ev) ev->step_anime = false; consumesStep = false; break;
         case 35: *pdfix = true; consumesStep = false; break;
@@ -1539,7 +1560,10 @@ static bool applyMoveCmd(int targetId, const MoveCmd& mc) {
             *pchar = resolveAoOniCharName(mc.params[0].asStr());
             if (targetId == -1) g_game.playerTransparent = pchar->empty();
             if (mc.params.a.size() >= 3 && mc.params[2].asInt(0) > 0) *pdir = mc.params[2].asInt(2);
-            if (mc.params.a.size() >= 4) *ppat = mc.params[3].asInt(0) % 4;
+            if (mc.params.a.size() >= 4) {
+                *ppat = mc.params[3].asInt(0) % 4;
+                if (ev) ev->original_pattern = *ppat;
+            }
             consumesStep = false;
             break;
         case 42: if (ev) ev->opacity = mc.params[0].asInt(255); consumesStep = false; break;
@@ -1594,7 +1618,7 @@ static bool applyMoveCmd(int targetId, const MoveCmd& mc) {
         }
         default: consumesStep = false; break;
     }
-    if (walked && *ppat == 0) *ppat = 1;
+    if (walked && *ppat == 0 && (!ev || ev->walk_anime)) *ppat = 1;
     return consumesStep;
 }
 
@@ -2136,8 +2160,28 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                 g_game.msgPos = p[0].asInt(2);
                 ip++;
                 break;
-            case 105: { // Button Input Processing (Armarios tansu / CE 25)
-                if (!isForeground) { ip++; break; }
+            case 105: { // Button Input Processing (Armarios tansu / CE 25 / Puzzle Map 60)
+                if (!isForeground) {
+                    int rmCode = 0;
+                    int hitBit = -1;
+                    const uint32_t m = g_game.parBtnJustPressedMask;
+                    if (m & (1u << PAD_CIRCLE))        { hitBit = PAD_CIRCLE;   rmCode = 12; }
+                    else if (m & (1u << PAD_TRIANGLE)) { hitBit = PAD_TRIANGLE; rmCode = 12; }
+                    else if (m & (1u << PAD_CROSS))    { hitBit = PAD_CROSS;    rmCode = 13; }
+                    else if (m & (1u << PAD_OPTIONS))  { hitBit = PAD_OPTIONS;  rmCode = 13; }
+                    else if (m & (1u << PAD_SQUARE))   { hitBit = PAD_SQUARE;   rmCode = 11; }
+                    else if (m & (1u << PAD_DOWN))     { hitBit = PAD_DOWN;     rmCode = 2; }
+                    else if (m & (1u << PAD_LEFT))     { hitBit = PAD_LEFT;     rmCode = 4; }
+                    else if (m & (1u << PAD_RIGHT))    { hitBit = PAD_RIGHT;    rmCode = 6; }
+                    else if (m & (1u << PAD_UP))       { hitBit = PAD_UP;       rmCode = 8; }
+                    if (rmCode == 0) return;
+                    g_game.parBtnJustPressedMask &= ~(1u << hitBit);
+                    int varId = p[0].asInt(8);
+                    if (varId >= 0 && varId < 512) g_game.variables[varId] = rmCode;
+                    refreshEvents();
+                    ip++;
+                    break;
+                }
                 g_game.btnInputVarId = p[0].asInt(8);
                 g_game.btnInputActive = true;
                 ip++;
@@ -2339,6 +2383,7 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                 }
                 // En Interpreter 5 (command_201) de Ao Oni: añade 1 segundo al timer al cambiar de sala
                 if (g_game.timerWorking) g_game.timerFrames += getFpsTarget();
+                g_game.nextNoFade = (p.a.size() >= 6 && p[5].asInt(0) == 1);
                 g_game.pendingTransfer = true;
                 ip++;
                 while (ip < list.a.size() && list[ip].get("c").asInt(0) == 0) ip++;
@@ -2725,16 +2770,30 @@ static void updateWalkAndEventsSmooth(bool sprinting, bool holdingMoveInput) {
             else ev.realY += (edy > 0.0f ? espd : -espd);
         }
 
-        if (isEventMoving(ev) || ev.step_anime) {
-            ev.animTicks++;
-            int stride = std::max(4, 11 - (int)ev.move_speed);
-            if (ev.animTicks >= stride) {
+        // Actualización de animación 1:1 RPG Maker XP (018_Game_Character_1.rb:137-166)
+        bool moving = isEventMoving(ev);
+        int unit = (g_frameRateMode == FPS_40_ORIGINAL) ? 6 : 4;
+        int thresh = std::max(6, (int)std::lround((18.0f - ev.move_speed * 2.0f) * 6.0f));
+        int inc = 0;
+        if (moving) {
+            if (ev.walk_anime) inc = (unit * 3) / 2;
+            else if (ev.step_anime) inc = unit;
+        } else {
+            if (ev.step_anime) inc = unit;
+            else if (ev.pattern != ev.original_pattern) inc = (unit * 3) / 2;
+        }
+        if (inc > 0) {
+            ev.animTicks += inc;
+            if (ev.animTicks > thresh) {
                 ev.animTicks = 0;
-                ev.pattern = (ev.pattern + 1) % 4;
+                if (!ev.step_anime && !moving) {
+                    ev.pattern = ev.original_pattern;
+                } else {
+                    ev.pattern = (ev.pattern + 1) % 4;
+                }
             }
         } else {
             ev.animTicks = 0;
-            ev.pattern = (ev.activePage >= 0) ? ev.pages[ev.activePage].pattern : 0;
         }
     }
 }
@@ -2786,11 +2845,12 @@ static void updateMoveRoutes(uint32_t now) {
             if (now - ev.lastAutoMoveTick >= delay) {
                 ev.lastAutoMoveTick = now;
                 if (ev.move_type == 1) {
-                    if (stepCharacterDir(ev.x, ev.y, ev.dir, (rand() % 4 + 1) * 2, ev.dir_fix, ev.through, false, ev.id) && ev.pattern == 0)
+                    if (stepCharacterDir(ev.x, ev.y, ev.dir, (rand() % 4 + 1) * 2, ev.dir_fix, ev.through, false, ev.id) &&
+                        ev.walk_anime && ev.pattern == 0)
                         ev.pattern = 1;
                 } else if (ev.move_type == 2) {
-                    stepTowardPlayer(ev);
-                    if (ev.pattern == 0) ev.pattern = 1;
+                    if (stepTowardPlayer(ev) && ev.walk_anime && ev.pattern == 0)
+                        ev.pattern = 1;
                 } else if (ev.move_type == 3) {
                     const auto& mr = ev.pages[ev.activePage].move_route;
                     if (!mr.list.empty()) {
@@ -3008,7 +3068,8 @@ static bool restoreFromSnapshot(const SaveSnapshot& snap) {
     g_game.frameCount = snap.frameCount;
     g_game.fgStack.clear();
     g_game.msgActive = g_game.choiceActive = g_game.numInputActive = g_game.btnInputActive = g_game.nameInputActive = false;
-    g_game.pendingTransfer = g_game.gameOverTriggered = g_game.returnToTitleTriggered = false;
+    g_game.pendingTransfer = g_game.nextNoFade = g_game.gameOverTriggered = g_game.returnToTitleTriggered = false;
+    g_game.parBtnJustPressedMask = 0;
     g_game.timerWorking = false;
     g_game.menuDisabled = false; // Restablecer acceso al inventario tras continuar/cargar partida
     for (int i = 0; i < 52; i++) g_game.pictures[i].active = false;
@@ -3059,6 +3120,8 @@ static void resetNewGame() {
     g_game.btnInputActive = false;
     g_game.nameInputActive = false;
     g_game.pendingTransfer = false;
+    g_game.nextNoFade = false;
+    g_game.parBtnJustPressedMask = 0;
     g_game.gameOverTriggered = false;
     g_game.returnToTitleTriggered = false;
     g_game.timerWorking = false;
@@ -3096,6 +3159,154 @@ static const QuickNameBtn NAME_QUICK_BTNS[9] = {
     { "HIROSI",    "HIROSI",    "Easter Egg: Retrato clasico de Hiroshi en dialogos" },
     { "TIMER",     "TIMER",     "Easter Egg: Cronometro Speedrun en pantalla" }
 };
+
+// ==================== BRILLO RESPLANDECIENTE POST-TONO (OBJETOS RECOGIBLES 1:1) ====================
+struct SparkleGlintPt {
+    int x, y;
+    uint8_t r, g, b;
+};
+
+struct SparkleGlintCell {
+    int cw = 0, ch = 0;
+    std::vector<SparkleGlintPt> pts;
+    int cx = 0, cy = 0;
+    uint8_t tintR = 255, tintG = 255, tintB = 255;
+};
+
+static bool isSparkleSheetName(const std::string& name) {
+    return name == "hikaru_item" || name == "book_on_tana2" || name == "book_on_tana" ||
+           name == "zou_wareta_hikaru" || name == "kinkoa" || name == "kinkob" ||
+           name == "kinkoc" || name == "kinko_haikyo" || name == "yokusou" ||
+           name == "yokusou2" || name == "e_chara2" || name == "ka-petto" ||
+           name == "tansu" || name == "tansu_l" || name == "tansu_la";
+}
+
+static const SparkleGlintCell& getCachedSparkleGlints(const std::string& charName, int dir, int pat, SDL_Surface* es) {
+    static std::map<std::string, SparkleGlintCell> s_cache;
+    int row = rmDirToRow(dir);
+    int pIdx = ((pat % 4) + 4) % 4;
+    std::string key = charName + "#" + std::to_string(row * 4 + pIdx);
+    auto it = s_cache.find(key);
+    if (it != s_cache.end()) return it->second;
+
+    SparkleGlintCell cell;
+    if (es && es->pixels && es->w >= 4 && es->h >= 4) {
+        int cw = es->w / 4, ch = es->h / 4;
+        cell.cw = cw;
+        cell.ch = ch;
+        if (pIdx > 0) {
+            std::vector<SparkleGlintPt> cand;
+            for (int y = 0; y < ch; y++) {
+                const uint8_t* rowCur = (const uint8_t*)es->pixels + (row * ch + y) * es->pitch + (pIdx * cw) * 4;
+                const uint8_t* rowRef = (const uint8_t*)es->pixels + (row * ch + y) * es->pitch;
+                for (int x = 0; x < cw; x++) {
+                    const uint8_t* sp = rowCur + x * 4;
+                    const uint8_t* rp = rowRef + x * 4;
+                    if (sp[3] < 200) continue;
+                    bool diff = (sp[0] != rp[0] || sp[1] != rp[1] || sp[2] != rp[2] || sp[3] != rp[3]);
+                    if (!diff) continue;
+                    uint8_t mx = std::max(sp[0], std::max(sp[1], sp[2]));
+                    int sum = (int)sp[0] + (int)sp[1] + (int)sp[2];
+                    if (mx >= 245 && sum >= 520) {
+                        cand.push_back({ x, y, sp[0], sp[1], sp[2] });
+                    }
+                }
+            }
+            if (!cand.empty() && cand.size() <= 16) {
+                cell.pts = cand;
+                int sumX = 0, sumY = 0, sumR = 0, sumG = 0, sumB = 0;
+                for (const auto& pt : cand) {
+                    sumX += pt.x; sumY += pt.y;
+                    sumR += pt.r; sumG += pt.g; sumB += pt.b;
+                }
+                int n = (int)cand.size();
+                cell.cx = (sumX + n / 2) / n;
+                cell.cy = (sumY + n / 2) / n;
+                cell.tintR = (uint8_t)(sumR / n);
+                cell.tintG = (uint8_t)(sumG / n);
+                cell.tintB = (uint8_t)(sumB / n);
+            }
+        }
+    }
+    return s_cache[key] = cell;
+}
+
+static inline void blendSparklePixel(SDL_Surface* dst, int offX, int offY, int camX, int camY,
+                                      bool alwaysTop, int sx, int sy,
+                                      uint8_t gr, uint8_t gg, uint8_t gb, int intensity) {
+    if (intensity <= 0) return;
+    if (sx < offX || sx >= offX + GAME_W || sy < offY || sy >= offY + GAME_H) return;
+    if (!alwaysTop && g_game.mapUpperSurf && g_game.mapUpperSurf->pixels) {
+        int wx = camX + (sx - offX);
+        int wy = camY + (sy - offY);
+        if (wx >= 0 && wy >= 0 && wx < g_game.mapUpperSurf->w && wy < g_game.mapUpperSurf->h) {
+            const uint8_t* up = (const uint8_t*)g_game.mapUpperSurf->pixels + wy * g_game.mapUpperSurf->pitch + wx * 4;
+            if (up[3] >= 128) return;
+        }
+    }
+    uint32_t* row = (uint32_t*)((uint8_t*)dst->pixels + sy * dst->pitch);
+    uint8_t dr, dg, db;
+    unpackWinPixel(row[sx], dr, dg, db);
+    int nr = std::min(255, (int)dr + ((int)gr * intensity) / 255);
+    int ng = std::min(255, (int)dg + ((int)gg * intensity) / 255);
+    int nb = std::min(255, (int)db + ((int)gb * intensity) / 255);
+    row[sx] = packWinPixel((uint8_t)nr, (uint8_t)ng, (uint8_t)nb);
+}
+
+static void drawSparkleStarGlow(SDL_Surface* gameSurf, int offX, int offY, int camX, int camY,
+                                const MapEvent& mev, int evPxX, int evPxY) {
+    SDL_Surface* es = getSurf(std::string("/app0/assets/images/char_") + mev.char_name + ".png");
+    if (!es) return;
+    const SparkleGlintCell& gl = getCachedSparkleGlints(mev.char_name, mev.dir, mev.pattern, es);
+    if (gl.pts.empty() || gl.cw <= 0 || gl.ch <= 0) return;
+
+    int ex = offX + (evPxX - camX) - (gl.cw - TILE_SZ) / 2;
+    int ey = offY + (evPxY - camY) - (gl.ch - TILE_SZ);
+    int op = std::min(255, std::max(0, mev.opacity));
+    int pat = ((mev.pattern % 4) + 4) % 4;
+
+    uint8_t haloR = (gl.tintR < 220) ? (uint8_t)std::min(255, (int)gl.tintR + 50) : 255;
+    uint8_t haloG = (gl.tintG < 220) ? (uint8_t)std::min(255, (int)gl.tintG + 65) : 252;
+    uint8_t haloB = 255;
+
+    for (const auto& pt : gl.pts) {
+        int sx = ex + pt.x;
+        int sy = ey + pt.y;
+        uint8_t cr = std::max<uint8_t>(225, pt.r);
+        uint8_t cg = std::max<uint8_t>(225, pt.g);
+        uint8_t cb = std::max<uint8_t>(240, pt.b);
+        blendSparklePixel(gameSurf, offX, offY, camX, camY, mev.always_top, sx, sy, cr, cg, cb, (220 * op) >> 8);
+    }
+
+    int scx = ex + gl.cx;
+    int scy = ey + gl.cy;
+    if (pat == 2) {
+        for (int d = 1; d <= 4; d++) {
+            int w = (d == 1) ? 195 : ((d == 2) ? 145 : ((d == 3) ? 90 : 42));
+            int iw = (w * op) >> 8;
+            blendSparklePixel(gameSurf, offX, offY, camX, camY, mev.always_top, scx - d, scy, haloR, haloG, haloB, iw);
+            blendSparklePixel(gameSurf, offX, offY, camX, camY, mev.always_top, scx + d, scy, haloR, haloG, haloB, iw);
+            blendSparklePixel(gameSurf, offX, offY, camX, camY, mev.always_top, scx, scy - d, haloR, haloG, haloB, iw);
+            blendSparklePixel(gameSurf, offX, offY, camX, camY, mev.always_top, scx, scy + d, haloR, haloG, haloB, iw);
+        }
+        int dw = (72 * op) >> 8;
+        blendSparklePixel(gameSurf, offX, offY, camX, camY, mev.always_top, scx - 1, scy - 1, haloR, haloG, haloB, dw);
+        blendSparklePixel(gameSurf, offX, offY, camX, camY, mev.always_top, scx + 1, scy - 1, haloR, haloG, haloB, dw);
+        blendSparklePixel(gameSurf, offX, offY, camX, camY, mev.always_top, scx - 1, scy + 1, haloR, haloG, haloB, dw);
+        blendSparklePixel(gameSurf, offX, offY, camX, camY, mev.always_top, scx + 1, scy + 1, haloR, haloG, haloB, dw);
+    } else {
+        int w1 = (95 * op) >> 8;
+        int w2 = (36 * op) >> 8;
+        blendSparklePixel(gameSurf, offX, offY, camX, camY, mev.always_top, scx - 1, scy, haloR, haloG, haloB, w1);
+        blendSparklePixel(gameSurf, offX, offY, camX, camY, mev.always_top, scx + 1, scy, haloR, haloG, haloB, w1);
+        blendSparklePixel(gameSurf, offX, offY, camX, camY, mev.always_top, scx, scy - 1, haloR, haloG, haloB, w1);
+        blendSparklePixel(gameSurf, offX, offY, camX, camY, mev.always_top, scx, scy + 1, haloR, haloG, haloB, w1);
+        blendSparklePixel(gameSurf, offX, offY, camX, camY, mev.always_top, scx - 2, scy, haloR, haloG, haloB, w2);
+        blendSparklePixel(gameSurf, offX, offY, camX, camY, mev.always_top, scx + 2, scy, haloR, haloG, haloB, w2);
+        blendSparklePixel(gameSurf, offX, offY, camX, camY, mev.always_top, scx, scy - 2, haloR, haloG, haloB, w2);
+        blendSparklePixel(gameSurf, offX, offY, camX, camY, mev.always_top, scx, scy + 2, haloR, haloG, haloB, w2);
+    }
+}
 
 enum AppState { STATE_TITLE = 0, STATE_MAP = 1, STATE_INVENTORY = 2, STATE_GAMEOVER = 3 };
 
@@ -3337,6 +3548,15 @@ int main(int argc, char* argv[]) {
             }
         } else {
             dpadRepeatHoldFrames = 0;
+        }
+
+        // Registrar pulsación para eventos paralelos con cmd 105 (ej. Map 60 - Puzzle de la muñeca) sin interferir con L2/R2/R3 ni diálogos
+        if (state == STATE_MAP && g_game.transPhase == 0 && !g_game.pendingTransfer &&
+            g_game.fgStack.empty() && !g_game.msgActive && !g_game.choiceActive &&
+            !g_game.numInputActive && !g_game.btnInputActive && !g_game.nameInputActive) {
+            g_game.parBtnJustPressedMask = justPressedMask & ~((1u << PAD_L2) | (1u << PAD_R2) | (1u << PAD_R3));
+        } else {
+            g_game.parBtnJustPressedMask = 0;
         }
 
         // Procesar cada botón recién pulsado (o repetido en menú) una sola vez limpia por frame
@@ -3676,7 +3896,7 @@ int main(int argc, char* argv[]) {
             updatePictures();
 
             // 1) Avanzar primero el sub-píxel del jugador hacia su casilla actual para que no haya ni 1 frame de pausa al llegar a una casilla
-            bool sprinting = (padL1 || padR1 || ((curPadMask & (1u << PAD_CIRCLE)) != 0) ||
+            bool sprinting = (padL1 || padR1 || ((curPadMask & (1u << PAD_CIRCLE)) != 0 && g_game.mapId != 60) ||
                               ((curPadMask & (1u << PAD_L2)) != 0) || ((curPadMask & (1u << PAD_R2)) != 0) ||
                               g_game.switches[49]);
             float remMovePx = advancePlayerSubPixel(sprinting);
@@ -3854,7 +4074,8 @@ int main(int argc, char* argv[]) {
                     const auto& pg = mev.pages[mev.activePage];
                     if (pg.trigger == 4 && pg.list.a.size() > 1) {
                         runInterpreterSlice(pg.list, mev.parIp, mev.parWait, mev.id, false);
-                        if (mev.parIp >= pg.list.a.size()) mev.parIp = 0;
+                        if (mev.activePage >= 0 && !mev.erased && mev.parIp >= mev.pages[mev.activePage].list.a.size())
+                            mev.parIp = 0;
                     }
                 }
                 for (auto& ce : g_game.commonEvents) {
@@ -3867,8 +4088,10 @@ int main(int argc, char* argv[]) {
 
             // Gestión de transiciones suaves entre mapas (cmd 201 + fade out / fade in)
             if (g_game.pendingTransfer) {
-                if (g_game.screenBlackout || g_game.fadeAlpha >= 250) {
+                bool wasNoFade = g_game.nextNoFade;
+                if (wasNoFade || g_game.screenBlackout || g_game.fadeAlpha >= 250) {
                     g_game.pendingTransfer = false;
+                    g_game.nextNoFade = false;
                     int tm = g_game.nextMapId, tx = g_game.nextX, ty = g_game.nextY, td = g_game.nextDir;
                     if (loadMap(tm)) {
                         g_game.playerX = tx;
@@ -3877,12 +4100,16 @@ int main(int argc, char* argv[]) {
                         g_game.playerRealY = (float)(ty * TILE_SZ);
                         g_game.playerPattern = 0;
                         if (td > 0) g_game.playerDir = td;
-                        // QoL: Auto-guardado de punto de control al entrar a una sala segura (fuera de persecución)
-                        if (tm != 75 && tm != 35 && !g_game.switches[49] && !g_game.switches[50] && !g_game.playerTransparent) {
+                        // QoL: Auto-guardado de punto de control al entrar a una sala segura (fuera de persecución y del minijuego puzzle_player)
+                        if (tm != 75 && tm != 35 && tm != 60 && g_game.playerChar != "puzzle_player" &&
+                            !g_game.switches[49] && !g_game.switches[50] && !g_game.playerTransparent) {
                             captureSnapshot(g_autoSave);
                         }
                     }
-                    if (!g_game.screenBlackout) {
+                    if (wasNoFade) {
+                        g_game.fadeAlpha = 0;
+                        g_game.transPhase = 0;
+                    } else if (!g_game.screenBlackout) {
                         g_game.fadeAlpha = 255;
                         g_game.transPhase = 2;
                     }
@@ -4011,27 +4238,28 @@ int main(int argc, char* argv[]) {
                 blitSurf(g_game.mapLowerSurf, &src, gameSurf, &dst);
             }
 
-            // 2) Ordenar por coordenada Y sub-píxel y dibujar eventos + jugador
+            // 2) Ordenar por coordenada Y sub-píxel y dibujar eventos + jugador (screen_z 1:1 RPG Maker XP)
             struct SpriteDraw { float ry; int order; bool isPlayer; const MapEvent* ev; };
             std::vector<SpriteDraw> drawList;
             drawList.reserve(g_game.events.size() + 1);
             for (const auto& mev : g_game.events) {
                 if (mev.activePage < 0 || (mev.char_name.empty() && mev.tile_id <= 0)) continue;
-                drawList.push_back({ mev.realY, mev.always_top ? 2 : 0, false, &mev });
+                drawList.push_back({ mev.realY, mev.always_top ? 1 : 0, false, &mev });
             }
             if (!g_game.playerTransparent && !g_game.playerChar.empty()) {
-                drawList.push_back({ g_game.playerRealY, 1, true, nullptr });
+                drawList.push_back({ g_game.playerRealY, 0, true, nullptr });
             }
-            std::sort(drawList.begin(), drawList.end(), [](const SpriteDraw& a, const SpriteDraw& b) {
+            std::stable_sort(drawList.begin(), drawList.end(), [](const SpriteDraw& a, const SpriteDraw& b) {
                 if (a.order != b.order) return a.order < b.order;
-                return a.ry < b.ry;
+                if (std::fabs(a.ry - b.ry) > 0.5f) return a.ry < b.ry;
+                return (a.isPlayer ? 1 : 0) < (b.isPlayer ? 1 : 0);
             });
 
             SDL_Surface* tsSurf = nullptr;
-            for (const auto& sd : drawList) {
+            auto drawSpriteEntry = [&](const SpriteDraw& sd) {
                 if (sd.isPlayer) {
                     SDL_Surface* ps = getSurf(std::string("/app0/assets/images/char_") + g_game.playerChar + ".png");
-                    if (!ps) continue;
+                    if (!ps) return;
                     int cw = ps->w / 4, ch = ps->h / 4;
                     SDL_Rect src = { g_game.playerPattern * cw, rmDirToRow(g_game.playerDir) * ch, cw, ch };
                     int px = offX + (pPxX - camX) - (cw - TILE_SZ) / 2;
@@ -4043,7 +4271,7 @@ int main(int argc, char* argv[]) {
                     int evPxY = (int)std::round(sd.ev->realY);
                     if (!sd.ev->char_name.empty()) {
                         SDL_Surface* es = getSurf(std::string("/app0/assets/images/char_") + sd.ev->char_name + ".png");
-                        if (!es) continue;
+                        if (!es) return;
                         int cw = es->w / 4, ch = es->h / 4;
                         SDL_Rect src = { sd.ev->pattern * cw, rmDirToRow(sd.ev->dir) * ch, cw, ch };
                         int ex = offX + (evPxX - camX) - (cw - TILE_SZ) / 2;
@@ -4061,6 +4289,10 @@ int main(int argc, char* argv[]) {
                         }
                     }
                 }
+            };
+
+            for (const auto& sd : drawList) {
+                if (sd.order == 0) drawSpriteEntry(sd);
             }
 
             // 3) Dibujar capa superior pre-renderizada (techos, bordes de pared con prioridad > 0)
@@ -4070,12 +4302,28 @@ int main(int argc, char* argv[]) {
                 blitSurf(g_game.mapUpperSurf, &src, gameSurf, &dst);
             }
 
+            // 3.5) Eventos con always_on_top == true (RGSS1 screen_z = 999, por encima de prio > 0, ej. Map 25 Ev 6 oil, Map 60 puzzle_parts)
+            for (const auto& sd : drawList) {
+                if (sd.order > 0) drawSpriteEntry(sd);
+            }
+
             // 4) Aplicar tono de pantalla (cmd 223, ej: -85,-85,-85 en el interior de la mansión)
             int tr = (int)std::round(g_game.curToneR);
             int tg = (int)std::round(g_game.curToneG);
             int tb = (int)std::round(g_game.curToneB);
             if (tr != 0 || tg != 0 || tb != 0) {
                 applyToneRectFast(gameSurf, offX, offY, GAME_W, GAME_H, tr, tg, tb);
+            }
+
+            // 4.5) Brillo resplandeciente post-tono para objetos recogibles activos
+            if (!g_game.screenBlackout && g_game.fadeAlpha < 254) {
+                for (const auto& mev : g_game.events) {
+                    if (mev.activePage >= 0 && mev.step_anime && isSparkleSheetName(mev.char_name)) {
+                        int evPxX = (int)std::round(mev.realX);
+                        int evPxY = (int)std::round(mev.realY);
+                        drawSparkleStarGlow(gameSurf, offX, offY, camX, camY, mev, evPxX, evPxY);
+                    }
+                }
             }
 
             // 5) Dibujar Pictures activas (1..50, con soporte de origin y zoom)
@@ -4110,7 +4358,7 @@ int main(int argc, char* argv[]) {
                 fillRectFast(gameSurf, offX + 12, offY + 12, 116, 26, 15, 22, 68, 210);
                 drawRectFast(gameSurf, offX + 12, offY + 12, 116, 26, 190, 210, 255);
                 drawText(gameSurf, offX + 20, offY + 18, tbuf, 2, 255, 240, 130);
-                bool isSprinting = (padL1 || padR1 || ((curPadMask & (1u << PAD_CIRCLE)) != 0) ||
+                bool isSprinting = (padL1 || padR1 || ((curPadMask & (1u << PAD_CIRCLE)) != 0 && g_game.mapId != 60) ||
                                     ((curPadMask & (1u << PAD_L2)) != 0) || ((curPadMask & (1u << PAD_R2)) != 0) ||
                                     g_game.switches[49]);
                 if (isSprinting && isPlayerMoving()) {
