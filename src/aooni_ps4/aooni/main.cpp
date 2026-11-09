@@ -1513,7 +1513,12 @@ static bool applyMoveCmd(int targetId, const MoveCmd& mc) {
             ev->dir = (std::abs(dx) >= std::abs(dy)) ? (dx >= 0 ? 6 : 4) : (dy >= 0 ? 2 : 8);
         } break;
         case 27: g_game.switches[mc.params[0].asInt(1)] = true; refreshEvents(); consumesStep = false; break;
-        case 28: g_game.switches[mc.params[0].asInt(1)] = false; refreshEvents(); consumesStep = false; break;
+        case 28:
+            g_game.switches[mc.params[0].asInt(1)] = false;
+            if (mc.params[0].asInt(1) == 49) g_game.menuDisabled = false;
+            refreshEvents();
+            consumesStep = false;
+            break;
         case 29:
             if (targetId == -1) g_game.playerSpeed = (float)mc.params[0].asNum(4.0);
             else if (ev) ev->move_speed = (float)mc.params[0].asNum(3.0);
@@ -1546,7 +1551,13 @@ static bool applyMoveCmd(int targetId, const MoveCmd& mc) {
             float spd = 0.0f;
             int arg1 = 0, arg2 = 0;
             if (s.find("attack_on") != std::string::npos) {
-                if (ev) ev->collisionAttack = true;
+                if (ev) {
+                    ev->collisionAttack = true;
+                    int dist = std::abs(ev->x - g_game.playerX) + std::abs(ev->y - g_game.playerY);
+                    if (dist <= 6) {
+                        ev->routeWaitFrames = std::max(ev->routeWaitFrames, (int)(45 * getFpsTarget() / 60));
+                    }
+                }
                 consumesStep = false;
             } else if (s.find("attack_off") != std::string::npos) {
                 if (ev) ev->collisionAttack = false;
@@ -2248,6 +2259,9 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                             triggerRumble(255, 255, 65);
                             setPadLightbar(255, 0, 0);
                         }
+                        if (id == 49 && !val) {
+                            g_game.menuDisabled = false; // Re-habilitar menú al finalizar persecución
+                        }
                         g_game.switches[id] = val;
                     }
                 }
@@ -2344,6 +2358,15 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                     tev->realX = (float)(tev->x * TILE_SZ);
                     tev->realY = (float)(tev->y * TILE_SZ);
                     if (p[4].asInt(0) > 0) tev->dir = p[4].asInt(2);
+                    // Ventana de gracia para emboscada/aparición de Ao Oni (ej. sala del piano, var 5 == 100):
+                    if (tev->char_name.rfind("ao", 0) == 0 || tev->collisionAttack || tev->isBattler) {
+                        int dist = std::abs(tev->x - g_game.playerX) + std::abs(tev->y - g_game.playerY);
+                        if (dist <= 6) {
+                            tev->routeWaitFrames = std::max(tev->routeWaitFrames, (int)(45 * getFpsTarget() / 60));
+                            triggerRumble(220, 150, 18);
+                            setPadLightbar(255, 0, 50);
+                        }
+                    }
                 }
                 ip++;
                 break;
@@ -2714,6 +2737,12 @@ static void updateMoveRoutes(uint32_t now) {
     }
     for (auto& ev : g_game.events) {
         if (ev.activePage < 0) continue;
+        bool isAo = (ev.char_name.rfind("ao", 0) == 0 || ev.collisionAttack || ev.isBattler);
+        bool inInspection = (!g_game.fgStack.empty() || g_game.btnInputActive || g_game.msgActive || g_game.choiceActive || g_game.numInputActive || g_game.nameInputActive);
+        if (isAo && inInspection) {
+            // Congelar persecución mientras el jugador está viendo una imagen/acertijo (ej: piano, armarios) o en un diálogo
+            continue;
+        }
         if (ev.routeActive) {
             if (!isEventMoving(ev)) {
                 if (ev.routeWaitFrames > 0) {
@@ -2730,7 +2759,7 @@ static void updateMoveRoutes(uint32_t now) {
                     }
                 }
             }
-        } else if (g_game.fgStack.empty() && ev.move_type > 0 && !isEventMoving(ev)) {
+        } else if (g_game.fgStack.empty() && !g_game.btnInputActive && !g_game.msgActive && !g_game.choiceActive && ev.move_type > 0 && !isEventMoving(ev)) {
             if (ev.routeWaitFrames > 0) {
                 ev.routeWaitFrames--;
                 continue;
@@ -2964,6 +2993,7 @@ static bool restoreFromSnapshot(const SaveSnapshot& snap) {
     g_game.msgActive = g_game.choiceActive = g_game.numInputActive = g_game.btnInputActive = g_game.nameInputActive = false;
     g_game.pendingTransfer = g_game.gameOverTriggered = g_game.returnToTitleTriggered = false;
     g_game.timerWorking = false;
+    g_game.menuDisabled = false; // Restablecer acceso al inventario tras continuar/cargar partida
     for (int i = 0; i < 52; i++) g_game.pictures[i].active = false;
     loadMap(snap.mapId);
     g_game.playerX = snap.playerX;
@@ -3015,6 +3045,7 @@ static void resetNewGame() {
     g_game.gameOverTriggered = false;
     g_game.returnToTitleTriggered = false;
     g_game.timerWorking = false;
+    g_game.menuDisabled = false; // Restablecer acceso al inventario para nueva partida
     g_game.playerX = 9;
     g_game.playerY = 8;
     g_game.playerRealX = (float)(9 * TILE_SZ);
@@ -3500,8 +3531,8 @@ int main(int argc, char* argv[]) {
                     else if (b == PAD_RIGHT) rmCode = 6;
                     else if (b == PAD_UP) rmCode = 8;
                     else if (b == PAD_SQUARE) rmCode = 11;
-                    else if (b == PAD_CIRCLE || b == PAD_TRIANGLE) rmCode = 12;
-                    else if (b == PAD_CROSS) rmCode = 13;
+                    else if (b == PAD_CIRCLE || b == PAD_TRIANGLE) rmCode = 13; // En CE 8 y CE 25 permite cerrar la imagen con Círculo además de Cruz
+                    else if (b == PAD_CROSS || b == PAD_OPTIONS) rmCode = 13;
                     if (rmCode > 0) {
                         if (g_game.btnInputVarId >= 0 && g_game.btnInputVarId < 512)
                             g_game.variables[g_game.btnInputVarId] = rmCode;

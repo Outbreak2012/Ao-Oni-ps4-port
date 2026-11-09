@@ -14,9 +14,30 @@ struct JVal {
     std::vector<JVal> a;
     std::map<std::string, JVal> o;
 
-    int asInt(int def = 0) const { return type == T_NUM ? (int)n : def; }
-    double asNum(double def = 0.0) const { return type == T_NUM ? n : def; }
-    bool asBool(bool def = false) const { return type == T_BOOL ? b : def; }
+    int asInt(int def = 0) const {
+        if (type == T_NUM) return (int)n;
+        if (type == T_STR && !s.empty()) {
+            char* endp = nullptr;
+            long v = strtol(s.c_str(), &endp, 10);
+            if (endp != s.c_str()) return (int)v;
+        }
+        return def;
+    }
+    double asNum(double def = 0.0) const {
+        if (type == T_NUM) return n;
+        if (type == T_STR && !s.empty()) {
+            char* endp = nullptr;
+            double v = strtod(s.c_str(), &endp);
+            if (endp != s.c_str()) return v;
+        }
+        return def;
+    }
+    bool asBool(bool def = false) const {
+        if (type == T_BOOL) return b;
+        if (type == T_STR) return (s == "true" || s == "1");
+        if (type == T_NUM) return n != 0;
+        return def;
+    }
     const std::string& asStr() const { return s; }
     const JVal& operator[](size_t i) const {
         static JVal nullVal;
