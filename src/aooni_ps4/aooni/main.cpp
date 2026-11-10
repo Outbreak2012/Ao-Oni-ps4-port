@@ -1066,6 +1066,8 @@ struct GameRuntime {
     std::map<int, int> inventory;
     std::map<int, std::string> actorNames;
     std::map<int, std::string> actorChars;
+    std::vector<int> startingParty = {1};
+    std::vector<int> partyActors = {1};
     std::map<int, ItemDef> itemDefs;
     std::vector<CommonEventDef> commonEvents;
     Picture pictures[52];
@@ -1193,6 +1195,57 @@ static MapEvent* findEvent(int id) {
     return nullptr;
 }
 
+static inline bool isAoOniLethalEvent(const MapEvent& ev) {
+    if (ev.activePage < 0) return false;
+    if (ev.collisionAttack) return true;
+    return ev.isBattler && !ev.through && !ev.char_name.empty();
+}
+
+static inline bool isAoOniBattlerEvent(const MapEvent& ev) {
+    return ev.isBattler || ev.collisionAttack;
+}
+
+static bool isActorInParty(int actorId) {
+    for (int id : g_game.partyActors) {
+        if (id == actorId) return true;
+    }
+    return false;
+}
+
+static std::string resolveLeaderPartyChar() {
+    for (int id : g_game.partyActors) {
+        auto it = g_game.actorChars.find(id);
+        if (it != g_game.actorChars.end() && !it->second.empty()) {
+            if (id == 2 && g_game.switches[76] && g_game.actorChars.count(3) && !g_game.actorChars[3].empty()) {
+                return g_game.actorChars[3];
+            }
+            return it->second;
+        }
+    }
+    return "";
+}
+
+static void refreshPlayerPartyGraphic() {
+    if (g_game.playerChar == "puzzle_player") return;
+    g_game.playerChar = resolveLeaderPartyChar();
+}
+
+static void addPartyActor(int actorId) {
+    if (actorId <= 0) return;
+    if (!isActorInParty(actorId)) {
+        g_game.partyActors.push_back(actorId);
+    }
+    refreshPlayerPartyGraphic();
+}
+
+static void removePartyActor(int actorId) {
+    for (auto it = g_game.partyActors.begin(); it != g_game.partyActors.end(); ) {
+        if (*it == actorId) it = g_game.partyActors.erase(it);
+        else ++it;
+    }
+    refreshPlayerPartyGraphic();
+}
+
 static bool checkPageCond(int mapId, int evId, const EventPage& p) {
     // En XAS_BA (092_battler_attachment.rb), la página con variable_id == 25 es solo una etiqueta de metadatos para registrar el enemigo
     if (p.var_valid && p.var_id == 25) return false;
@@ -1235,6 +1288,7 @@ static void refreshEvents() {
             }
         }
         if (found != ev.activePage) {
+            int prevWaitFrames = ev.routeWaitFrames;
             ev.activePage = found;
             ev.parIp = 0;
             ev.parWait = 0;
@@ -1284,6 +1338,10 @@ static void refreshEvents() {
                             break;
                         }
                     }
+                }
+                // Conservar tiempo de gracia de aparición (cmd 202) si Ao Oni activa su página de persecución justo después
+                if ((ev.collisionAttack || (ev.isBattler && !ev.through)) && !ev.char_name.empty()) {
+                    ev.routeWaitFrames = prevWaitFrames;
                 }
             } else {
                 ev.char_name.clear();
@@ -1402,7 +1460,7 @@ static bool stepCharacterDir(int& x, int& y, int& dir, int d, bool dirFix, bool 
     if (!isPlayer && evId > 0 && nx == g_game.playerX && ny == g_game.playerY) {
         MapEvent* selfEv = findEvent(evId);
         if (selfEv && selfEv->activePage >= 0) {
-            if (selfEv->collisionAttack || selfEv->char_name.rfind("ao", 0) == 0) {
+            if (isAoOniLethalEvent(*selfEv)) {
                 if (selfEv->routeWaitFrames <= 0 && !g_game.playerTransparent) {
                     triggerPlayerDeathByAoOni();
                 }
@@ -1988,6 +2046,7 @@ static bool evalConditionCmd(int evId, const JVal& p) {
         case 4: {
             int aId = p[1].asInt(1);
             int sub = p[2].asInt(0);
+            if (sub == 0) return isActorInParty(aId);
             if (sub == 1) return g_game.actorNames[aId] == p[3].asStr();
             return false;
         }
@@ -2355,12 +2414,16 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                 ip++;
                 break;
             }
-            case 129: { // Change Party Member
+            case 129: { // Change Party Member (RMXP 1:1: mantiene al líder como sprite del jugador)
                 int actorId = p[0].asInt(1);
-                int add = p[1].asInt(0);
-                if (add == 0 && g_game.actorChars.count(actorId) && !g_game.actorChars[actorId].empty()) {
-                    g_game.playerChar = g_game.actorChars[actorId];
-                    g_game.playerTransparent = false;
+                int op = p[1].asInt(0);
+                if (op == 0) {
+                    addPartyActor(actorId);
+                    if (!g_game.playerChar.empty() && g_game.mapId != 75) {
+                        g_game.playerTransparent = false;
+                    }
+                } else {
+                    removePartyActor(actorId);
                 }
                 ip++;
                 break;
@@ -2412,17 +2475,34 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                     tev->realX = (float)(tev->x * TILE_SZ);
                     tev->realY = (float)(tev->y * TILE_SZ);
                     if (p[4].asInt(0) > 0) tev->dir = p[4].asInt(2);
-                    // Ventana de gracia para emboscada/aparición de Ao Oni (ej. sala del piano, entradas de sala):
-                    if (tev->char_name.rfind("ao", 0) == 0 || tev->collisionAttack || tev->isBattler) {
+                    // Ventana de gracia para emboscada/aparición de Ao Oni (ej. sala del piano, agujero de suelo, entradas):
+                    if (isAoOniBattlerEvent(*tev)) {
                         int dist = std::abs(tev->x - g_game.playerX) + std::abs(tev->y - g_game.playerY);
-                        // Si spawnea encima o a <= 2 casillas del jugador, separar para evitar muerte instantánea injusta
+                        // Si spawnea encima o a <= 2 casillas del jugador, reubicar en una casilla transitable segura (>= 3)
                         if (dist <= 2) {
-                            if (tev->x == g_game.playerX) {
-                                if (tev->y <= g_game.playerY && tev->y - 2 >= 0) tev->y -= 2;
-                                else if (tev->y + 2 < g_game.mapH) tev->y += 2;
-                            } else if (tev->y == g_game.playerY) {
-                                if (tev->x <= g_game.playerX && tev->x - 2 >= 0) tev->x -= 2;
-                                else if (tev->x + 2 < g_game.mapW) tev->x += 2;
+                            int bestX = tev->x, bestY = tev->y;
+                            bool foundSafe = false;
+                            for (int wantDist = 3; wantDist <= 6 && !foundSafe; wantDist++) {
+                                int bestScore = 999999;
+                                for (int dy = -wantDist; dy <= wantDist; dy++) {
+                                    for (int dx = -wantDist; dx <= wantDist; dx++) {
+                                        if (std::abs(dx) + std::abs(dy) != wantDist) continue;
+                                        int cx = g_game.playerX + dx;
+                                        int cy = g_game.playerY + dy;
+                                        if (!canPassTile(cx, cy, false, tev->id)) continue;
+                                        int score = std::abs(cx - tev->x) + std::abs(cy - tev->y);
+                                        if (score < bestScore) {
+                                            bestScore = score;
+                                            bestX = cx;
+                                            bestY = cy;
+                                            foundSafe = true;
+                                        }
+                                    }
+                                }
+                            }
+                            if (foundSafe) {
+                                tev->x = bestX;
+                                tev->y = bestY;
                             }
                             tev->realX = (float)(tev->x * TILE_SZ);
                             tev->realY = (float)(tev->y * TILE_SZ);
@@ -2757,7 +2837,7 @@ static void updateWalkAndEventsSmooth(bool sprinting, bool holdingMoveInput) {
                            g_game.numInputActive || g_game.btnInputActive || g_game.nameInputActive || g_game.pendingTransfer;
     for (auto& ev : g_game.events) {
         if (ev.activePage < 0) continue;
-        bool isAoBattler = ev.isBattler || ev.collisionAttack || ev.char_name.rfind("ao", 0) == 0;
+        bool isAoBattler = isAoOniBattlerEvent(ev);
         if (!nonPreemptPause || ev.routeActive || !isAoBattler) {
             float etx = (float)(ev.x * TILE_SZ);
             float ety = (float)(ev.y * TILE_SZ);
@@ -2884,6 +2964,15 @@ static void initGameDb() {
         g_game.actorNames[id] = kv.second.get("name").asStr();
         g_game.actorChars[id] = kv.second.get("char_name").asStr();
     }
+    const JVal& party = db.get("party");
+    if (party.type == JVal::T_ARR && !party.a.empty()) {
+        g_game.startingParty.clear();
+        for (size_t i = 0; i < party.a.size(); i++) {
+            int aid = party[i].asInt(0);
+            if (aid > 0) g_game.startingParty.push_back(aid);
+        }
+        if (g_game.startingParty.empty()) g_game.startingParty.push_back(1);
+    }
     const JVal& its = db.get("items");
     for (const auto& kv : its.o) {
         int id = atoi(kv.first.c_str());
@@ -2909,10 +2998,12 @@ static void initGameDb() {
 // Guardado / Carga de partida (en memoria, Auto-Save QoL y en /data/aooni_save.dat en disco)
 struct SaveSnapshot {
     bool valid = false;
+    uint32_t versionMagic = 0x414F4E36;
     bool switches[512];
     int variables[512];
     std::map<std::string, bool> selfSwitches;
     std::map<int, int> inventory;
+    std::vector<int> partyActors;
     int mapId = 4, playerX = 9, playerY = 8, playerDir = 2;
     std::string playerChar = "hirosi";
     std::string heroName = "Hiroshi";
@@ -2922,14 +3013,16 @@ struct SaveSnapshot {
 } g_memorySave, g_autoSave;
 
 static const char* SAVE_FILE_PATH = "/data/aooni_save.dat";
-static const uint32_t SAVE_MAGIC = 0x414F4E35; // "AON5"
+static const uint32_t SAVE_MAGIC = 0x414F4E36; // "AON6"
 
 static void captureSnapshot(SaveSnapshot& snap) {
     snap.valid = true;
+    snap.versionMagic = SAVE_MAGIC;
     memcpy(snap.switches, g_game.switches, sizeof(g_game.switches));
     memcpy(snap.variables, g_game.variables, sizeof(g_game.variables));
     snap.selfSwitches = g_game.selfSwitches;
     snap.inventory = g_game.inventory;
+    snap.partyActors = g_game.partyActors;
     snap.mapId = g_game.mapId;
     snap.playerX = g_game.playerX;
     snap.playerY = g_game.playerY;
@@ -2979,6 +3072,11 @@ static bool writeSnapshotToDisk(const SaveSnapshot& snap, const char* path) {
         fwrite(&kv.first, 4, 1, f);
         fwrite(&kv.second, 4, 1, f);
     }
+    uint32_t paCount = (uint32_t)snap.partyActors.size();
+    fwrite(&paCount, 4, 1, f);
+    for (int aid : snap.partyActors) {
+        fwrite(&aid, 4, 1, f);
+    }
     fclose(f);
     return true;
 }
@@ -2987,7 +3085,8 @@ static bool readSnapshotFromDisk(SaveSnapshot& snap, const char* path) {
     FILE* f = fopen(path, "rb");
     if (!f) return false;
     uint32_t magic = 0;
-    if (fread(&magic, 4, 1, f) != 1 || (magic != SAVE_MAGIC && magic != 0x414F4E34)) { fclose(f); return false; }
+    if (fread(&magic, 4, 1, f) != 1 || (magic != SAVE_MAGIC && magic != 0x414F4E35 && magic != 0x414F4E34)) { fclose(f); return false; }
+    snap.versionMagic = magic;
     fread(snap.switches, sizeof(snap.switches), 1, f);
     fread(snap.variables, sizeof(snap.variables), 1, f);
     fread(&snap.mapId, 4, 1, f);
@@ -3003,7 +3102,7 @@ static bool readSnapshotFromDisk(SaveSnapshot& snap, const char* path) {
     fread(&pcLen, 2, 1, f);
     snap.playerChar.assign(pcLen, '\0');
     if (pcLen > 0) fread(&snap.playerChar[0], 1, pcLen, f);
-    if (magic == SAVE_MAGIC) {
+    if (magic >= 0x414F4E35) {
         uint16_t hnLen = 0;
         fread(&hnLen, 2, 1, f);
         snap.heroName.assign(hnLen, '\0');
@@ -3030,6 +3129,17 @@ static bool readSnapshotFromDisk(SaveSnapshot& snap, const char* path) {
         if (fread(&id, 4, 1, f) != 1 || fread(&qty, 4, 1, f) != 1) break;
         snap.inventory[id] = qty;
     }
+    snap.partyActors.clear();
+    if (magic >= 0x414F4E36) {
+        uint32_t paCount = 0;
+        if (fread(&paCount, 4, 1, f) == 1) {
+            for (uint32_t i = 0; i < paCount && i < 32; i++) {
+                int aid = 0;
+                if (fread(&aid, 4, 1, f) != 1) break;
+                if (aid > 0) snap.partyActors.push_back(aid);
+            }
+        }
+    }
     fclose(f);
     snap.valid = true;
     return true;
@@ -3052,7 +3162,21 @@ static bool restoreFromSnapshot(const SaveSnapshot& snap) {
     memcpy(g_game.variables, snap.variables, sizeof(g_game.variables));
     g_game.selfSwitches = snap.selfSwitches;
     g_game.inventory = snap.inventory;
+    if (!snap.partyActors.empty()) {
+        g_game.partyActors = snap.partyActors;
+    } else {
+        g_game.partyActors = (snap.mapId == 75) ? g_game.startingParty : std::vector<int>{ g_game.switches[76] ? 3 : 2 };
+    }
     g_game.playerChar = snap.playerChar;
+    // Reparar guardados antiguos (< AON6) afectados por el bug de cmd 129 que sobrescribia playerChar con "takurou"
+    if (g_game.playerChar == "takurou" || (snap.versionMagic < SAVE_MAGIC && g_game.playerChar != "puzzle_player")) {
+        std::string leader = resolveLeaderPartyChar();
+        if (!leader.empty()) {
+            g_game.playerChar = leader;
+        } else if (g_game.playerChar == "takurou") {
+            g_game.playerChar = g_game.switches[76] ? "hirosi_s" : "hirosi";
+        }
+    }
     g_game.actorNames[2] = snap.heroName.empty() ? "Hiroshi" : snap.heroName;
     g_game.playerTransparent = snap.playerTransparent;
     g_game.toneR = snap.toneR;
@@ -3099,7 +3223,8 @@ static void resetNewGame() {
     g_game.selfSwitches.clear();
     g_game.inventory.clear();
     for (int i = 0; i < 52; i++) g_game.pictures[i].active = false;
-    g_game.playerChar = "hirosi";
+    g_game.partyActors = g_game.startingParty;
+    g_game.playerChar = resolveLeaderPartyChar();
     g_game.actorNames[2] = "Hiroshi";
     g_game.playerTransparent = true;
     g_game.playerThrough = false;
@@ -3395,7 +3520,7 @@ int main(int argc, char* argv[]) {
                 // Latido háptico en el mando cuando Ao Oni está a <= 4 casillas de Hiroshi
                 if (frame % 26 == 0 && g_rumbleFrames <= 0) {
                     for (const auto& mev : g_game.events) {
-                        if (mev.activePage >= 0 && (mev.collisionAttack || mev.char_name.rfind("ao", 0) == 0)) {
+                        if (isAoOniLethalEvent(mev)) {
                             int dist = std::abs(mev.x - g_game.playerX) + std::abs(mev.y - g_game.playerY);
                             if (dist <= 4) {
                                 uint8_t str = (uint8_t)std::min(190, (5 - dist) * 45);
@@ -3913,7 +4038,8 @@ int main(int argc, char* argv[]) {
                     g_game.playerTransparent = false;
                 }
                 if (g_game.playerChar.empty()) {
-                    g_game.playerChar = "hirosi";
+                    std::string leader = resolveLeaderPartyChar();
+                    g_game.playerChar = !leader.empty() ? leader : (g_game.switches[76] ? "hirosi_s" : "hirosi");
                 }
             }
             bool holdingMoveInput = canManualMove && (dpadUp || dpadDown || dpadLeft || dpadRight);
@@ -3945,7 +4071,7 @@ int main(int argc, char* argv[]) {
                     for (const auto& mev : g_game.events) {
                         if (mev.activePage < 0) continue;
                         if (mev.x == nx && mev.y == ny) {
-                            if (mev.collisionAttack || mev.char_name.rfind("ao", 0) == 0) {
+                            if (isAoOniLethalEvent(mev)) {
                                 if (mev.routeWaitFrames <= 0 && !g_game.playerTransparent) {
                                     triggerPlayerDeathByAoOni();
                                     break;
@@ -4003,7 +4129,7 @@ int main(int argc, char* argv[]) {
                     if (mev.activePage < 0) continue;
                     const auto& pg = mev.pages[mev.activePage];
                     if (mev.x == g_game.playerX && mev.y == g_game.playerY) {
-                        if (mev.collisionAttack || mev.char_name.rfind("ao", 0) == 0) {
+                        if (isAoOniLethalEvent(mev)) {
                             if (mev.routeWaitFrames <= 0 && !g_game.playerTransparent) {
                                 triggerPlayerDeathByAoOni();
                                 break;
@@ -4427,22 +4553,35 @@ int main(int argc, char* argv[]) {
                 }
             }
 
-            // 8) Cuadro de introducción de código numérico (cmd 103 - Cajas fuertes)
+            // 8) Cuadro de introducción de código numérico compacto (cmd 103 - Cajas fuertes / Paneles)
             if (g_game.numInputActive) {
-                int bw = g_game.numInputDigits * 44 + 40;
-                int bh = 76;
+                const int cellW = 24;
+                const int padX = 14;
+                int bw = g_game.numInputDigits * cellW + padX * 2;
+                int bh = 44;
                 int bx = offX + (GAME_W - bw) / 2;
-                int by = offY + (GAME_H - bh) / 2;
-                fillRectFast(gameSurf, bx, by, bw, bh, 18, 28, 78, 245);
-                drawRectFast(gameSurf, bx, by, bw, bh, 230, 230, 255);
+                int by = (g_game.msgPos == 0) ? (offY + 24)
+                       : ((g_game.msgPos == 1) ? (offY + (GAME_H - bh) / 2)
+                       : (offY + GAME_H - bh - 24));
+                fillRectFast(gameSurf, bx, by, bw, bh, 18, 28, 78, 240);
+                drawRectFast(gameSurf, bx, by, bw, bh, 225, 232, 255);
                 for (int d = 0; d < g_game.numInputDigits; d++) {
-                    int dx = bx + 20 + d * 44;
+                    int slotX = bx + padX + d * cellW;
+                    int dx = slotX + 4;
                     if (d == g_game.numInputCursor) {
-                        fillRectFast(gameSurf, dx - 4, by + 18, 32, 40, 70, 105, 190);
+                        fillRectFast(gameSurf, slotX + 1, by + 9, cellW - 2, 26, 65, 100, 185);
+                        drawRectFast(gameSurf, slotX + 1, by + 9, cellW - 2, 26, 255, 235, 140);
+                        int cx = slotX + cellW / 2;
+                        fillRectFast(gameSurf, cx, by + 3, 1, 2, 255, 235, 140);
+                        fillRectFast(gameSurf, cx - 1, by + 5, 3, 2, 255, 235, 140);
+                        fillRectFast(gameSurf, cx - 2, by + 7, 5, 1, 255, 235, 140);
+                        fillRectFast(gameSurf, cx - 2, by + 36, 5, 1, 255, 235, 140);
+                        fillRectFast(gameSurf, cx - 1, by + 37, 3, 2, 255, 235, 140);
+                        fillRectFast(gameSurf, cx, by + 39, 1, 2, 255, 235, 140);
                     }
                     char digStr[4];
                     snprintf(digStr, sizeof(digStr), "%d", g_game.numInputVals[d]);
-                    drawText(gameSurf, dx, by + 26, digStr, 3, 255, 255, 255);
+                    drawText(gameSurf, dx, by + 14, digStr, 2, 255, 255, 255);
                 }
             }
 
