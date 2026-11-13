@@ -630,83 +630,215 @@ static void* audioThreadFunc(void*) {
     return nullptr;
 }
 
-// ==================== FUENTE BITMAP Y RENDERIZADO DIRECTO ULTRARRÁPIDO ====================
-static const uint8_t FONT8X8[96][8] = {
-    {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},{0x18,0x3C,0x3C,0x18,0x18,0x00,0x18,0x00},
-    {0x36,0x36,0x00,0x00,0x00,0x00,0x00,0x00},{0x36,0x36,0x7F,0x36,0x7F,0x36,0x36,0x00},
-    {0x0C,0x3E,0x03,0x1E,0x30,0x1F,0x0C,0x00},{0x00,0x63,0x33,0x18,0x0C,0x66,0x63,0x00},
-    {0x1C,0x36,0x1C,0x6E,0x3B,0x33,0x6E,0x00},{0x06,0x06,0x03,0x00,0x00,0x00,0x00,0x00},
-    {0x18,0x0C,0x06,0x06,0x06,0x0C,0x18,0x00},{0x06,0x0C,0x18,0x18,0x18,0x0C,0x06,0x00},
-    {0x00,0x66,0x3C,0xFF,0x3C,0x66,0x00,0x00},{0x00,0x0C,0x0C,0x3F,0x0C,0x0C,0x00,0x00},
-    {0x00,0x00,0x00,0x00,0x00,0x0C,0x0C,0x06},{0x00,0x00,0x00,0x3F,0x00,0x00,0x00,0x00},
-    {0x00,0x00,0x00,0x00,0x00,0x0C,0x0C,0x00},{0x60,0x30,0x18,0x0C,0x06,0x03,0x01,0x00},
-    {0x3E,0x63,0x73,0x7B,0x6F,0x67,0x3E,0x00},{0x0C,0x0E,0x0C,0x0C,0x0C,0x0C,0x3F,0x00},
-    {0x1E,0x33,0x30,0x1C,0x06,0x33,0x3F,0x00},{0x1E,0x33,0x30,0x1C,0x30,0x33,0x1E,0x00},
-    {0x38,0x3C,0x36,0x33,0x7F,0x30,0x78,0x00},{0x3F,0x03,0x1F,0x30,0x30,0x33,0x1E,0x00},
-    {0x1C,0x06,0x03,0x1F,0x33,0x33,0x1E,0x00},{0x3F,0x33,0x30,0x18,0x0C,0x0C,0x0C,0x00},
-    {0x1E,0x33,0x33,0x1E,0x33,0x33,0x1E,0x00},{0x1E,0x33,0x33,0x3E,0x30,0x18,0x0E,0x00},
-    {0x00,0x0C,0x0C,0x00,0x00,0x0C,0x0C,0x00},{0x00,0x0C,0x0C,0x00,0x00,0x0C,0x0C,0x06},
-    {0x18,0x0C,0x06,0x03,0x06,0x0C,0x18,0x00},{0x00,0x00,0x3F,0x00,0x00,0x3F,0x00,0x00},
-    {0x06,0x0C,0x18,0x30,0x18,0x0C,0x06,0x00},{0x1E,0x33,0x30,0x18,0x0C,0x00,0x0C,0x00},
-    {0x3E,0x63,0x7B,0x7B,0x7B,0x03,0x1E,0x00},{0x0C,0x1E,0x33,0x33,0x3F,0x33,0x33,0x00},
-    {0x3F,0x66,0x66,0x3E,0x66,0x66,0x3F,0x00},{0x3C,0x66,0x03,0x03,0x03,0x66,0x3C,0x00},
-    {0x1F,0x36,0x66,0x66,0x66,0x36,0x1F,0x00},{0x7F,0x46,0x16,0x1E,0x16,0x46,0x7F,0x00},
-    {0x7F,0x46,0x16,0x1E,0x16,0x06,0x0F,0x00},{0x3C,0x66,0x03,0x03,0x73,0x66,0x7C,0x00},
-    {0x33,0x33,0x33,0x3F,0x33,0x33,0x33,0x00},{0x1E,0x0C,0x0C,0x0C,0x0C,0x0C,0x1E,0x00},
-    {0x78,0x30,0x30,0x30,0x33,0x33,0x1E,0x00},{0x67,0x66,0x36,0x1E,0x36,0x66,0x67,0x00},
-    {0x0F,0x06,0x06,0x06,0x46,0x66,0x7F,0x00},{0x63,0x77,0x7F,0x7F,0x6B,0x63,0x63,0x00},
-    {0x63,0x67,0x6F,0x7B,0x73,0x63,0x63,0x00},{0x1C,0x36,0x63,0x63,0x63,0x36,0x1C,0x00},
-    {0x3F,0x66,0x66,0x3E,0x06,0x06,0x0F,0x00},{0x1E,0x33,0x33,0x33,0x3B,0x1E,0x38,0x00},
-    {0x3F,0x66,0x66,0x3E,0x36,0x66,0x67,0x00},{0x1E,0x33,0x07,0x0E,0x38,0x33,0x1E,0x00},
-    {0x3F,0x2D,0x0C,0x0C,0x0C,0x0C,0x1E,0x00},{0x33,0x33,0x33,0x33,0x33,0x33,0x3F,0x00},
-    {0x33,0x33,0x33,0x33,0x33,0x1E,0x0C,0x00},{0x63,0x63,0x63,0x6B,0x7F,0x77,0x63,0x00},
-    {0x63,0x63,0x36,0x1C,0x1C,0x36,0x63,0x00},{0x33,0x33,0x33,0x1E,0x0C,0x0C,0x1E,0x00},
-    {0x7F,0x63,0x31,0x18,0x4C,0x66,0x7F,0x00},{0x1E,0x06,0x06,0x06,0x06,0x06,0x1E,0x00},
-    {0x03,0x06,0x0C,0x18,0x30,0x60,0x40,0x00},{0x1E,0x18,0x18,0x18,0x18,0x18,0x1E,0x00},
-    {0x08,0x1C,0x36,0x63,0x00,0x00,0x00,0x00},{0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xFF},
-    {0x0C,0x0C,0x18,0x00,0x00,0x00,0x00,0x00},{0x00,0x00,0x1E,0x30,0x3E,0x33,0x6E,0x00},
-    {0x07,0x06,0x06,0x3E,0x66,0x66,0x3B,0x00},{0x00,0x00,0x1E,0x33,0x03,0x33,0x1E,0x00},
-    {0x38,0x30,0x30,0x3e,0x33,0x33,0x6E,0x00},{0x00,0x00,0x1E,0x33,0x3f,0x03,0x1E,0x00},
-    {0x1C,0x36,0x06,0x0f,0x06,0x06,0x0F,0x00},{0x00,0x00,0x6E,0x33,0x33,0x3E,0x30,0x1F},
-    {0x07,0x06,0x36,0x6E,0x66,0x66,0x67,0x00},{0x0C,0x00,0x0E,0x0C,0x0C,0x0C,0x1E,0x00},
-    {0x30,0x00,0x30,0x30,0x30,0x33,0x33,0x1E},{0x07,0x06,0x66,0x36,0x1E,0x36,0x67,0x00},
-    {0x0E,0x0C,0x0C,0x0C,0x0C,0x0C,0x1E,0x00},{0x00,0x00,0x33,0x7F,0x7F,0x6B,0x63,0x00},
-    {0x00,0x00,0x1F,0x33,0x33,0x33,0x33,0x00},{0x00,0x00,0x1E,0x33,0x33,0x33,0x1E,0x00},
-    {0x00,0x00,0x3B,0x66,0x66,0x3E,0x06,0x0F},{0x00,0x00,0x6E,0x33,0x33,0x3E,0x30,0x78},
-    {0x00,0x00,0x3B,0x6E,0x66,0x06,0x0F,0x00},{0x00,0x00,0x3E,0x03,0x1E,0x30,0x1F,0x00},
-    {0x08,0x0C,0x3E,0x0C,0x0C,0x2C,0x18,0x00},{0x00,0x00,0x33,0x33,0x33,0x33,0x6E,0x00},
-    {0x00,0x00,0x33,0x33,0x33,0x1E,0x0C,0x00},{0x00,0x00,0x63,0x6B,0x7F,0x7F,0x36,0x00},
-    {0x00,0x00,0x63,0x36,0x1C,0x36,0x63,0x00},{0x00,0x00,0x33,0x33,0x33,0x3E,0x30,0x1F},
-    {0x00,0x00,0x3F,0x19,0x0C,0x26,0x3F,0x00},{0x38,0x0C,0x0C,0x07,0x0C,0x0C,0x38,0x00},
-    {0x18,0x18,0x18,0x00,0x18,0x18,0x18,0x00},{0x07,0x0C,0x0C,0x38,0x0C,0x0C,0x07,0x00},
-    {0x6E,0x3B,0x00,0x00,0x00,0x00,0x00,0x00},{0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}
-};
+// ==================== FUENTE PROPORCIONAL ESPAÑOLA Y RENDERIZADO DIRECTO ULTRARRÁPIDO ====================
+#include "font_prop18.h"
 
-static std::string utf8ToAscii(const std::string& in) {
+static std::string normalizeUtf8Text(const std::string& in) {
     std::string out;
     out.reserve(in.size());
     for (size_t i = 0; i < in.size(); i++) {
         unsigned char c = (unsigned char)in[i];
-        if (c == 0xC3 && i + 1 < in.size()) {
-            unsigned char c2 = (unsigned char)in[++i];
-            switch (c2) {
-                case 0xA1: out += 'a'; break; case 0xA9: out += 'e'; break;
-                case 0xAD: out += 'i'; break; case 0xB3: out += 'o'; break;
-                case 0xBA: case 0xBC: out += 'u'; break; case 0xB1: out += 'n'; break;
-                case 0x81: out += 'A'; break; case 0x89: out += 'E'; break;
-                case 0x8D: out += 'I'; break; case 0x93: out += 'O'; break;
-                case 0x9A: case 0x9C: out += 'U'; break; case 0x91: out += 'N'; break;
-                default: out += '?'; break;
-            }
-        } else if (c == 0xC2 && i + 1 < in.size()) {
-            unsigned char c2 = (unsigned char)in[++i];
-            if (c2 == 0xBF) out += '?';
-            else if (c2 == 0xA1) out += '!';
-        } else if (c < 128) {
-            out.push_back((char)c);
+        // Normalizar puntos suspensivos Unicode (U+2026: E2 80 A6) -> "..."
+        if (c == 0xE2 && i + 2 < in.size() && (unsigned char)in[i + 1] == 0x80 && (unsigned char)in[i + 2] == 0xA6) {
+            out += "...";
+            i += 2;
+            continue;
         }
+        // Flecha Unicode (U+2192: E2 86 92) -> "->"
+        if (c == 0xE2 && i + 2 < in.size() && (unsigned char)in[i + 1] == 0x86 && (unsigned char)in[i + 2] == 0x92) {
+            out += "->";
+            i += 2;
+            continue;
+        }
+        // Digitos fullwidth (U+FF10..U+FF19: EF BC 90..99)
+        if (c == 0xEF && i + 2 < in.size() && (unsigned char)in[i + 1] == 0xBC) {
+            unsigned char c3 = (unsigned char)in[i + 2];
+            if (c3 >= 0x90 && c3 <= 0x99) {
+                out.push_back((char)('0' + (c3 - 0x90)));
+                i += 2;
+                continue;
+            }
+        }
+        out.push_back((char)c);
     }
     return out;
+}
+
+// Decodifica el siguiente punto de codigo UTF-8 a indice de FONT18 (0..110), o -1 si es '\n'. Avanza i al final del caracter.
+static int decodeNextUtf8Glyph(const std::string& s, size_t& i) {
+    if (i >= s.size()) return 0;
+    unsigned char c = (unsigned char)s[i++];
+    if (c == '\n') return -1;
+    if (c == '\r' || c == '\t') return 0;
+    if (c < 128) {
+        if (c >= 32 && c <= 126) return (int)(c - 32);
+        return (int)('?' - 32);
+    }
+    if (c == 0xC3 && i < s.size()) {
+        unsigned char c2 = (unsigned char)s[i++];
+        switch (c2) {
+            case 0xA1: return 95;  // á
+            case 0xA9: return 96;  // é
+            case 0xAD: return 97;  // í
+            case 0xB3: return 98;  // ó
+            case 0xBA: return 99;  // ú
+            case 0xBC: return 100; // ü
+            case 0xB1: return 101; // ñ
+            case 0x81: return 102; // Á
+            case 0x89: return 103; // É
+            case 0x8D: return 104; // Í
+            case 0x93: return 105; // Ó
+            case 0x9A: return 106; // Ú
+            case 0x9C: return 107; // Ü
+            case 0x91: return 108; // Ñ
+            case 0xA0: case 0xA2: case 0xA4: return (int)('a' - 32);
+            case 0xA8: case 0xAA: case 0xAB: return (int)('e' - 32);
+            case 0xAC: case 0xAE: case 0xAF: return (int)('i' - 32);
+            case 0xB2: case 0xB4: case 0xB6: return (int)('o' - 32);
+            case 0xB9: case 0xBB: return (int)('u' - 32);
+            default: return (int)('?' - 32);
+        }
+    }
+    if (c == 0xC2 && i < s.size()) {
+        unsigned char c2 = (unsigned char)s[i++];
+        if (c2 == 0xBF) return 109; // ¿
+        if (c2 == 0xA1) return 110; // ¡
+        return (int)(' ' - 32);
+    }
+    // Saltar cualquier byte de continuacion UTF-8 restante (0x80..0xBF)
+    while (i < s.size() && (((unsigned char)s[i] & 0xC0) == 0x80)) i++;
+    return (int)('?' - 32);
+}
+
+static inline int glyphAdvancePx(int gidx, int scale) {
+    if (gidx < 0 || gidx >= FONT18_COUNT) gidx = (int)('?' - 32);
+    if (scale == 2) return FONT18_ADV[gidx];
+    return std::max(1, (FONT18_ADV[gidx] * scale + 1) / 2);
+}
+
+static int measureTextWidth(const std::string& raw, int scale) {
+    std::string s = normalizeUtf8Text(raw);
+    int maxW = 0, curW = 0;
+    size_t i = 0;
+    while (i < s.size()) {
+        int g = decodeNextUtf8Glyph(s, i);
+        if (g < 0) {
+            if (curW > maxW) maxW = curW;
+            curW = 0;
+            continue;
+        }
+        curW += glyphAdvancePx(g, scale);
+    }
+    return std::max(maxW, curW);
+}
+
+// Ajusta el texto por ancho exacto en pixeles respetando saltos '\n' existentes
+static std::string wrapTextToWidth(const std::string& raw, int maxWidthPx, int scale = 2) {
+    if (maxWidthPx <= 16) return normalizeUtf8Text(raw);
+    std::string s = normalizeUtf8Text(raw);
+    std::string result;
+    result.reserve(s.size() + 16);
+
+    size_t start = 0;
+    while (start <= s.size()) {
+        size_t nl = s.find('\n', start);
+        std::string para = (nl == std::string::npos) ? s.substr(start) : s.substr(start, nl - start);
+        if (!result.empty() || start > 0) {
+            if (start > 0) result.push_back('\n');
+        }
+
+        // Tokenizar palabras conservando espacios al inicio de parrafo y partiendo palabras si exceden maxWidthPx
+        size_t pos = 0;
+        std::string curLine;
+        int curW = 0;
+        while (pos < para.size()) {
+            // Leer espacios antes de palabra
+            std::string spaces;
+            int spacesW = 0;
+            while (pos < para.size() && para[pos] == ' ') {
+                spaces.push_back(' ');
+                spacesW += glyphAdvancePx(0, scale);
+                pos++;
+            }
+            // Leer palabra siguiente hasta espacio
+            size_t wStart = pos;
+            int wordW = 0;
+            while (pos < para.size() && para[pos] != ' ') {
+                size_t nextI = pos;
+                int g = decodeNextUtf8Glyph(para, nextI);
+                wordW += glyphAdvancePx(g, scale);
+                pos = nextI;
+            }
+            std::string word = para.substr(wStart, pos - wStart);
+
+            if (word.empty()) {
+                if (curLine.empty() && !spaces.empty()) {
+                    if (spacesW <= maxWidthPx) { curLine += spaces; curW += spacesW; }
+                }
+                break;
+            }
+
+            if (curLine.empty()) {
+                int leadW = spacesW + wordW;
+                if (leadW <= maxWidthPx) {
+                    curLine = spaces + word;
+                    curW = leadW;
+                } else {
+                    // Palabra mas larga que toda la linea: partir por glifos
+                    size_t wi = 0;
+                    while (wi < word.size()) {
+                        size_t nextI = wi;
+                        int g = decodeNextUtf8Glyph(word, nextI);
+                        int adv = glyphAdvancePx(g, scale);
+                        if (!curLine.empty() && curW + adv > maxWidthPx) {
+                            result += curLine;
+                            result.push_back('\n');
+                            curLine.clear();
+                            curW = 0;
+                        }
+                        curLine.append(word, wi, nextI - wi);
+                        curW += adv;
+                        wi = nextI;
+                    }
+                }
+            } else {
+                if (curW + spacesW + wordW <= maxWidthPx) {
+                    curLine += spaces + word;
+                    curW += spacesW + wordW;
+                } else {
+                    result += curLine;
+                    result.push_back('\n');
+                    curLine.clear();
+                    curW = 0;
+                    if (wordW <= maxWidthPx) {
+                        curLine = word;
+                        curW = wordW;
+                    } else {
+                        size_t wi = 0;
+                        while (wi < word.size()) {
+                            size_t nextI = wi;
+                            int g = decodeNextUtf8Glyph(word, nextI);
+                            int adv = glyphAdvancePx(g, scale);
+                            if (!curLine.empty() && curW + adv > maxWidthPx) {
+                                result += curLine;
+                                result.push_back('\n');
+                                curLine.clear();
+                                curW = 0;
+                            }
+                            curLine.append(word, wi, nextI - wi);
+                            curW += adv;
+                            wi = nextI;
+                        }
+                    }
+                }
+            }
+        }
+        result += curLine;
+
+        if (nl == std::string::npos) break;
+        start = nl + 1;
+    }
+    return result;
 }
 
 // PS4 sceVideoOut usa formato A8B8G8R8Srgb (en little-endian: byte0=R, byte1=G, byte2=B, byte3=A)
@@ -791,41 +923,92 @@ static inline void drawRectFast(SDL_Surface* dst, int rx, int ry, int rw, int rh
     fillRectFast(dst, rx + rw - 2, ry, 2, rh, r, g, b);
 }
 
-static inline void drawCharFast(SDL_Surface* dst, int x, int y, char c, int scale, uint8_t cr, uint8_t cg, uint8_t cb) {
-    int idx = (unsigned char)c;
-    if (idx < 32 || idx > 127) idx = '?';
-    const uint8_t* glyph = FONT8X8[idx - 32];
-    uint32_t col = packWinPixel(cr, cg, cb);
+static inline void blendGlyphPixel(uint32_t* drow, int px, uint8_t cr, uint8_t cg, uint8_t cb, uint8_t a) {
+    if (a >= 250) {
+        drow[px] = packWinPixel(cr, cg, cb);
+        return;
+    }
+    uint32_t dst = drow[px];
+    uint32_t dr = dst & 0xFFu;
+    uint32_t dg = (dst >> 8) & 0xFFu;
+    uint32_t db = (dst >> 16) & 0xFFu;
+    uint32_t inv = 255u - (uint32_t)a;
+    uint8_t nr = (uint8_t)((dr * inv + (uint32_t)cr * a) / 255u);
+    uint8_t ng = (uint8_t)((dg * inv + (uint32_t)cg * a) / 255u);
+    uint8_t nb = (uint8_t)((db * inv + (uint32_t)cb * a) / 255u);
+    drow[px] = packWinPixel(nr, ng, nb);
+}
 
-    for (int row = 0; row < 8; row++) {
-        uint8_t bits = glyph[row];
-        if (!bits) continue;
-        for (int sy = 0; sy < scale; sy++) {
-            int py = y + row * scale + sy;
+static inline void drawChar18Scaled(SDL_Surface* dst, int x, int y, int gidx, int scale, uint8_t cr, uint8_t cg, uint8_t cb) {
+    if (gidx < 0 || gidx >= FONT18_COUNT) gidx = (int)('?' - 32);
+    int gw = FONT18_GW[gidx];
+    if (gw <= 0) return;
+
+    if (scale == 2) {
+        for (int row = 0; row < FONT18_H; row++) {
+            int py = y + row;
             if (py < 0 || py >= dst->h) continue;
             uint32_t* drow = (uint32_t*)((uint8_t*)dst->pixels + py * dst->pitch);
-            for (int colBit = 0; colBit < 8; colBit++) {
-                if (bits & (1 << colBit)) {
-                    int px0 = x + colBit * scale;
-                    for (int sx = 0; sx < scale; sx++) {
-                        int px = px0 + sx;
-                        if (px >= 0 && px < dst->w) drow[px] = col;
-                    }
-                }
+            const uint8_t* rbytes = FONT18_AA[gidx][row];
+            for (int col = 0; col < gw; col++) {
+                int px = x + col;
+                if (px < 0 || px >= dst->w) continue;
+                uint8_t b = rbytes[col >> 1];
+                uint8_t niv = (col & 1) ? (b & 0x0Fu) : (b >> 4);
+                if (niv > 0) blendGlyphPixel(drow, px, cr, cg, cb, (uint8_t)(niv * 17));
             }
+        }
+        return;
+    }
+
+    int sw = std::max(1, (gw * scale + 1) / 2);
+    int sh = std::max(1, (FONT18_H * scale + 1) / 2);
+    for (int dy = 0; dy < sh; dy++) {
+        int py = y + dy;
+        if (py < 0 || py >= dst->h) continue;
+        int sy = std::min(FONT18_H - 1, (dy * 2) / std::max(1, scale));
+        uint32_t* drow = (uint32_t*)((uint8_t*)dst->pixels + py * dst->pitch);
+        const uint8_t* rbytes = FONT18_AA[gidx][sy];
+        for (int dx = 0; dx < sw; dx++) {
+            int px = x + dx;
+            if (px < 0 || px >= dst->w) continue;
+            int sx = std::min(gw - 1, (dx * 2) / std::max(1, scale));
+            uint8_t b = rbytes[sx >> 1];
+            uint8_t niv = (sx & 1) ? (b & 0x0Fu) : (b >> 4);
+            if (niv > 0) blendGlyphPixel(drow, px, cr, cg, cb, (uint8_t)(niv * 17));
+        }
+    }
+}
+
+static void drawTextLineStep(SDL_Surface* dst, int x, int y, const std::string& raw, int scale, int lineStep, uint8_t cr, uint8_t cg, uint8_t cb) {
+    if (!dst || raw.empty()) return;
+    std::string s = normalizeUtf8Text(raw);
+    int shOff = (scale >= 3) ? 2 : 1;
+    int stepY = (lineStep > 0) ? lineStep : ((scale == 2) ? 21 : std::max(10, (FONT18_H * scale + 1) / 2));
+
+    // Dos pasadas para que la sombra del siguiente glifo nunca ensombrezca el borde suavizado del anterior
+    for (int pass = 0; pass < 2; pass++) {
+        int cx = x + (pass == 0 ? shOff : 0);
+        int cy = y + (pass == 0 ? shOff : 0);
+        uint8_t pr = (pass == 0) ? 0 : cr;
+        uint8_t pg = (pass == 0) ? 0 : cg;
+        uint8_t pb = (pass == 0) ? 0 : cb;
+        size_t i = 0;
+        while (i < s.size()) {
+            int g = decodeNextUtf8Glyph(s, i);
+            if (g < 0) {
+                cy += stepY;
+                cx = x + (pass == 0 ? shOff : 0);
+                continue;
+            }
+            drawChar18Scaled(dst, cx, cy, g, scale, pr, pg, pb);
+            cx += glyphAdvancePx(g, scale);
         }
     }
 }
 
 static void drawText(SDL_Surface* dst, int x, int y, const std::string& raw, int scale, uint8_t cr, uint8_t cg, uint8_t cb) {
-    std::string s = utf8ToAscii(raw);
-    int cx = x;
-    for (size_t i = 0; i < s.size(); i++) {
-        if (s[i] == '\n') { y += 11 * scale; cx = x; continue; }
-        drawCharFast(dst, cx + scale, y + scale, s[i], scale, 0, 0, 0);
-        drawCharFast(dst, cx, y, s[i], scale, cr, cg, cb);
-        cx += 8 * scale;
-    }
+    drawTextLineStep(dst, x, y, raw, scale, 0, cr, cg, cb);
 }
 
 // Cache global de superficies cargadas con stb_image
@@ -2443,6 +2626,13 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                     ip++;
                 }
                 formatDialogText(lines, g_game.msgFace, g_game.msgSpeaker, g_game.msgText);
+                int msgTextRelX = 32;
+                if (!g_game.msgFace.empty()) {
+                    SDL_Surface* faceSurf = getSurf(std::string("/app0/assets/images/pic_") + g_game.msgFace + ".png");
+                    if (faceSurf) msgTextRelX = 26 + faceSurf->w + 14;
+                }
+                int maxMsgW = (GAME_W - 30) - msgTextRelX;
+                g_game.msgText = wrapTextToWidth(g_game.msgText, maxMsgW, 2);
                 g_game.msgCharReveal = 0;
                 g_game.msgActive = true;
                 if (ip < list.a.size() && list[ip].get("c").asInt(0) == 102) {
@@ -4763,9 +4953,13 @@ int main(int argc, char* argv[]) {
                 SDL_Rect dst = { offX, offY, GAME_W, GAME_H };
                 blitSurf(titleSurf, NULL, gameSurf, &dst);
             }
-            drawText(gameSurf, offX + 140, offY + 56, "AO ONI - PS4 PORT", 3, 220, 220, 255);
-            drawText(gameSurf, offX + 92, offY + 90, "Edicion 1:1 PS4 / PS4 Pro 4K  (60 FPS)", 2, 160, 195, 255);
-            drawText(gameSurf, offX + 200, offY + 114, "Port by Outbreak2012", 2, 255, 225, 130);
+            auto drawCentered = [&](int cy, const std::string& txt, int sc, uint8_t cr, uint8_t cg, uint8_t cb) {
+                int tx = offX + std::max(8, (GAME_W - measureTextWidth(txt, sc)) / 2);
+                drawText(gameSurf, tx, cy, txt, sc, cr, cg, cb);
+            };
+            drawCentered(offY + 54, "AO ONI - PS4 PORT", 3, 220, 220, 255);
+            drawCentered(offY + 90, "Edici\xC3\xB3n 1:1 PS4 / PS4 Pro 4K  (60 FPS)", 2, 160, 195, 255);
+            drawCentered(offY + 114, "Port by Outbreak2012", 2, 255, 225, 130);
 
             drawWindowBox(gameSurf, offX + 130, offY + 146, 395, 186, 230);
 
@@ -4778,7 +4972,7 @@ int main(int argc, char* argv[]) {
                     fillRectFast(gameSurf, offX + 140, offY + 156 + i * 42, 375, 32, 60, 90, 160, 210);
                 }
                 uint8_t tc = (i == 1 && !hasSave) ? 120 : 255;
-                drawText(gameSurf, offX + 150, offY + 164 + i * 42, opts[i], 2, tc, tc, tc);
+                drawText(gameSurf, offX + 150, offY + 163 + i * 42, opts[i], 2, tc, tc, tc);
             }
             if (aooniSurf) {
                 int cw = aooniSurf->w / 4, ch = aooniSurf->h / 4;
@@ -4786,33 +4980,38 @@ int main(int argc, char* argv[]) {
                 SDL_Rect dst = { offX + 24, offY + 188, cw * 2, ch * 2 };
                 blitSurf(aooniSurf, &src, gameSurf, &dst);
             }
-            drawText(gameSurf, offX + 16, offY + 412, "X: Aceptar | R2: Resolucion | L2: Aspecto | 60 FPS", 2, 190, 205, 235);
-            drawText(gameSurf, offX + 16, offY + 438, "L1/R1: Correr | []: Guardar | TOUCHPAD: Brillo ON/OFF", 2, 165, 180, 215);
+            drawCentered(offY + 412, "X: Aceptar | R2: Resoluci\xC3\xB3n | L2: Aspecto | 60 FPS", 2, 190, 205, 235);
+            drawCentered(offY + 438, "L1/R1: Correr | []: Guardar | TOUCHPAD: Brillo ON/OFF", 2, 165, 180, 215);
         } else if (state == STATE_GAMEOVER) {
             if (goSurf) {
                 SDL_Rect dst = { offX, offY, GAME_W, GAME_H };
                 blitSurf(goSurf, NULL, gameSurf, &dst);
             } else {
-                drawText(gameSurf, offX + 200, offY + 210, "GAME OVER", 4, 220, 40, 40);
+                int goX = offX + std::max(8, (GAME_W - measureTextWidth("GAME OVER", 4)) / 2);
+                drawText(gameSurf, goX, offY + 210, "GAME OVER", 4, 220, 40, 40);
             }
             if (g_autoSave.valid || g_memorySave.valid) {
-                drawText(gameSurf, offX + 64, offY + 424, "X: Reintentar desde ultima sala | Circulo: Titulo", 2, 240, 220, 220);
+                std::string msgGo = "X: Reintentar desde \xC3\xBAltima sala | C\xC3\xADrculo: T\xC3\xADtulo";
+                int gx = offX + std::max(8, (GAME_W - measureTextWidth(msgGo, 2)) / 2);
+                drawText(gameSurf, gx, offY + 424, msgGo, 2, 240, 220, 220);
             } else {
-                drawText(gameSurf, offX + 140, offY + 424, "Pulsa X para volver al titulo", 2, 220, 220, 220);
+                std::string msgGo = "Pulsa X para volver al t\xC3\xADtulo";
+                int gx = offX + std::max(8, (GAME_W - measureTextWidth(msgGo, 2)) / 2);
+                drawText(gameSurf, gx, offY + 424, msgGo, 2, 220, 220, 220);
             }
         } else if (state == STATE_INVENTORY) {
             drawWindowBox(gameSurf, offX + 24, offY + 24, GAME_W - 48, GAME_H - 48, 230);
-            drawText(gameSurf, offX + 40, offY + 38, "OBJETOS | X: Usar | [] Guardar | O/OPT: Volver", 2, 255, 235, 140);
+            drawText(gameSurf, offX + 40, offY + 36, "OBJETOS | X: Usar | []: Guardar | O/OPT: Volver", 2, 255, 235, 140);
             int totalSec = (int)(g_game.frameCount / 60);
             char hdrInfo[80];
             snprintf(hdrInfo, sizeof(hdrInfo), "Tiempo: %02d:%02d  |  Brillo: %s  |  Outbreak2012",
                      totalSec / 60, totalSec % 60, g_highlightObjects ? "ON" : "OFF");
-            drawText(gameSurf, offX + 44, offY + 60, hdrInfo, 2, 170, 210, 245);
-            drawText(gameSurf, offX + 44, offY + GAME_H - 54, "TOUCHPAD: Brillo | L1+R1+OPT: Salir al titulo", 2, 160, 175, 210);
+            drawText(gameSurf, offX + 40, offY + 58, hdrInfo, 2, 170, 210, 245);
+            drawText(gameSurf, offX + 40, offY + GAME_H - 52, "TOUCHPAD: Brillo | L1+R1+OPT: Salir al t\xC3\xADtulo", 2, 160, 175, 210);
 
             int iy = offY + 88;
             if (ownedItems.empty()) {
-                drawText(gameSurf, offX + 48, iy, "(No tienes objetos todavia)", 2, 180, 180, 180);
+                drawText(gameSurf, offX + 48, iy, "(No tienes objetos todav\xC3\xAD" "a)", 2, 180, 180, 180);
             } else {
                 const int maxVisible = 9;
                 if (invCursor >= (int)ownedItems.size()) invCursor = (int)ownedItems.size() - 1;
@@ -4834,14 +5033,17 @@ int main(int argc, char* argv[]) {
                             textX = offX + 76;
                         }
                     }
-                    drawText(gameSurf, textX, iy + 2, iname, 2, 255, 255, 255);
+                    drawText(gameSurf, textX, iy + 1, iname, 2, 255, 255, 255);
                     iy += 30;
                 }
                 if (invCursor >= 0 && invCursor < (int)ownedItems.size()) {
                     int selId = ownedItems[invCursor];
                     std::string desc = g_game.itemDefs.count(selId) ? g_game.itemDefs[selId].desc : "";
                     drawWindowBox(gameSurf, offX + 36, offY + GAME_H - 102, GAME_W - 72, 46, 225);
-                    drawText(gameSurf, offX + 48, offY + GAME_H - 86, desc, 2, 210, 220, 255);
+                    std::string wrappedDesc = wrapTextToWidth(desc, GAME_W - 96, 2);
+                    bool multiLineDesc = (wrappedDesc.find('\n') != std::string::npos);
+                    drawTextLineStep(gameSurf, offX + 48, multiLineDesc ? (offY + GAME_H - 99) : (offY + GAME_H - 89),
+                                     wrappedDesc, 2, 19, 210, 220, 255);
                 }
             }
             if (!invStatusMsg.empty()) {
@@ -5043,14 +5245,30 @@ int main(int argc, char* argv[]) {
             }
 
             if (autoSaveBannerFrames > 0) {
-                drawWindowBox(gameSurf, offX + GAME_W - 216, offY + 10, 204, 32, 230);
-                drawText(gameSurf, offX + GAME_W - 202, offY + 19, "PARTIDA GUARDADA", 2, 140, 255, 160);
+                std::string sbTxt = "PARTIDA GUARDADA";
+                int sbW = std::max(196, measureTextWidth(sbTxt, 2) + 28);
+                int sbX = offX + GAME_W - 12 - sbW;
+                drawWindowBox(gameSurf, sbX, offY + 10, sbW, 32, 230);
+                drawText(gameSurf, sbX + (sbW - measureTextWidth(sbTxt, 2)) / 2, offY + 16, sbTxt, 2, 140, 255, 160);
             }
 
             // 6) Cuadro de diálogo con Windowskin auténtica de Ao Oni
+            int activeMsgBoxY = offY + GAME_H - 132;
             if (g_game.msgActive) {
-                int boxY = (g_game.msgPos == 0) ? (offY + 12) : ((g_game.msgPos == 1) ? (offY + 170) : (offY + GAME_H - 132));
-                drawWindowBox(gameSurf, offX + 16, boxY, GAME_W - 32, 120, 228);
+                int lineCount = 1;
+                for (size_t li = 0; li < g_game.msgText.size(); li++) {
+                    if (g_game.msgText[li] == '\n') lineCount++;
+                }
+                int lineStep = (!g_game.msgSpeaker.empty())
+                             ? ((lineCount >= 4) ? 18 : 22)
+                             : ((lineCount >= 5) ? 17 : ((lineCount == 4) ? 20 : 22));
+                int needH = (!g_game.msgSpeaker.empty() ? 38 : 16) + lineCount * lineStep + 14;
+                int boxH = std::max(120, needH);
+                int boxY = (g_game.msgPos == 0) ? (offY + 12)
+                         : ((g_game.msgPos == 1) ? (offY + (GAME_H - boxH) / 2)
+                         : (offY + GAME_H - 12 - boxH));
+                activeMsgBoxY = boxY;
+                drawWindowBox(gameSurf, offX + 16, boxY, GAME_W - 32, boxH, 228);
 
                 int textX = offX + 32;
                 if (!g_game.msgFace.empty()) {
@@ -5061,21 +5279,20 @@ int main(int argc, char* argv[]) {
                         textX = offX + 26 + faceSurf->w + 14;
                     }
                 }
-                int textY = boxY + 14;
+                int textY = boxY + 12;
                 if (!g_game.msgSpeaker.empty()) {
                     drawText(gameSurf, textX, textY, "[" + g_game.msgSpeaker + "]", 2, 255, 230, 120);
-                    textY += 24;
+                    textY += 22;
+                } else {
+                    textY += 4;
                 }
                 size_t revLen = std::min(g_game.msgCharReveal, g_game.msgText.size());
-                // Evitar partir secuencias UTF-8 de 2 bytes (0xC2 / 0xC3) a la mitad durante el efecto typewriter
-                if (revLen > 0 && revLen < g_game.msgText.size()) {
-                    unsigned char lastB = (unsigned char)g_game.msgText[revLen - 1];
-                    if (lastB == 0xC2 || lastB == 0xC3) revLen++;
-                }
-                drawText(gameSurf, textX, textY, g_game.msgText.substr(0, revLen), 2, 255, 255, 255);
+                // Evitar partir secuencias UTF-8 multibyte a la mitad durante el efecto typewriter
+                while (revLen < g_game.msgText.size() && (((unsigned char)g_game.msgText[revLen] & 0xC0) == 0x80)) revLen++;
+                drawTextLineStep(gameSurf, textX, textY, g_game.msgText.substr(0, revLen), 2, lineStep, 255, 255, 255);
                 if (revLen >= g_game.msgText.size() && !g_game.choiceActive && ((frame / 18) % 2 == 0)) {
                     int ax = offX + GAME_W / 2;
-                    int ay = boxY + 109;
+                    int ay = boxY + boxH - 11;
                     fillRectFast(gameSurf, ax - 4, ay, 9, 2, 255, 255, 255);
                     fillRectFast(gameSurf, ax - 3, ay + 2, 7, 2, 255, 255, 255);
                     fillRectFast(gameSurf, ax - 1, ay + 4, 3, 2, 255, 255, 255);
@@ -5084,15 +5301,21 @@ int main(int argc, char* argv[]) {
 
             // 7) Cuadro de elecciones (cmd 102)
             if (g_game.choiceActive && !g_game.choices.empty()) {
+                int maxChW = 0;
+                for (size_t i = 0; i < g_game.choices.size(); i++) {
+                    maxChW = std::max(maxChW, measureTextWidth(g_game.choices[i], 2));
+                }
+                int chW = std::min(GAME_W - 32, std::max(204, maxChW + 32));
                 int chH = (int)g_game.choices.size() * 28 + 20;
-                int cx = offX + GAME_W - 220;
-                int cy = offY + GAME_H - 132 - chH - 8;
-                drawWindowBox(gameSurf, cx, cy, 204, chH, 235);
+                int cx = offX + GAME_W - 16 - chW;
+                int cy = (g_game.msgActive && g_game.msgPos == 2) ? (activeMsgBoxY - chH - 8) : (offY + GAME_H - 132 - chH - 8);
+                if (cy < offY + 8) cy = offY + 8;
+                drawWindowBox(gameSurf, cx, cy, chW, chH, 235);
                 for (size_t i = 0; i < g_game.choices.size(); i++) {
                     if ((int)i == g_game.choiceIndex) {
-                        fillRectFast(gameSurf, cx + 6, cy + 8 + (int)i * 28, 192, 24, 65, 95, 175, 210);
+                        fillRectFast(gameSurf, cx + 6, cy + 8 + (int)i * 28, chW - 12, 24, 65, 95, 175, 210);
                     }
-                    drawText(gameSurf, cx + 14, cy + 12 + (int)i * 28, g_game.choices[i], 2, 255, 255, 255);
+                    drawText(gameSurf, cx + 14, cy + 10 + (int)i * 28, g_game.choices[i], 2, 255, 255, 255);
                 }
             }
 
@@ -5109,7 +5332,6 @@ int main(int argc, char* argv[]) {
                 drawWindowBox(gameSurf, bx, by, bw, bh, 235);
                 for (int d = 0; d < g_game.numInputDigits; d++) {
                     int slotX = bx + padX + d * cellW;
-                    int dx = slotX + 4;
                     if (d == g_game.numInputCursor) {
                         fillRectFast(gameSurf, slotX + 1, by + 9, cellW - 2, 26, 65, 100, 185);
                         drawRectFast(gameSurf, slotX + 1, by + 9, cellW - 2, 26, 255, 235, 140);
@@ -5123,7 +5345,8 @@ int main(int argc, char* argv[]) {
                     }
                     char digStr[4];
                     snprintf(digStr, sizeof(digStr), "%d", g_game.numInputVals[d]);
-                    drawText(gameSurf, dx, by + 14, digStr, 2, 255, 255, 255);
+                    int dx = slotX + std::max(1, (cellW - measureTextWidth(digStr, 2)) / 2);
+                    drawText(gameSurf, dx, by + 12, digStr, 2, 255, 255, 255);
                 }
             }
 
@@ -5131,7 +5354,7 @@ int main(int argc, char* argv[]) {
             if (g_game.nameInputActive) {
                 drawWindowBox(gameSurf, 28, 22, GAME_W - 56, GAME_H - 44, 244);
 
-                drawText(gameSurf, 48, 36, "NOMBRE DEL PROTAGONISTA (X: Elegir | Cuadrado: Borrar | OPTIONS: OK)", 2, 255, 235, 130);
+                drawText(gameSurf, 44, 34, "NOMBRE DEL PROTAGONISTA (X: Elegir | Cuadrado: Borrar | OPTIONS: OK)", 2, 255, 235, 130);
 
                 // Caja del nombre actual con sprite de Hiroshi
                 drawWindowBox(gameSurf, 48, 66, GAME_W - 96, 52, 240);
@@ -5143,7 +5366,7 @@ int main(int argc, char* argv[]) {
                     blitSurf(hSurf, &src, gameSurf, &dst);
                 }
                 std::string dispName = g_game.nameInputStr + ((frame / 15) % 2 == 0 ? "_" : " ");
-                drawText(gameSurf, 114, 80, dispName, 3, 255, 255, 255);
+                drawText(gameSurf, 114, 78, dispName, 3, 255, 255, 255);
 
                 // Cuadrícula de caracteres (6 filas x 10 columnas)
                 for (int r = 0; r < 6; r++) {
@@ -5156,16 +5379,17 @@ int main(int argc, char* argv[]) {
                             drawRectFast(gameSurf, kx - 6, ky - 4, 38, 28, 255, 240, 150);
                         }
                         char chStr[2] = { NAME_KB_ROWS[r][c], '\0' };
-                        drawText(gameSurf, kx + 4, ky + 2, chStr, 2, 255, 255, 255);
+                        int chX = (kx - 6) + std::max(2, (38 - measureTextWidth(chStr, 2)) / 2);
+                        drawText(gameSurf, chX, ky, chStr, 2, 255, 255, 255);
                     }
                 }
 
                 // Fila 6: Botones de acción rápida y Nombres Truco / Easter Eggs Oficiales
-                drawText(gameSurf, 48, 342, "BOTONES RAPIDOS Y MODOS SECRETOS (EASTER EGGS OFICIALES):", 2, 175, 210, 255);
+                drawText(gameSurf, 48, 340, "BOTONES RAPIDOS Y MODOS SECRETOS (EASTER EGGS OFICIALES):", 2, 175, 210, 255);
                 int bx = 46;
                 int by = 366;
                 for (int q = 0; q < 9; q++) {
-                    int bw = (int)strlen(NAME_QUICK_BTNS[q].label) * 12 + 14;
+                    int bw = measureTextWidth(NAME_QUICK_BTNS[q].label, 2) + 16;
                     if (bx + bw > GAME_W - 44) {
                         bx = 46;
                         by += 32;
@@ -5181,24 +5405,25 @@ int main(int argc, char* argv[]) {
                     uint8_t rCol = (q == 0) ? 150 : ((q >= 3) ? 255 : 235);
                     uint8_t gCol = (q == 0) ? 255 : ((q >= 3) ? 230 : 235);
                     uint8_t bCol = (q == 0) ? 170 : ((q >= 3) ? 140 : 255);
-                    drawText(gameSurf, bx + 7, by + 5, NAME_QUICK_BTNS[q].label, 2, rCol, gCol, bCol);
+                    drawText(gameSurf, bx + 8, by + 3, NAME_QUICK_BTNS[q].label, 2, rCol, gCol, bCol);
                     bx += bw + 8;
                 }
 
                 // Descripción inferior de la tecla o Easter Egg seleccionado
-                std::string hintText = "Selecciona letras con X o elige un nombre rapido abajo.";
+                std::string hintText = "Selecciona letras con X o elige un nombre r\xC3\xA1pido abajo.";
                 if (g_game.nameInputRow == 6 && g_game.nameInputCol >= 0 && g_game.nameInputCol < 9) {
                     hintText = NAME_QUICK_BTNS[g_game.nameInputCol].hint;
                 }
-                drawText(gameSurf, 48, 434, hintText, 2, 200, 235, 190);
+                drawText(gameSurf, 48, 434, wrapTextToWidth(hintText, GAME_W - 96, 2), 2, 200, 235, 190);
             }
         }
 
         if (videoBannerFrames > 0 && !videoBannerText.empty()) {
-            int bw = (int)videoBannerText.size() * 12 + 28;
+            int txtW = measureTextWidth(videoBannerText, 2);
+            int bw = std::min(GAME_W - 16, txtW + 28);
             int bx = std::max(8, (GAME_W - bw) / 2);
             drawWindowBox(gameSurf, bx, 8, bw, 32, 230);
-            drawText(gameSurf, bx + 14, 17, videoBannerText, 2, 255, 240, 140);
+            drawText(gameSurf, bx + std::max(8, (bw - txtW) / 2), 14, videoBannerText, 2, 255, 240, 140);
         }
 
         // Presentación con VSync hardware (sceVideoOut); evita doble espera de VSync que provocaría 30 FPS

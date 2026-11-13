@@ -365,114 +365,340 @@ def make_switch02_charset(path):
     write_rgba_png(path, w, h, cv.buf)
 
 def make_storekeeper02_charset(path):
-    """Genera NPC adulto distinto de Hiroshi para el epilogo (148-Storekeeper02, 128x192, 32x48)."""
+    """Reconstruye 1:1 el charset RTP 148-Storekeeper02 (128x192, 32x48) a partir de las siluetas exactas de pic_t1/t2/t3."""
     w, h = 128, 192
     cv = PixelCanvas(w, h)
-    ol = (26, 20, 18, 255)
-    cap = (78, 56, 42, 255)
-    cap_hi = (108, 80, 60, 255)
-    hair = (88, 54, 34, 255)
-    skin = (236, 194, 162, 255)
-    skin_sh = (206, 160, 128, 255)
-    eye = (34, 28, 28, 255)
-    shirt = (224, 218, 204, 255)
-    vest = (62, 84, 62, 255)
-    apron = (188, 168, 134, 255)
-    pants = (48, 54, 68, 255)
-    shoe = (64, 42, 28, 255)
 
-    for row in range(4):      # 0=Abajo, 1=Izquierda, 2=Derecha, 3=Arriba
-        for col in range(4):  # Ciclo de caminata 0..3
+    t3_front = [
+        "............00000............",
+        "..........001111100..........",
+        ".........01122222110.........",
+        "........0122222222213........",
+        "........0422222222213........",
+        "........0041222221103........",
+        "........0022144410003........",
+        ".......560220000000065.......",
+        ".......706820000000607.......",
+        "......5970AB88888A60795......",
+        "......7CC970ABBBA079CC7......",
+        "......7CDDC7700077CDDC7......",
+        "......7CDD77CCCCC77DDC7......",
+        "......59C7557EEE7557C95......",
+        "......5799CC9EEE9CC9975......",
+        "......FC79GG7DDD7GG97CF......",
+        "......FC756HGDDDGH657CF......",
+        ".......F75IGG999GGI57F.......",
+        ".......F9DC9557559CD9F.......",
+        ".....55F7CC5777775CC7F55.....",
+        "....5JJ0F79K75757K97F0JJ5....",
+        "....5JLL00FFK5K5K5KFF00LLJ5.."[:29],
+        "..5JMNL0220JFFFFFJ0220LNMJ5..",
+        "..5MNNJ2110JNFFFNJ0112JNNM5..",
+        ".5JNNMJ2110MJNNNJM0112JMNNJ5.",
+        ".5LNML52112MMJJJMM01125LMNL5.",
+        "5NJLML52212LMNNNML21225LMLJN5",
+        "5JNJJL02122OLLLLLO22120LJJNJ5",
+        "55JLNJP2212QOQOQOQ2122PJNLJ55",
+        "595JJ5RP022QSQSQSQ220PR5JJ595",
+        "599R5QRRQ02O4O4O4O20QRRQ5R995",
+        ".RR..RRQRRQO4O4O4OQRRQRR..RR.",
+        ".....RQQQQQRRRRRRRQQQQQR.....",
+        ".....RQQQQQOOOOOOOQQQQQR.....",
+        ".....RQOQOQRQOOOQRQOQOQR.....",
+        ".....RQOOQOQRRRRRQOQOOQR.....",
+        ".....RQO4OQOQRPRQOQO4OQR.....",
+        "......ROO4OQQRPRQQO4OOR......",
+        "......RO44OOQRPRQOO44OR......",
+        "......RQO4OQQRPRQQO4OQR......",
+        ".......ROOOOQRPRQOOOOR.......",
+        ".......RQOOQQR.RQQOOQR.......",
+        "........RRQRRT.TRRQRR........",
+        "........TTTTTT.TTTTTT........",
+        "........GTU8TG.GT8UTG........",
+        ".........GGGG...GGGG.........",
+    ]
+    # Corregir fila 21 a ancho exacto 29
+    t3_front[21] = "...5JLL00FFK5K5K5KFF00LLJ5..."
+
+    t2_left = [
+        "........000.......",
+        "......0011100.....",
+        ".....0112221100...",
+        ".....01222222120..",
+        "....0212222222123.",
+        "....0221222222143.",
+        "...02200112221423.",
+        "...82000001144203.",
+        "...06800000000003.",
+        "..F70AB8000000003.",
+        ".F7C970AB80000080.",
+        ".F9CDC970ABIAA805F",
+        ".FCEED77970000057F",
+        ".FCEE7557CC977999F",
+        "..7DD9CCCCCCC9999K",
+        "..FDD7GG9DDC97797K",
+        "..FCCGH65DDD9DF97K",
+        "..559GGI5DDD9CF75K",
+        ".57755CDDDDD97F7K.",
+        ".557775CDDDC9F55K.",
+        ".KK75759CCC9FP5K..",
+        "..KKK5K77970KP....",
+        "...5KKKK002120P...",
+        "..5MFF50211122P...",
+        ".5MJNM02115J520P..",
+        ".JNMJ50112LMM50P..",
+        "JMNNM02115MNNJ00P.",
+        "JMNNJ0111JNNNM00P.",
+        "QJMM50212JNNNM50P.",
+        "Q4JJ02122MNNNM500.",
+        "54Q502220JNNML500.",
+        "545402220NJLLM50..",
+        ".R5452005JNNNL5R..",
+        "..RQQ45455975RQR..",
+        "...RQQQQQQ995RQR..",
+        "...RQQOO4OORRQQR..",
+        "....RQQO44OQQQQR..",
+        "....RQOO4OQOQQR...",
+        "....RPQOO4OQOQR...",
+        ".....PQOOOQOQQR...",
+        ".....PRQOOOQOR....",
+        "....FFPRQOOOQR....",
+        "....FFFPRRRRRP....",
+        "......FTTTTTTP....",
+        ".......T88TTP.....",
+        "........TTPP......",
+    ]
+
+    t1_back = [
+        "............00000............",
+        "..........001111100..........",
+        ".........01122222110.........",
+        "........0122222222213........",
+        "........0422222222213........",
+        "........0422222222213........",
+        "........0041222221103........",
+        ".......500221444100035.......",
+        ".......760220000000067.......",
+        "......59068200000006095......",
+        "......7970AB88888A607C7......",
+        "......7CC970ABBBA079CC7......",
+        "......7CCCC9700079CCCC7......",
+        "......5CCCCCCCCCCCCCCC5......",
+        "......59CCCCCCCCCCCCC95......",
+        "......F9CCCCCCCCCCCCC9F......",
+        "......F7CCCCCCCCCCCCC7F......",
+        ".......F9CCCCCCCCCCC9F.......",
+        ".......F79CCCCCCCCC97F.......",
+        ".....550F799CCCCC997F055.....",
+        "....5JJ50FF7799977FF05JJ5....",
+        "...5JLL5000KKKKKKK0005LLJ5...",
+        "..5JMNL522000000000225LNMJ5..",
+        "..5MNNJ511122222221115JNNM5..",
+        ".5JNNMJ211111111111112JMNNJ5.",
+        ".5LNML52111111111111125LMNL5.",
+        "5NJLML52212121112121225LMLJN5",
+        "5JNJJL02121212121212120LJJNJ5",
+        "55JLNJP221212121212122PJNLJ55",
+        "595JJ5RP0222121212220PR5JJ595",
+        "599R5QRRQ00022222000QRRQ5R995",
+        ".RR..RRQRRQO4O4O4OQRRQRR..RR.",
+        ".....RQOOOQRRRRRRRQOOOQR.....",
+        ".....RQOO4O4444444O4OOQR.....",
+        ".....RQOOO4O44444O4OOOQR.....",
+        ".....RQOOQOQQQQQQQOQOOQR.....",
+        ".....RQO4OQOQRPRQOQO4OQR.....",
+        "......ROO4OQQRPRQQO4OOR......",
+        "......RO44OOQRPRQOO44OR......",
+        "......RQO4OQQRPRQQO4OQR......",
+        ".......ROOOOQRPRQOOOOR.......",
+        ".......RQOOQQR.RQQOOQR.......",
+        "........RRQRRT.TRRQRR........",
+        "........TTTTTT.TTTTTT........",
+        "........GT88TG.GT88TG........",
+        ".........GGGG...GGGG.........",
+    ]
+
+    def map_color(sym, x, y, gw):
+        # Region anatomica para colores fieles al RTP 148-Storekeeper02
+        if sym == ".":
+            return None
+        # Sombrero azul (y <= 12): azul pizarra / marino con visera y brillo
+        if sym in ("0", "1", "2", "3", "4", "6", "8", "A", "B") and (y <= 12 or (y <= 32 and sym in ("0", "1", "2"))):
+            if sym == "0":
+                return (28, 38, 68, 255)
+            if sym == "1":
+                return (46, 68, 122, 255)
+            if sym == "2":
+                return (68, 98, 162, 255)
+            if sym == "3":
+                return (34, 46, 82, 255)
+            if sym == "4":
+                return (108, 144, 208, 255)
+            if sym == "6":
+                return (40, 56, 98, 255)
+            if sym == "8":
+                return (132, 168, 224, 255)
+            if sym == "A":
+                return (54, 78, 134, 255)
+            if sym == "B":
+                return (88, 122, 182, 255)
+
+        # Ojos (y=15 esclerotica/parpado superior, y=16 pupila H + iris 6 + esclerotica G, y=17 pomulo iluminado)
+        if y == 15:
+            if sym == "G":
+                return (230, 232, 240, 255)
+        if y == 16:
+            if sym == "G":
+                return (246, 248, 255, 255)
+            if sym == "H":
+                return (24, 26, 38, 255)
+            if sym == "6":
+                return (54, 68, 102, 255)
+        if y == 17:
+            if sym == "G":
+                return (244, 212, 182, 255)
+            if sym == "I":
+                return (182, 130, 102, 255)
+
+        # Zapatos oscuros (y >= 42)
+        if y >= 42 and sym in ("T", "G", "U", "8"):
+            if sym == "T":
+                return (62, 46, 40, 255)
+            if sym == "G":
+                return (30, 22, 20, 255)
+            return (104, 84, 74, 255)
+
+        # Pantalones holgados marrones (cinturon/piernas y >= 27)
+        if y >= 27 and sym in ("R", "Q", "O", "P", "4"):
+            if sym == "R":
+                return (74, 48, 34, 255)
+            if sym == "P":
+                return (48, 32, 22, 255)
+            if sym == "Q":
+                return (108, 72, 48, 255)
+            if sym == "O":
+                return (138, 96, 64, 255)
+            if sym == "4":
+                return (172, 122, 84, 255)
+        if sym == "S":
+            return (192, 172, 140, 255)
+
+        # Sueter beige claro / crema (brazos y pecho central)
+        if sym == "N":
+            return (242, 232, 210, 255)
+        if sym == "M":
+            return (226, 210, 182, 255)
+        if sym == "J":
+            return (202, 184, 152, 255)
+        if sym == "L":
+            return (174, 156, 126, 255)
+
+        # Cabeza calva / piel / cejas y bigote castaño (y <= 31)
+        if sym == "E":
+            return (250, 220, 192, 255)
+        if sym == "C":
+            return (240, 198, 166, 255)
+        if sym == "D":
+            return (226, 176, 142, 255)
+        if sym == "9":
+            return (196, 144, 110, 255)
+        if sym == "7":
+            # Bigote / contorno calido castano
+            if 18 <= y <= 21:
+                return (134, 84, 52, 255)
+            return (156, 108, 76, 255)
+        if sym == "5":
+            # Contorno calido y cejas/bigote oscuro
+            if y in (13, 18, 19, 20, 21):
+                return (88, 52, 34, 255)
+            return (64, 42, 32, 255)
+        if sym == "F":
+            return (54, 34, 24, 255)
+        if sym == "K":
+            return (78, 46, 28, 255)
+        return (56, 40, 32, 255)
+
+    def render_grid_to_cell(grid, ox, oy, flip_x=False, col=0, is_side=False):
+        gh = len(grid)
+        gw = len(grid[0])
+        dx0 = (32 - gw) // 2
+        dy0 = 1
+        # Sombra bajo los pies en la base 32x48
+        cv.rect(ox + 10, oy + 45, 12, 2, (20, 20, 24, 80))
+
+        # Caminata suave sin cortes ni grietas horizontales/verticales
+        bob = -1 if col in (1, 3) else 0
+        # 1) Dibujamos cadera y muslos continuos (y >= 32) sin partir verticalmente el muslo
+        for y in range(32, gh):
+            for rx in range(gw):
+                sx = (gw - 1 - rx) if flip_x else rx
+                rgba = map_color(grid[y][sx], rx, y, gw)
+                if rgba is None:
+                    continue
+                px = ox + dx0 + rx
+                py = oy + dy0 + y
+                if col in (1, 3):
+                    if not is_side:
+                        # Paso frontal/trasero: una pierna se eleva 1px en la pantorrilla/pie
+                        if ((col == 1 and rx < gw // 2) or (col == 3 and rx >= gw // 2)) and y >= 38:
+                            py -= 1
+                    else:
+                        # Paso lateral continuo: ligera oscilacion de pantorrilla/pie sin abrir grietas en el muslo
+                        if y >= 40:
+                            is_front_leg = (rx < gw // 2) if not flip_x else (rx >= gw // 2)
+                            if (col == 1 and is_front_leg) or (col == 3 and not is_front_leg):
+                                py -= 1
+                if ox <= px < ox + 32 and oy <= py < oy + 48:
+                    cv.pset(px, py, rgba)
+
+        # 2) Cabeza, sombrero, sueter, chaleco y cintura (y <= 32) con bob = -1 y balanceo de brazos
+        for y in range(33):
+            for rx in range(gw):
+                sx = (gw - 1 - rx) if flip_x else rx
+                rgba = map_color(grid[y][sx], rx, y, gw)
+                if rgba is None:
+                    continue
+                px = ox + dx0 + rx
+                py = oy + dy0 + y + bob
+                if is_side and col in (1, 3) and 24 <= y <= 32 and 7 <= sx <= 13:
+                    # Pintar fondo de chaleco azul debajo de la manga desplazada para evitar huecos de 1px
+                    rgba = (54, 78, 134, 255)
+                elif not is_side and col in (1, 3) and y >= 21:
+                    if rx <= 5:
+                        py += (1 if col == 1 else -1)
+                    elif rx >= gw - 6:
+                        py += (-1 if col == 1 else 1)
+                if ox <= px < ox + 32 and oy <= py < oy + 48:
+                    cv.pset(px, py, rgba)
+
+        # 3) Manga lateral sobre el chaleco en col=1,3 para mantener el contorno limpio en ambos sentidos
+        if is_side and col in (1, 3):
+            arm_dx = (-1 if col == 1 else 1) * (-1 if flip_x else 1)
+            for y in range(24, 33):
+                for rx in range(gw):
+                    sx = (gw - 1 - rx) if flip_x else rx
+                    if not (7 <= sx <= 13):
+                        continue
+                    rgba = map_color(grid[y][sx], rx, y, gw)
+                    if rgba is None:
+                        continue
+                    px = ox + dx0 + rx + arm_dx
+                    py = oy + dy0 + y + bob
+                    if ox <= px < ox + 32 and oy <= py < oy + 48:
+                        cv.pset(px, py, rgba)
+
+    for row in range(4):  # 0=Abajo, 1=Izquierda, 2=Derecha, 3=Arriba
+        for col in range(4):
             ox, oy = col * 32, row * 48
-            cx = ox + 16
-            step = -1 if col == 1 else (1 if col == 3 else 0)
-            bob = -1 if col in (1, 3) else 0
-            hy = oy + 8 + bob
-
-            # Sombra sutil bajo los pies
-            cv.rect(cx - 5, oy + 45, 10, 2, (20, 20, 24, 90))
-
-            # Piernas y zapatos
-            if row in (0, 3):
-                ly_off = -2 if col == 1 else 0
-                ry_off = -2 if col == 3 else 0
-                cv.rect(cx - 5, oy + 34, 4, 10 + ly_off, ol)
-                cv.rect(cx - 4, oy + 35, 3, 7 + ly_off, pants)
-                cv.rect(cx - 4, oy + 41 + ly_off, 3, 2, shoe)
-                cv.rect(cx + 1, oy + 34, 4, 10 + ry_off, ol)
-                cv.rect(cx + 1, oy + 35, 3, 7 + ry_off, pants)
-                cv.rect(cx + 1, oy + 41 + ry_off, 3, 2, shoe)
-            else:
-                fd = -1 if row == 1 else 1
-                s1 = step * 3
-                cv.rect(cx - 3 + s1, oy + 34, 5, 10, ol)
-                cv.rect(cx - 2 + s1, oy + 35, 3, 6, pants)
-                cv.rect(cx - 2 + s1, oy + 41, 3, 2, shoe)
-                cv.rect(cx - 2 - s1, oy + 35, 4, 9, ol)
-                cv.rect(cx - 1 - s1, oy + 36, 2, 5, pants)
-                cv.rect(cx - 1 - s1, oy + 41, 2, 2, shoe)
-
-            # Torso (chaleco verde oliva + delantal beige de tendero/peaton)
-            ty = oy + 23 + bob
-            if row in (0, 3):
-                cv.rect(cx - 7, ty, 14, 13, ol)
-                cv.rect(cx - 6, ty + 1, 12, 11, vest)
-                # Mangas y brazos balanceandose
-                l_arm_dy = step if col % 2 == 1 else 0
-                r_arm_dy = -step if col % 2 == 1 else 0
-                cv.rect(cx - 8, ty + 2 + l_arm_dy, 3, 7, ol)
-                cv.rect(cx - 7, ty + 3 + l_arm_dy, 2, 4, shirt)
-                cv.pset(cx - 7, ty + 7 + l_arm_dy, skin)
-                cv.rect(cx + 5, ty + 2 + r_arm_dy, 3, 7, ol)
-                cv.rect(cx + 5, ty + 3 + r_arm_dy, 2, 4, shirt)
-                cv.pset(cx + 6, ty + 7 + r_arm_dy, skin)
-                if row == 0:
-                    cv.rect(cx - 3, ty + 1, 6, 3, shirt)
-                    cv.rect(cx - 4, ty + 4, 8, 8, apron)
-                else:
-                    cv.rect(cx - 3, ty + 5, 6, 2, apron)
-            else:
-                fd = -1 if row == 1 else 1
-                cv.rect(cx - 5, ty, 10, 13, ol)
-                cv.rect(cx - 4, ty + 1, 8, 11, vest)
-                # Delantal lateral hacia el frente
-                ax = cx - 4 if fd < 0 else cx + 1
-                cv.rect(ax, ty + 4, 3, 8, apron)
-                # Brazo lateral balanceado
-                cv.rect(cx - 2 - step * 2, ty + 2, 4, 8, ol)
-                cv.rect(cx - 1 - step * 2, ty + 3, 2, 4, shirt)
-                cv.rect(cx - 1 - step * 2, ty + 7, 2, 2, skin)
-
-            # Cabeza y gorra/pelo castano (claramente distinto de Hiroshi)
-            cv.rect(cx - 7, hy, 14, 16, ol)
-            cv.rect(cx - 6, hy + 1, 12, 14, hair if row == 3 else skin)
-            # Gorra plana + visera
-            cv.rect(cx - 7, hy, 14, 5, ol)
-            cv.rect(cx - 6, hy + 1, 12, 4, cap)
-            cv.rect(cx - 5, hy + 1, 10, 2, cap_hi)
             if row == 0:
-                cv.rect(cx - 6, hy + 4, 12, 2, ol)
-                cv.rect(cx - 5, hy + 5, 10, 2, hair)
-                cv.rect(cx - 6, hy + 7, 12, 7, skin)
-                cv.rect(cx - 5, hy + 13, 10, 1, skin_sh)
-                # Ojos y bigote adulto
-                cv.rect(cx - 4, hy + 8, 2, 2, eye)
-                cv.rect(cx + 2, hy + 8, 2, 2, eye)
-                cv.rect(cx - 2, hy + 11, 5, 1, hair)
-            elif row in (1, 2):
-                fd = -1 if row == 1 else 1
-                # Visera extendida al frente
-                bx = cx - 8 if fd < 0 else cx + 2
-                cv.rect(bx, hy + 4, 6, 2, ol)
-                # Pelo nuca
-                hx_back = cx + (1 if fd < 0 else -5)
-                cv.rect(hx_back, hy + 5, 5, 8, hair)
-                # Ojo y bigote de perfil
-                ex = cx + (fd * 3)
-                cv.rect(ex, hy + 8, 2, 2, eye)
-                cv.rect(ex + (-1 if fd < 0 else 0), hy + 11, 2, 1, hair)
+                render_grid_to_cell(t3_front, ox, oy, flip_x=False, col=col, is_side=False)
+            elif row == 1:
+                render_grid_to_cell(t2_left, ox, oy, flip_x=False, col=col, is_side=True)
+            elif row == 2:
+                render_grid_to_cell(t2_left, ox, oy, flip_x=True, col=col, is_side=True)
             else:
-                cv.rect(cx - 6, hy + 5, 12, 9, hair)
+                render_grid_to_cell(t1_back, ox, oy, flip_x=False, col=col, is_side=False)
+
     write_rgba_png(path, w, h, cv.buf)
 
 def patch_tileset_floor_holes(out_img):
