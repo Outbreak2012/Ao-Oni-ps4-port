@@ -30,22 +30,122 @@ def write_rgba_png(path, width, height, rgba_bytes):
     with open(path, "wb") as f:
         f.write(png)
 
+def _build_32x32_grass_tex(seed=101):
+    """Genera textura tileable 32x32 de pasto estilo RMXP RTP sin repeticion visual marcada."""
+    rng = random.Random(seed)
+    base_pal = [
+        (95, 153, 76, 255),
+        (104, 163, 73, 255),
+        (112, 171, 70, 255),
+        (124, 176, 67, 255),
+        (138, 181, 63, 255),
+    ]
+    tex = [[(112, 171, 70, 255) for _ in range(32)] for _ in range(32)]
+    # Sub-manchas distribuidas uniformemente en cuadrantes 16x16 para evitar patron de sellos cada 32px
+    for y in range(32):
+        for x in range(32):
+            v = (math.sin(x * math.pi / 8.0 + 0.4) * math.cos(y * math.pi / 8.0 - 0.3)
+                 + 0.65 * math.sin((x + y) * math.pi / 16.0)
+                 + rng.uniform(-0.85, 0.85))
+            idx = max(0, min(len(base_pal) - 1, int(round(2.0 + v * 0.9))))
+            tex[y][x] = base_pal[idx]
+    # Pequenas briznas finas (2px) repartidas en los 4 cuadrantes de 16x16
+    for qy in (0, 16):
+        for qx in (0, 16):
+            for _ in range(4):
+                bx = (qx + rng.randrange(16)) & 31
+                by = (qy + rng.randrange(16)) & 31
+                tex[by][bx] = (82, 146, 84, 255)
+                tex[(by - 1) & 31][(bx + 1) & 31] = (145, 184, 60, 255)
+    return tex
+
+def _build_32x32_tex(palette, seed=202, speck_prob=0.14):
+    """Genera textura tileable 32x32 organica a partir de una paleta RGBA ordenada oscuro->claro."""
+    rng = random.Random(seed)
+    n = len(palette)
+    tex = [[palette[n // 2] for _ in range(32)] for _ in range(32)]
+    blobs = [(rng.randrange(32), rng.randrange(32), rng.uniform(3.0, 6.5), rng.uniform(-1.3, 1.3)) for _ in range(20)]
+    for y in range(32):
+        for x in range(32):
+            val = (n - 1) * 0.5
+            for bx, by, br, bw in blobs:
+                dx = min((x - bx) % 32, (bx - x) % 32)
+                dy = min((y - by) % 32, (by - y) % 32)
+                d2 = dx * dx + dy * dy
+                if d2 < br * br:
+                    val += bw * (1.0 - d2 / (br * br)) * 0.85
+            val += rng.uniform(-0.4, 0.4)
+            idx = max(0, min(n - 1, int(round(val))))
+            tex[y][x] = palette[idx]
+    for y in range(32):
+        for x in range(32):
+            if rng.random() < speck_prob:
+                idx = max(0, min(n - 1, rng.choice([0, n - 1])))
+                tex[y][x] = palette[idx]
+    return tex
+
+def _rmxp_autotile_edge_dist(x, y, radius=11.0):
+    """Distancia interior al borde redondeado del formato RMXP 96x128 (subtiles 6x8 de 16x16)."""
+    if x < 32 and y < 32:
+        dx = min(x, 31 - x)
+        dy = min(y, 31 - y)
+        if dx < radius and dy < radius:
+            return radius - math.hypot(radius - 0.5 - dx, radius - 0.5 - dy)
+        return min(dx, dy) + 0.5
+    if x >= 64 and y < 32:
+        # Esquinas concavas (subtiles 4, 5, 10, 11) con radio continuo respecto al borde recto
+        cx = (x - 64) if x < 80 else (95 - x)
+        cy = y if y < 16 else (31 - y)
+        return math.hypot(cx + 0.5, cy + 0.5)
+    if y >= 32:
+        lx, ly = x, y - 32
+        dx = min(lx, 95 - lx)
+        dy = min(ly, 95 - ly)
+        if dx < radius and dy < radius:
+            return radius - math.hypot(radius - 0.5 - dx, radius - 0.5 - dy)
+        return min(dx, dy) + 0.5
+    return 99.0
+
+def make_rmxp_autotile(path, in_tex, out_tex=None, rim_color=None, fringe=0.0,
+                       edge_jitter=1.4, transparent_outside=False, seed=303):
+    """Construye un autotile RMXP 96x128 con textura 32x32 continua en los 48 sub-patrones."""
+    if os.path.exists(path):
+        return
+    w, h = 96, 128
+    buf = bytearray(w * h * 4)
+    for y in range(h):
+        py = y & 31
+        for x in range(w):
+            px = x & 31
+            d = _rmxp_autotile_edge_dist(x, y)
+            # Ondulacion determinista y periodica para bordes organicos sin costuras
+            wave = math.sin((x * 0.65) + (y * 0.45) + seed * 0.1) * edge_jitter
+            wave += math.cos((x * 1.15) - (y * 0.85)) * (edge_jitter * 0.5)
+            eff = d + wave
+            if out_tex is not None and eff < fringe:
+                rgba = out_tex[py][px]
+            elif transparent_outside and eff < 3.0:
+                rgba = (0, 0, 0, 0)
+            elif rim_color is not None and eff < (fringe + 1.8 if out_tex is not None else 4.6):
+                rgba = rim_color
+            else:
+                rgba = in_tex[py][px]
+            idx = (y * w + x) * 4
+            buf[idx:idx + 4] = bytes(rgba)
+    write_rgba_png(path, w, h, buf)
+
 def make_solid_autotile(path, r, g, b, r2=None, g2=None, b2=None, alpha=255):
     if os.path.exists(path):
         return
     if r2 is None:
         r2, g2, b2 = max(0, r - 12), max(0, g - 12), max(0, b - 12)
-    w, h = 96, 128
-    buf = bytearray(w * h * 4)
-    for y in range(h):
-        for x in range(w):
-            c = ((x // 8) + (y // 8)) & 1
-            cr = r if c == 0 else r2
-            cg = g if c == 0 else g2
-            cb = b if c == 0 else b2
-            idx = (y * w + x) * 4
-            buf[idx:idx + 4] = bytes((cr, cg, cb, alpha))
-    write_rgba_png(path, w, h, buf)
+    pal = [
+        (max(0, r2 - 6), max(0, g2 - 6), max(0, b2 - 6), alpha),
+        (r2, g2, b2, alpha),
+        (r, g, b, alpha),
+        (min(255, r + 8), min(255, g + 8), min(255, b + 8), alpha),
+    ]
+    make_rmxp_autotile(path, _build_32x32_tex(pal, seed=(r * 13 + g * 7 + b)), edge_jitter=0.6)
 
 def read_png_rgba(path):
     """Decodifica PNG (RGB/Palette/RGBA de 8 bits) a (w, h, rgba_bytes) en Python puro."""
@@ -930,18 +1030,65 @@ def make_bird_charset_legacy_unused(path):
 
 def make_fallback_rtp_images(out_img):
     """Crea texturas equivalentes para recursos RTP de RPG Maker XP no incluidos en Ao Oni/Graphics."""
-    make_solid_autotile(os.path.join(out_img, "at_009-G2_Water01.png"), 18, 36, 58, 14, 28, 48)
-    make_solid_autotile(os.path.join(out_img, "at_010-G2_Ground01.png"), 22, 34, 24, 18, 28, 20)
-    make_solid_autotile(os.path.join(out_img, "at_011-G2_Ground02.png"), 28, 38, 28, 22, 30, 22)
-    make_solid_autotile(os.path.join(out_img, "at_038-Tree03.png"), 16, 28, 18, 12, 22, 14)
-    make_solid_autotile(os.path.join(out_img, "at_039-Tree04.png"), 14, 24, 16, 10, 18, 12)
-    make_solid_autotile(os.path.join(out_img, "at_042-Ground02.png"), 38, 36, 34, 32, 30, 28)
-    make_solid_autotile(os.path.join(out_img, "at_062-CF_Lava01.png"), 45, 20, 20, 35, 15, 15)
+    grass_tex = _build_32x32_grass_tex(seed=101)
+    dirt_pal = [
+        (143, 144, 99, 255),
+        (149, 144, 112, 255),
+        (155, 159, 103, 255),
+        (159, 156, 118, 255),
+        (165, 169, 111, 255),
+        (179, 176, 137, 255),
+    ]
+    dirt_tex = _build_32x32_tex(dirt_pal, seed=202, speck_prob=0.10)
+    water_pal = [
+        (76, 128, 178, 255),
+        (92, 148, 198, 255),
+        (108, 168, 214, 255),
+        (132, 192, 228, 255),
+    ]
+    water_tex = _build_32x32_tex(water_pal, seed=303, speck_prob=0.08)
+    tree_pal = [
+        (59, 82, 82, 255),
+        (69, 99, 87, 255),
+        (75, 111, 96, 255),
+        (81, 130, 106, 255),
+        (93, 150, 107, 255),
+    ]
+    tree_tex = _build_32x32_tex(tree_pal, seed=404, speck_prob=0.18)
+    tree_alt_pal = [
+        (86, 88, 66, 255),
+        (104, 110, 74, 255),
+        (122, 128, 84, 255),
+        (138, 144, 94, 255),
+    ]
+    tree_alt_tex = _build_32x32_tex(tree_alt_pal, seed=405, speck_prob=0.16)
+    rock_pal = [
+        (114, 108, 96, 255),
+        (126, 120, 108, 255),
+        (138, 132, 120, 255),
+        (152, 144, 132, 255),
+    ]
+    rock_tex = _build_32x32_tex(rock_pal, seed=505, speck_prob=0.12)
+
+    # Pasto, vereda, agua y arboles RTP con brillo diurno para que el tinte nocturno (-85) de Ao Oni no los vuelva negros
+    make_rmxp_autotile(os.path.join(out_img, "at_009-G2_Water01.png"), water_tex,
+                       out_tex=grass_tex, rim_color=(138, 142, 102, 255), fringe=5.0, edge_jitter=1.2, seed=9)
+    make_rmxp_autotile(os.path.join(out_img, "at_010-G2_Ground01.png"), grass_tex,
+                       edge_jitter=1.0, seed=10)
+    make_rmxp_autotile(os.path.join(out_img, "at_011-G2_Ground02.png"), dirt_tex,
+                       out_tex=grass_tex, rim_color=(143, 144, 99, 255), fringe=5.5, edge_jitter=1.6, seed=11)
+    make_rmxp_autotile(os.path.join(out_img, "at_038-Tree03.png"), tree_tex,
+                       rim_color=(45, 94, 90, 255), edge_jitter=1.8, transparent_outside=True, seed=38)
+    make_rmxp_autotile(os.path.join(out_img, "at_039-Tree04.png"), tree_alt_tex,
+                       rim_color=(64, 68, 52, 255), edge_jitter=1.8, transparent_outside=True, seed=39)
+    make_rmxp_autotile(os.path.join(out_img, "at_042-Ground02.png"), rock_tex,
+                       out_tex=grass_tex, rim_color=(104, 114, 78, 255), fringe=4.5, edge_jitter=1.4, seed=42)
+    make_solid_autotile(os.path.join(out_img, "at_062-CF_Lava01.png"), 155, 72, 42, 128, 52, 32)
     make_solid_autotile(os.path.join(out_img, "at_063-CF_Shadow01.png"), 0, 0, 0, 0, 0, 0, 120)
-    make_solid_autotile(os.path.join(out_img, "at_064-CF_Ground01.png"), 48, 44, 40, 42, 38, 34)
-    make_solid_autotile(os.path.join(out_img, "at_065-CF_Ground02.png"), 42, 38, 34, 36, 32, 28)
-    make_solid_autotile(os.path.join(out_img, "at_066-CF_Ground03.png"), 36, 32, 28, 30, 26, 22)
-    make_solid_autotile(os.path.join(out_img, "at_067-CF_Ground04.png"), 30, 28, 26, 24, 22, 20)
+    make_solid_autotile(os.path.join(out_img, "at_064-CF_Ground01.png"), 138, 130, 120, 122, 114, 104)
+    make_solid_autotile(os.path.join(out_img, "at_065-CF_Ground02.png"), 126, 118, 108, 110, 102, 94)
+    make_solid_autotile(os.path.join(out_img, "at_066-CF_Ground03.png"), 116, 108, 100, 102, 94, 88)
+    make_solid_autotile(os.path.join(out_img, "at_067-CF_Ground04.png"), 106, 98, 92, 94, 88, 82)
     make_bird_charset(os.path.join(out_img, "char_165-Small07.png"))
     make_bird_perched_charset(os.path.join(out_img, "char_166-Small08.png"))
     make_cell_door_charset(os.path.join(out_img, "char_173-Door04.png"))
