@@ -77,26 +77,12 @@ enum VideoScaleMode {
     SCALE_PIXEL_PERFECT = 2  // Entero Pixel-Perfect (4x = 2560x1920 en 4K, 2x = 1280x960 en 1080p)
 };
 
-enum FrameRateMode {
-    FPS_40_ORIGINAL = 0, // 40 FPS (1:1 Original RGSS1 / RPG Maker XP)
-    FPS_60_REMASTER = 1  // 60 FPS (Remaster Fluido)
-};
-
-static int g_frameRateMode = FPS_40_ORIGINAL; // Por defecto: 40 FPS 1:1 original fiel al clásico
 static int g_videoScaleMode = SCALE_4_3_FIT;
 static int g_videoResIndex = 0; // 0 = 720p (1280x720), 1 = 1080p (1920x1080), 2 = 4K Nativo PS4 Pro (3840x2160)
 static bool g_videoClearNeeded = true;
 
-static inline const char* getFrameRateLabel() {
-    return (g_frameRateMode == FPS_40_ORIGINAL) ? "40 FPS (Original 1:1 RGSS1)" : "60 FPS (Remaster Fluido)";
-}
-
-static inline void cycleFrameRateMode() {
-    g_frameRateMode = (g_frameRateMode == FPS_40_ORIGINAL) ? FPS_60_REMASTER : FPS_40_ORIGINAL;
-}
-
 static inline int getFpsTarget() {
-    return (g_frameRateMode == FPS_40_ORIGINAL) ? 40 : 60;
+    return 60;
 }
 
 static PS4_VideoData* getPs4VideoData() {
@@ -465,6 +451,15 @@ static void playBgs(const std::string& name, int volume = 100, int pitch = 100, 
     if (name.empty()) {
         g_bgsTrack.active = false;
         g_bgsTrack.name.clear();
+        g_bgsTrack.fadeTotalFrames = 0;
+        g_bgsTrack.fadeRemFrames = 0;
+        pthread_mutex_unlock(&g_audioMutex);
+        return;
+    }
+    if (g_bgsTrack.active && g_bgsTrack.name == name && g_bgsTrack.fadeTotalFrames == 0 && fadeInSeconds <= 0) {
+        g_bgsTrack.volume = std::max(0, std::min(100, volume));
+        g_bgsTrack.origPitch = pitch;
+        g_bgsTrack.stepFP = (uint32_t)((std::max(25, std::min(250, pitch)) * 65536ULL) / 100ULL);
         pthread_mutex_unlock(&g_audioMutex);
         return;
     }
@@ -485,14 +480,20 @@ static void playBgs(const std::string& name, int volume = 100, int pitch = 100, 
         g_bgsTrack.active = true;
     } else {
         g_bgsTrack.active = false;
+        g_bgsTrack.name.clear();
     }
     pthread_mutex_unlock(&g_audioMutex);
 }
 
 static void fadeOutBgs(int seconds) {
     pthread_mutex_lock(&g_audioMutex);
-    if (g_bgsTrack.active) {
-        int f = std::max(1, seconds) * 48000;
+    if (seconds <= 0) {
+        g_bgsTrack.active = false;
+        g_bgsTrack.name.clear();
+        g_bgsTrack.fadeTotalFrames = 0;
+        g_bgsTrack.fadeRemFrames = 0;
+    } else if (g_bgsTrack.active) {
+        int f = seconds * 48000;
         g_bgsTrack.fadeTotalFrames = f;
         g_bgsTrack.fadeRemFrames = f;
         g_bgsTrack.fadeIn = false;
@@ -754,13 +755,7 @@ static inline void applyToneRectFast(SDL_Surface* dst, int rx, int ry, int rw, i
     int x1 = std::min(dst->w, rx + rw), y1 = std::min(dst->h, ry + rh);
     if (x0 >= x1 || y0 >= y1) return;
 
-    // Si los 3 canales son negativos iguales (ej. -85 en la mansión), usar oscurecimiento directo
-    if (tr < 0 && tr == tg && tg == tb) {
-        uint8_t alpha = (uint8_t)std::min(255, -tr);
-        fillRectFast(dst, rx, ry, rw, rh, 0, 0, 0, alpha);
-        return;
-    }
-
+    // Sustracción/adición lineal exacta por canal (RGSS1 Tone: clamp(c + t, 0, 255))
     for (int y = y0; y < y1; y++) {
         uint32_t* row = (uint32_t*)((uint8_t*)dst->pixels + y * dst->pitch);
         for (int x = x0; x < x1; x++) {
@@ -884,7 +879,7 @@ static void blitSurf(SDL_Surface* src, const SDL_Rect* sr, SDL_Surface* dst, SDL
             if (dstIsWindow) {
                 uint32_t* dp = (uint32_t*)((uint8_t*)dst->pixels + (dy0 + y) * dst->pitch) + dx0;
                 for (int x = 0; x < dw; x++, sp += 4) {
-                    uint32_t sa = (sp[3] * alphaMul) >> 8;
+                    uint32_t sa = (alphaMul == 255) ? sp[3] : ((sp[3] * alphaMul) >> 8);
                     if (sa == 0) continue;
                     if (sa >= 254) {
                         dp[x] = packWinPixel(sp[0], sp[1], sp[2]);
@@ -902,7 +897,7 @@ static void blitSurf(SDL_Surface* src, const SDL_Rect* sr, SDL_Surface* dst, SDL
                 // Ambos RGBA32 (pre-renderizado de capas de mapa)
                 uint8_t* dp = (uint8_t*)dst->pixels + (dy0 + y) * dst->pitch + dx0 * 4;
                 for (int x = 0; x < dw; x++, sp += 4, dp += 4) {
-                    uint32_t sa = (sp[3] * alphaMul) >> 8;
+                    uint32_t sa = (alphaMul == 255) ? sp[3] : ((sp[3] * alphaMul) >> 8);
                     if (sa == 0) continue;
                     if (sa >= 254 || dp[3] == 0) {
                         dp[0] = sp[0]; dp[1] = sp[1]; dp[2] = sp[2]; dp[3] = (uint8_t)sa;
@@ -936,7 +931,7 @@ static void blitSurf(SDL_Surface* src, const SDL_Rect* sr, SDL_Surface* dst, SDL
             if (sx < 0 || sx >= src->w) continue;
 
             const uint8_t* sp = srow + sx * 4;
-            uint32_t sa = (sp[3] * alphaMul) >> 8;
+            uint32_t sa = (alphaMul == 255) ? sp[3] : ((sp[3] * alphaMul) >> 8);
             if (sa == 0) continue;
             if (sa >= 254) {
                 drow[px] = packWinPixel(sp[0], sp[1], sp[2]);
@@ -1079,6 +1074,11 @@ struct GameRuntime {
     std::vector<int16_t> layers;
     std::vector<uint8_t> passable;
     std::vector<uint8_t> priorities;
+    std::vector<uint8_t> maskedPenTiles;
+    bool autoplayBgs = false;
+    std::string mapBgsName;
+    int mapBgsVol = 100;
+    int mapBgsPitch = 100;
     std::vector<MapEvent> events;
 
     SDL_Surface* mapLowerSurf = nullptr;
@@ -1169,17 +1169,8 @@ static inline bool isEventMoving(const MapEvent& ev) {
 
 static inline float rmxpSpeedPxPerFrame(float spd) {
     float s = std::max(1.0f, std::min(7.0f, spd));
-    if (g_frameRateMode == FPS_40_ORIGINAL) {
-        // En RPG Maker XP nativo (40 FPS 1:1 RGSS1):
-        // Velocidad s: px/frame = (2^s) / 4.0f
-        // Velocidad 4 (Hiroshi normal): 16 / 4 = 4.0 px/frame exactos (8 frames = 0.20s por casilla de 32px)
-        // Velocidad 5 (Ao Oni persecución): 32 / 4 = 8.0 px/frame exactos (4 frames = 0.10s por casilla de 32px)
-        return std::pow(2.0f, s) / 4.0f;
-    } else {
-        // Modo Remaster a 60 FPS:
-        // px/frame = (2^s / 4) * (40 / 60) = (2^s) / 6.0f
-        return std::pow(2.0f, s) / 6.0f;
-    }
+    // Modo fijo a 60 FPS: px/frame = (2^s / 4) * (40 / 60) = (2^s) / 6.0f
+    return std::pow(2.0f, s) / 6.0f;
 }
 
 static int rmDirToRow(int d) {
@@ -1579,7 +1570,7 @@ static bool applyMoveCmd(int targetId, const MoveCmd& mc) {
             break;
         case 15: { // Wait inside Move Route
             int wf = std::max(1, mc.params[0].asInt(1));
-            if (g_frameRateMode == FPS_60_REMASTER) wf = (wf * 3) / 2;
+            wf = (wf * 3) / 2;
             if (targetId == -1) g_game.playerRouteWaitFrames = wf;
             else if (ev) ev->routeWaitFrames = wf;
             break;
@@ -1640,7 +1631,7 @@ static bool applyMoveCmd(int targetId, const MoveCmd& mc) {
                     ev->collisionAttack = true;
                     int dist = std::abs(ev->x - g_game.playerX) + std::abs(ev->y - g_game.playerY);
                     if (dist <= 6) {
-                        ev->routeWaitFrames = std::max(ev->routeWaitFrames, (int)(45 * getFpsTarget() / 60));
+                        ev->routeWaitFrames = std::max(ev->routeWaitFrames, 45);
                     }
                 }
                 consumesStep = false;
@@ -1680,9 +1671,127 @@ static bool applyMoveCmd(int targetId, const MoveCmd& mc) {
     return consumesStep;
 }
 
+static int rmxpSlot1AutotileSub(bool n, bool e, bool s, bool w, bool ne, bool se, bool sw, bool nw) {
+    if (n && e && s && w) {
+        return (nw ? 0 : 1) | (ne ? 0 : 2) | (se ? 0 : 4) | (sw ? 0 : 8);
+    }
+    if (!w && n && e && s) return 16 + (ne ? 0 : 1) + (se ? 0 : 2);
+    if (!n && e && s && w) return 20 + (se ? 0 : 1) + (sw ? 0 : 2);
+    if (!e && n && s && w) return 24 + (sw ? 0 : 1) + (nw ? 0 : 2);
+    if (!s && n && e && w) return 28 + (nw ? 0 : 1) + (ne ? 0 : 2);
+    if (!w && !e && n && s) return 32;
+    if (!n && !s && e && w) return 33;
+    if (!n && !w && e && s) return se ? 34 : 35;
+    if (!n && !e && s && w) return sw ? 36 : 37;
+    if (!s && !e && n && w) return nw ? 38 : 39;
+    if (!s && !w && n && e) return ne ? 40 : 41;
+    if (!n && !w && !e && s) return 42;
+    if (!n && !w && !s && e) return 43;
+    if (!w && !e && !s && n) return 44;
+    if (!n && !e && !s && w) return 45;
+    return 47;
+}
+
+static void maskIsolatedHoldingPens() {
+    int w = g_game.mapW, h = g_game.mapH;
+    g_game.maskedPenTiles.assign((size_t)w * (size_t)h, 0);
+    if (strcmp(g_game.autotileFiles[6], "AT-hekitainai") != 0 || g_game.layers.size() < (size_t)w * (size_t)h * 3) {
+        return;
+    }
+    bool isSlot1Heki = (strstr(g_game.autotileFiles[0], "heki") != nullptr);
+    std::vector<uint8_t> visited((size_t)w * (size_t)h, 0);
+    std::vector<uint8_t> affected((size_t)w * (size_t)h, 0);
+    auto L0 = [&](int x, int y) -> int16_t { return g_game.layers[x + y * w]; };
+    auto isSlot7 = [](int16_t t) -> bool { return t >= 336 && t < 384; };
+    auto hasAoAt = [&](int x, int y) -> bool {
+        for (const auto& ev : g_game.events) {
+            if (ev.x == x && ev.y == y) {
+                for (const auto& pg : ev.pages) {
+                    if (pg.char_name.rfind("ao", 0) == 0) return true;
+                }
+            }
+        }
+        return false;
+    };
+    const int d4x[4] = {1, -1, 0, 0};
+    const int d4y[4] = {0, 0, 1, -1};
+    for (int sy = 0; sy < h; sy++) {
+        for (int sx = 0; sx < w; sx++) {
+            if (visited[sy * w + sx] || !isSlot7(L0(sx, sy))) continue;
+            std::vector<std::pair<int, int>> comp;
+            std::vector<std::pair<int, int>> q;
+            q.push_back({sx, sy});
+            visited[sy * w + sx] = 1;
+            bool touchesReal = false;
+            bool hasAo = false;
+            while (!q.empty()) {
+                auto cur = q.back(); q.pop_back();
+                comp.push_back(cur);
+                if (hasAoAt(cur.first, cur.second)) hasAo = true;
+                for (int k = 0; k < 4; k++) {
+                    int nx = cur.first + d4x[k], ny = cur.second + d4y[k];
+                    if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
+                        int16_t nt = L0(nx, ny);
+                        if (isSlot7(nt)) {
+                            if (!visited[ny * w + nx]) {
+                                visited[ny * w + nx] = 1;
+                                q.push_back({nx, ny});
+                            }
+                        } else if (!(nt >= 48 && nt < 96) && nt != 0) {
+                            if (!(g_game.mapId == 70 && nt == 425)) {
+                                touchesReal = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if ((!touchesReal && comp.size() <= 32) || (!isSlot1Heki && comp.size() <= 16 && hasAo)) {
+                int16_t fillTile = isSlot1Heki ? 48 : 425;
+                for (const auto& c : comp) {
+                    int mx = c.first, my = c.second;
+                    g_game.maskedPenTiles[my * w + mx] = 1;
+                    g_game.layers[mx + my * w] = fillTile;
+                    for (int dy = -1; dy <= 1; dy++) {
+                        for (int dx = -1; dx <= 1; dx++) {
+                            int ax = mx + dx, ay = my + dy;
+                            if (ax >= 0 && ax < w && ay >= 0 && ay < h) {
+                                affected[ay * w + ax] = 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    auto isSlot1OrOob = [&](int x, int y) -> bool {
+        if (x < 0 || x >= w || y < 0 || y >= h) return true;
+        int16_t t = L0(x, y);
+        return t >= 48 && t < 96;
+    };
+    std::vector<int16_t> newSlot1((size_t)w * (size_t)h, -1);
+    for (int ay = 0; ay < h; ay++) {
+        for (int ax = 0; ax < w; ax++) {
+            if (!affected[ay * w + ax]) continue;
+            int16_t t = L0(ax, ay);
+            if (t >= 48 && t < 96) {
+                int sub = rmxpSlot1AutotileSub(
+                    isSlot1OrOob(ax, ay - 1), isSlot1OrOob(ax + 1, ay), isSlot1OrOob(ax, ay + 1), isSlot1OrOob(ax - 1, ay),
+                    isSlot1OrOob(ax + 1, ay - 1), isSlot1OrOob(ax + 1, ay + 1), isSlot1OrOob(ax - 1, ay + 1), isSlot1OrOob(ax - 1, ay - 1)
+                );
+                newSlot1[ay * w + ax] = (int16_t)(48 + sub);
+            }
+        }
+    }
+    for (int i = 0; i < w * h; i++) {
+        if (newSlot1[i] >= 0) g_game.layers[i] = newSlot1[i];
+    }
+}
+
 static void buildMapCacheSurfaces() {
     if (g_game.mapLowerSurf) { SDL_FreeSurface(g_game.mapLowerSurf); g_game.mapLowerSurf = nullptr; }
     if (g_game.mapUpperSurf) { SDL_FreeSurface(g_game.mapUpperSurf); g_game.mapUpperSurf = nullptr; }
+
+    maskIsolatedHoldingPens();
 
     int pw = g_game.mapW * TILE_SZ;
     int ph = g_game.mapH * TILE_SZ;
@@ -1761,6 +1870,16 @@ static bool loadMap(int mapId) {
         if (meta.get("autoplay_bgm").asBool(false)) {
             const JVal& b = meta.get("bgm");
             playBgm(b.get("name").asStr(), b.get("volume").asInt(100), b.get("pitch").asInt(100));
+        }
+        g_game.autoplayBgs = meta.get("autoplay_bgs").asBool(false);
+        if (g_game.autoplayBgs) {
+            const JVal& bs = meta.get("bgs");
+            g_game.mapBgsName = bs.get("name").asStr();
+            g_game.mapBgsVol = bs.get("volume").asInt(100);
+            g_game.mapBgsPitch = bs.get("pitch").asInt(100);
+            playBgs(g_game.mapBgsName, g_game.mapBgsVol, g_game.mapBgsPitch);
+        } else {
+            g_game.mapBgsName.clear();
         }
         const JVal& evs = meta.get("events");
         for (size_t i = 0; i < evs.a.size(); i++) {
@@ -2040,7 +2159,7 @@ static bool evalConditionCmd(int evId, const JVal& p) {
         case 3: {
             int sec = p[1].asInt(0);
             int cmp = p[2].asInt(0);
-            int curSec = g_game.timerFrames / getFpsTarget();
+            int curSec = g_game.timerFrames / 60;
             return (cmp == 0) ? (curSec >= sec) : (curSec <= sec);
         }
         case 4: {
@@ -2101,8 +2220,8 @@ static void execControlVars(int evId, const JVal& p) {
         int other = p[4].asInt(0);
         if (other == 0) val = g_game.mapId;
         // En RGSS (Interpreter 4, when 4): Play Time = Graphics.frame_count / Graphics.frame_rate (segundos)
-        else if (other == 4) val = (int)(g_game.frameCount / getFpsTarget());
-        else if (other == 5) val = g_game.timerFrames / getFpsTarget();
+        else if (other == 4) val = (int)(g_game.frameCount / 60);
+        else if (other == 5) val = g_game.timerFrames / 60;
     }
     for (int id = sId; id <= eId; id++) {
         if (id < 0 || id >= 512) continue;
@@ -2247,7 +2366,7 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                 return;
             }
             case 106: // Wait
-                waitFrames = (g_frameRateMode == FPS_60_REMASTER) ? ((p[0].asInt(1) * 3) / 2) : p[0].asInt(1);
+                waitFrames = (p[0].asInt(1) * 3) / 2;
                 ip++;
                 return;
             case 111: { // Conditional Branch
@@ -2398,7 +2517,7 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
             case 124: { // Control Timer
                 if (p[0].asInt(0) == 0) {
                     g_game.timerWorking = true;
-                    g_game.timerFrames = p[1].asInt(0) * getFpsTarget();
+                    g_game.timerFrames = p[1].asInt(0) * 60;
                 } else {
                     g_game.timerWorking = false;
                 }
@@ -2445,7 +2564,7 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                     g_game.nextDir = p[4].asInt(0);
                 }
                 // En Interpreter 5 (command_201) de Ao Oni: añade 1 segundo al timer al cambiar de sala
-                if (g_game.timerWorking) g_game.timerFrames += getFpsTarget();
+                if (g_game.timerWorking) g_game.timerFrames += 60;
                 g_game.nextNoFade = (p.a.size() >= 6 && p[5].asInt(0) == 1);
                 g_game.pendingTransfer = true;
                 ip++;
@@ -2509,7 +2628,7 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                             dist = std::abs(tev->x - g_game.playerX) + std::abs(tev->y - g_game.playerY);
                         }
                         if (dist <= 7) {
-                            tev->routeWaitFrames = std::max(tev->routeWaitFrames, (int)(80 * getFpsTarget() / 60));
+                            tev->routeWaitFrames = std::max(tev->routeWaitFrames, 80);
                             triggerRumble(240, 180, 25);
                             setPadLightbar(255, 0, 50);
                         }
@@ -2594,7 +2713,7 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                     g_game.curToneB = (float)g_game.toneB;
                     g_game.toneFrames = 0;
                 } else {
-                    g_game.toneFrames = dur;
+                    g_game.toneFrames = std::max(1, (dur * 3) / 2);
                 }
                 ip++;
                 break;
@@ -2622,7 +2741,7 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                 int picId = p[0].asInt(1);
                 if (picId >= 1 && picId <= 50 && g_game.pictures[picId].active) {
                     Picture& pic = g_game.pictures[picId];
-                    int dur = std::max(1, p[1].asInt(1));
+                    int dur = std::max(1, (std::max(1, p[1].asInt(1)) * 3) / 2);
                     pic.origin = p[2].asInt(0);
                     pic.targetX = (p[3].asInt(0) == 0) ? (float)p[4].asNum(0) : (float)g_game.variables[p[4].asInt(0)];
                     pic.targetY = (p[3].asInt(0) == 0) ? (float)p[5].asNum(0) : (float)g_game.variables[p[5].asInt(0)];
@@ -2774,7 +2893,7 @@ static void updatePictures() {
 static float getEffectivePlayerStepPx(bool sprinting) {
     float effPlayerSpeed = g_game.playerSpeed;
     if (sprinting && !g_game.playerRouteActive && g_game.fgStack.empty()) {
-        effPlayerSpeed = std::min(5.25f, g_game.playerSpeed + (g_frameRateMode == FPS_40_ORIGINAL ? 0.85f : 0.75f));
+        effPlayerSpeed = std::min(5.25f, g_game.playerSpeed + 0.75f);
     }
     return rmxpSpeedPxPerFrame(effPlayerSpeed);
 }
@@ -2852,7 +2971,7 @@ static void updateWalkAndEventsSmooth(bool sprinting, bool holdingMoveInput) {
 
         // Actualización de animación 1:1 RPG Maker XP (018_Game_Character_1.rb:137-166)
         bool moving = isEventMoving(ev);
-        int unit = (g_frameRateMode == FPS_40_ORIGINAL) ? 6 : 4;
+        int unit = 4;
         int thresh = std::max(6, (int)std::lround((18.0f - ev.move_speed * 2.0f) * 6.0f));
         int inc = 0;
         if (moving) {
@@ -3675,11 +3794,11 @@ int main(int argc, char* argv[]) {
             dpadRepeatHoldFrames = 0;
         }
 
-        // Registrar pulsación para eventos paralelos con cmd 105 (ej. Map 60 - Puzzle de la muñeca) sin interferir con L2/R2/R3 ni diálogos
+        // Registrar pulsación para eventos paralelos con cmd 105 (ej. Map 60 - Puzzle de la muñeca) sin interferir con L2/R2 ni diálogos
         if (state == STATE_MAP && g_game.transPhase == 0 && !g_game.pendingTransfer &&
             g_game.fgStack.empty() && !g_game.msgActive && !g_game.choiceActive &&
             !g_game.numInputActive && !g_game.btnInputActive && !g_game.nameInputActive) {
-            g_game.parBtnJustPressedMask = justPressedMask & ~((1u << PAD_L2) | (1u << PAD_R2) | (1u << PAD_R3));
+            g_game.parBtnJustPressedMask = justPressedMask & ~((1u << PAD_L2) | (1u << PAD_R2));
         } else {
             g_game.parBtnJustPressedMask = 0;
         }
@@ -3688,7 +3807,7 @@ int main(int argc, char* argv[]) {
         for (int b = 0; b <= 20; b++) {
             if (!(justPressedMask & (1u << b))) continue;
 
-            // Atajos globales PS4 / PS4 Pro: R2 cambia resolución (720p / 1080p / 4K Nativo), L2 cambia aspecto (4:3 / 16:9 / Pixel-Perfect), R3 cambia tasa de frames (40 FPS / 60 FPS)
+            // Atajos globales PS4 / PS4 Pro: R2 cambia resolución (720p / 1080p / 4K Nativo), L2 cambia aspecto (4:3 / 16:9 / Pixel-Perfect)
             if (b == PAD_R2) {
                 cycleVideoResolution();
                 playSe("001-System01", 80, 100);
@@ -3702,17 +3821,11 @@ int main(int argc, char* argv[]) {
                 videoBannerText = std::string("ESCALADO: ") + getVideoScaleLabel();
                 videoBannerFrames = 110;
                 continue;
-            } else if (b == PAD_R3) {
-                cycleFrameRateMode();
-                playSe("001-System01", 80, 100);
-                videoBannerText = std::string("TASA: ") + getFrameRateLabel();
-                videoBannerFrames = 110;
-                continue;
             }
 
             if (state == STATE_TITLE) {
-                if (b == PAD_UP)   { menuIndex = (menuIndex + 4) % 5; playSe("001-System01", 80, 100); }
-                if (b == PAD_DOWN) { menuIndex = (menuIndex + 1) % 5; playSe("001-System01", 80, 100); }
+                if (b == PAD_UP)   { menuIndex = (menuIndex + 3) % 4; playSe("001-System01", 80, 100); }
+                if (b == PAD_DOWN) { menuIndex = (menuIndex + 1) % 4; playSe("001-System01", 80, 100); }
                 if (b == PAD_LEFT || b == PAD_RIGHT) {
                     if (menuIndex == 2) {
                         cycleVideoResolution();
@@ -3720,9 +3833,6 @@ int main(int argc, char* argv[]) {
                     } else if (menuIndex == 3) {
                         g_videoScaleMode = (g_videoScaleMode + (b == PAD_RIGHT ? 1 : 2)) % 3;
                         g_videoClearNeeded = true;
-                        playSe("001-System01", 80, 100);
-                    } else if (menuIndex == 4) {
-                        cycleFrameRateMode();
                         playSe("001-System01", 80, 100);
                     }
                 }
@@ -3742,9 +3852,6 @@ int main(int argc, char* argv[]) {
                     } else if (menuIndex == 3) {
                         g_videoScaleMode = (g_videoScaleMode + 1) % 3;
                         g_videoClearNeeded = true;
-                        playSe("002-System02", 85, 100);
-                    } else if (menuIndex == 4) {
-                        cycleFrameRateMode();
                         playSe("002-System02", 85, 100);
                     }
                 }
@@ -4034,7 +4141,9 @@ int main(int argc, char* argv[]) {
                                  !g_game.pendingTransfer && g_game.transPhase != 1;
             if (canManualMove) {
                 // Red de seguridad: si el jugador puede moverse libremente por el mapa fuera de cutscenes, el sprite DEBE ser visible
-                if (g_game.playerTransparent && g_game.mapId != 75) {
+                bool isCutsceneMap = (g_game.mapId == 75 || g_game.mapId == 9 || g_game.mapId == 30 ||
+                                      g_game.mapId == 31 || g_game.mapId == 33 || g_game.mapId == 35 || g_game.mapId == 36);
+                if (g_game.playerTransparent && !isCutsceneMap) {
                     g_game.playerTransparent = false;
                 }
                 if (g_game.playerChar.empty()) {
@@ -4241,10 +4350,10 @@ int main(int argc, char* argv[]) {
                     }
                 } else {
                     g_game.transPhase = 1;
-                    g_game.fadeAlpha = std::min(255, g_game.fadeAlpha + 36);
+                    g_game.fadeAlpha = std::min(255, g_game.fadeAlpha + 24);
                 }
             } else if (g_game.transPhase == 2) {
-                g_game.fadeAlpha = std::max(0, g_game.fadeAlpha - 32);
+                g_game.fadeAlpha = std::max(0, g_game.fadeAlpha - 22);
                 if (g_game.fadeAlpha == 0) g_game.transPhase = 0;
             }
             if (g_game.gameOverTriggered) {
@@ -4267,23 +4376,23 @@ int main(int argc, char* argv[]) {
                 SDL_Rect dst = { offX, offY, GAME_W, GAME_H };
                 blitSurf(titleSurf, NULL, gameSurf, &dst);
             }
-            drawText(gameSurf, offX + 140, offY + 64, "AO ONI - PS4 PORT", 3, 220, 220, 255);
-            drawText(gameSurf, offX + 148, offY + 98, "Edicion 1:1 PS4 / PS4 Pro 4K Nativo", 2, 160, 195, 255);
+            drawText(gameSurf, offX + 140, offY + 56, "AO ONI - PS4 PORT", 3, 220, 220, 255);
+            drawText(gameSurf, offX + 92, offY + 90, "Edicion 1:1 PS4 / PS4 Pro 4K  (60 FPS)", 2, 160, 195, 255);
+            drawText(gameSurf, offX + 200, offY + 114, "Port by Outbreak2012", 2, 255, 225, 130);
 
-            fillRectFast(gameSurf, offX + 130, offY + 140, 395, 228, 20, 30, 80, 235);
-            drawRectFast(gameSurf, offX + 130, offY + 140, 395, 228, 220, 220, 255);
+            fillRectFast(gameSurf, offX + 130, offY + 146, 395, 186, 20, 30, 80, 235);
+            drawRectFast(gameSurf, offX + 130, offY + 146, 395, 186, 220, 220, 255);
 
             std::string opt2 = std::string("VIDEO: ") + getVideoResLabel();
             std::string opt3 = std::string("ASPECTO: ") + getVideoScaleLabel();
-            std::string opt4 = std::string("TASA: ") + getFrameRateLabel();
-            const char* opts[5] = { "NUEVA PARTIDA", "CONTINUAR", opt2.c_str(), opt3.c_str(), opt4.c_str() };
+            const char* opts[4] = { "NUEVA PARTIDA", "CONTINUAR", opt2.c_str(), opt3.c_str() };
             bool hasSave = g_memorySave.valid || g_autoSave.valid;
-            for (int i = 0; i < 5; i++) {
+            for (int i = 0; i < 4; i++) {
                 if (i == menuIndex) {
-                    fillRectFast(gameSurf, offX + 138, offY + 148 + i * 42, 379, 34, 60, 90, 160);
+                    fillRectFast(gameSurf, offX + 138, offY + 154 + i * 42, 379, 34, 60, 90, 160);
                 }
                 uint8_t tc = (i == 1 && !hasSave) ? 120 : 255;
-                drawText(gameSurf, offX + 148, offY + 156 + i * 42, opts[i], 2, tc, tc, tc);
+                drawText(gameSurf, offX + 148, offY + 162 + i * 42, opts[i], 2, tc, tc, tc);
             }
             if (aooniSurf) {
                 int cw = aooniSurf->w / 4, ch = aooniSurf->h / 4;
@@ -4291,8 +4400,8 @@ int main(int argc, char* argv[]) {
                 SDL_Rect dst = { offX + 24, offY + 188, cw * 2, ch * 2 };
                 blitSurf(aooniSurf, &src, gameSurf, &dst);
             }
-            drawText(gameSurf, offX + 24, offY + 412, "X: Aceptar | R3: 40/60 FPS | R2: Res | L2: Aspecto", 2, 190, 205, 235);
-            drawText(gameSurf, offX + 44, offY + 438, "L1/R1: Correr | Cuadrado: Guardar | OPTIONS: Inventario", 2, 165, 175, 205);
+            drawText(gameSurf, offX + 20, offY + 412, "X: Aceptar | R2: Resolucion | L2: Aspecto | 60 FPS", 2, 190, 205, 235);
+            drawText(gameSurf, offX + 26, offY + 438, "L1/R1: Correr | Cuadrado: Guardar | OPTIONS: Menu", 2, 165, 175, 205);
         } else if (state == STATE_GAMEOVER) {
             if (goSurf) {
                 SDL_Rect dst = { offX, offY, GAME_W, GAME_H };
@@ -4308,10 +4417,15 @@ int main(int argc, char* argv[]) {
         } else if (state == STATE_INVENTORY) {
             fillRectFast(gameSurf, offX + 24, offY + 24, GAME_W - 48, GAME_H - 48, 18, 26, 70);
             drawRectFast(gameSurf, offX + 24, offY + 24, GAME_W - 48, GAME_H - 48, 220, 220, 255);
-            drawText(gameSurf, offX + 44, offY + 40, "OBJETOS (X: Usar | Cuadrado: Guardar | OPTIONS / Circulo: Volver)", 2, 255, 235, 140);
+            drawText(gameSurf, offX + 38, offY + 38, "OBJETOS | X: Usar | [] Guardar | O/OPT: Volver", 2, 255, 235, 140);
+            int totalSec = (int)(g_game.frameCount / 60);
+            char hdrInfo[64];
+            snprintf(hdrInfo, sizeof(hdrInfo), "Tiempo: %02d:%02d  |  60 FPS  |  Port: Outbreak2012",
+                     totalSec / 60, totalSec % 60);
+            drawText(gameSurf, offX + 44, offY + 60, hdrInfo, 2, 170, 210, 245);
             drawText(gameSurf, offX + 44, offY + GAME_H - 54, "L1 + R1 + OPTIONS: Salir a la pantalla de titulo", 2, 160, 175, 210);
 
-            int iy = offY + 82;
+            int iy = offY + 86;
             if (ownedItems.empty()) {
                 drawText(gameSurf, offX + 48, iy, "(No tienes objetos todavia)", 2, 180, 180, 180);
             } else {
@@ -4370,6 +4484,11 @@ int main(int argc, char* argv[]) {
             drawList.reserve(g_game.events.size() + 1);
             for (const auto& mev : g_game.events) {
                 if (mev.activePage < 0 || (mev.char_name.empty() && mev.tile_id <= 0)) continue;
+                if (mev.x >= 0 && mev.x < g_game.mapW && mev.y >= 0 && mev.y < g_game.mapH &&
+                    (size_t)(mev.y * g_game.mapW + mev.x) < g_game.maskedPenTiles.size() &&
+                    g_game.maskedPenTiles[mev.y * g_game.mapW + mev.x] != 0) {
+                    continue;
+                }
                 drawList.push_back({ mev.realY, mev.always_top ? 1 : 0, false, &mev });
             }
             if (!g_game.playerTransparent && !g_game.playerChar.empty()) {
@@ -4662,11 +4781,11 @@ int main(int argc, char* argv[]) {
             drawText(gameSurf, bx + 12, 17, videoBannerText, 2, 255, 240, 140);
         }
 
-        if (g_frameRateMode == FPS_40_ORIGINAL) {
-            uint32_t elapsed = SDL_GetTicks() - frameStart;
-            if (elapsed < 25) {
-                SDL_Delay(25 - elapsed);
-            }
+        // Limitador fijo a 60 FPS (16.67 ms por frame)
+        uint32_t elapsed = SDL_GetTicks() - frameStart;
+        uint32_t targetMs = (frame % 3 == 0) ? 16 : 17;
+        if (elapsed < targetMs) {
+            SDL_Delay(targetMs - elapsed);
         }
 
         presentScaledCanvas(window, gameSurf);
