@@ -1567,15 +1567,75 @@ static bool isTinyInteractiveSheetName(const std::string& name) {
            name == "kinko_haikyo";
 }
 
-static bool pageGrantsItem(const EventPage& pg) {
-    if (pg.trigger != 0 || pg.list.a.size() <= 1) return false;
-    for (size_t i = 0; i < pg.list.a.size(); i++) {
-        const JVal& cmd = pg.list[i];
-        if (cmd.get("c").asInt(0) == 126 && cmd.get("p")[1].asInt(0) == 0) {
-            return true;
+static bool eventHasAnyPickupCmd(const MapEvent& ev) {
+    for (const auto& pg : ev.pages) {
+        if (pg.trigger != 0 || pg.list.a.size() <= 1) continue;
+        for (size_t i = 0; i < pg.list.a.size(); i++) {
+            const JVal& cmd = pg.list[i];
+            if (cmd.get("c").asInt(0) == 126 && cmd.get("p")[1].asInt(0) == 0) {
+                return true;
+            }
         }
     }
     return false;
+}
+
+static bool evalConditionCmd(int evId, const JVal& p);
+
+static bool pageGrantsUncollectedItem(const MapEvent& ev, const EventPage& pg) {
+    if (pg.trigger != 0 || pg.list.a.size() <= 1) return false;
+    struct CondFrame { int indent; bool active; bool deterministic; };
+    std::vector<CondFrame> stack;
+    for (size_t i = 0; i < pg.list.a.size(); i++) {
+        const JVal& cmd = pg.list[i];
+        int c = cmd.get("c").asInt(0);
+        int ind = cmd.get("i").asInt(0);
+        const JVal& p = cmd.get("p");
+        if (c == 111) {
+            int ctype = p[0].asInt(0);
+            // Solo ramas persistentes de estado de recolección (Interruptor != 49 persecución y Auto-Interruptor)
+            bool det = (ctype == 0 && p[1].asInt(1) != 49) || (ctype == 2);
+            bool active = det ? evalConditionCmd(ev.id, p) : true;
+            stack.push_back({ind, active, det});
+        } else if (c == 411) {
+            for (size_t k = stack.size(); k > 0; k--) {
+                if (stack[k - 1].indent == ind) {
+                    stack[k - 1].active = stack[k - 1].deterministic ? !stack[k - 1].active : true;
+                    break;
+                }
+            }
+        } else if (c == 412) {
+            while (!stack.empty() && stack.back().indent >= ind) {
+                stack.pop_back();
+            }
+        } else if (c == 126 && p[1].asInt(0) == 0) {
+            bool reachable = true;
+            for (const auto& f : stack) {
+                if (!f.active) { reachable = false; break; }
+            }
+            if (reachable) return true;
+        }
+    }
+    return false;
+}
+
+static void updateEventHighlightFlags(MapEvent& ev) {
+    if (ev.erased || ev.activePage < 0 || ev.activePage >= (int)ev.pages.size()) {
+        ev.grantsItem = false;
+        ev.isTinyInteractive = false;
+        ev.isInteractable = false;
+        return;
+    }
+    const EventPage& pg = ev.pages[ev.activePage];
+    ev.isInteractable = (pg.trigger == 0 && pg.list.a.size() > 1);
+    ev.grantsItem = pageGrantsUncollectedItem(ev, pg);
+    if (eventHasAnyPickupCmd(ev) && !ev.grantsItem) {
+        ev.isTinyInteractive = false;
+    } else {
+        ev.isTinyInteractive = (ev.char_name == "oil") ||
+                               (ev.isInteractable && isTinyInteractiveSheetName(ev.char_name)) ||
+                               (ev.grantsItem && ev.char_name.empty());
+    }
 }
 
 static void refreshEvents() {
@@ -1594,6 +1654,9 @@ static void refreshEvents() {
                 found = i;
                 break;
             }
+        }
+        if (found == ev.activePage && found >= 0) {
+            updateEventHighlightFlags(ev);
         }
         if (found != ev.activePage) {
             int prevWaitFrames = ev.routeWaitFrames;
@@ -1627,9 +1690,7 @@ static void refreshEvents() {
                 ev.move_type = pg.move_type;
                 ev.move_speed = (float)pg.move_speed;
                 ev.move_freq = pg.move_freq;
-                ev.isInteractable = (pg.trigger == 0 && pg.list.a.size() > 1);
-                ev.grantsItem = pageGrantsItem(pg);
-                ev.isTinyInteractive = isTinyInteractiveSheetName(ev.char_name) || (ev.grantsItem && ev.char_name.empty());
+                updateEventHighlightFlags(ev);
                 // Pre-aplicar modificadores iniciales de velocidad/ataque (code 45: @move_speed = 4.3, self.attack_on) al cambiar de página de IA (var[7])
                 if (pg.move_type == 3 && !pg.move_route.list.empty()) {
                     while (ev.routeIdx < pg.move_route.list.size()) {
@@ -1948,7 +2009,7 @@ static bool applyMoveCmd(int targetId, const MoveCmd& mc) {
             *pchar = resolveAoOniCharName(mc.params[0].asStr());
             if (ev) {
                 ev->cachedSurf = !pchar->empty() ? getSurf(std::string("/app0/assets/images/char_") + *pchar + ".png") : nullptr;
-                ev->isTinyInteractive = isTinyInteractiveSheetName(*pchar) || (ev->grantsItem && pchar->empty());
+                updateEventHighlightFlags(*ev);
             }
             if (targetId == -1) g_game.playerTransparent = pchar->empty();
             if (mc.params.a.size() >= 3 && mc.params[2].asInt(0) > 0) *pdir = mc.params[2].asInt(2);
@@ -2880,6 +2941,7 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                 int amt = (p[2].asInt(0) == 0) ? p[3].asInt(1) : g_game.variables[p[3].asInt(0)];
                 if (op == 0) g_game.inventory[itemId] += amt;
                 else g_game.inventory[itemId] = std::max(0, g_game.inventory[itemId] - amt);
+                refreshEvents();
                 ip++;
                 break;
             }
@@ -3202,7 +3264,7 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                 if (g_game.nameInputStr.empty()) g_game.nameInputStr = "Hiroshi";
                 g_game.nameInputRow = 0; // Iniciar en 'A' (Fila 0, Col 0) para que el jugador elija letras libremente
                 g_game.nameInputCol = 0;
-                g_game.nameInputCooldown = 20; // Debounce de 20 frames para no consumir la X del diálogo anterior
+                g_game.nameInputCooldown = 8; // Debounce de 8 frames solo para evitar confirmar accidentalmente con X
                 g_game.nameInputActive = true;
                 ip++;
                 return;
@@ -4375,6 +4437,10 @@ int main(int argc, char* argv[]) {
             g_game.parBtnJustPressedMask = 0;
         }
 
+        if (g_game.nameInputActive && g_game.nameInputCooldown > 0) {
+            g_game.nameInputCooldown--;
+        }
+
         // Procesar cada botón recién pulsado (o repetido en menú) una sola vez limpia por frame
         for (int b = 0; b <= 20; b++) {
             if (!(justPressedMask & (1u << b))) continue;
@@ -4487,8 +4553,8 @@ int main(int argc, char* argv[]) {
                 }
             } else if (state == STATE_MAP) {
                 if (g_game.nameInputActive) {
-                    if (g_game.nameInputCooldown > 0) {
-                        g_game.nameInputCooldown--;
+                    bool isDirBtn = (b == PAD_UP || b == PAD_DOWN || b == PAD_LEFT || b == PAD_RIGHT);
+                    if (g_game.nameInputCooldown > 0 && !isDirBtn) {
                         continue;
                     }
                     int maxCols = (g_game.nameInputRow == 6) ? 9 : 10;
@@ -5167,7 +5233,7 @@ int main(int argc, char* argv[]) {
             // 4.5) Brillo resplandeciente post-tono para llaves, ítems recogibles y pistas pequeñas
             if (!g_game.screenBlackout && g_game.fadeAlpha < 254) {
                 for (const auto& mev : g_game.events) {
-                    if (mev.activePage < 0) continue;
+                    if (mev.erased || mev.activePage < 0) continue;
                     if (mev.x >= 0 && mev.x < g_game.mapW && mev.y >= 0 && mev.y < g_game.mapH &&
                         (size_t)(mev.y * g_game.mapW + mev.x) < g_game.maskedPenTiles.size() &&
                         g_game.maskedPenTiles[mev.y * g_game.mapW + mev.x] != 0) {
