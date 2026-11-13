@@ -80,6 +80,7 @@ enum VideoScaleMode {
 static int g_videoScaleMode = SCALE_4_3_FIT;
 static int g_videoResIndex = 0; // 0 = 720p (1280x720), 1 = 1080p (1920x1080), 2 = 4K Nativo PS4 Pro (3840x2160)
 static bool g_videoClearNeeded = true;
+static bool g_highlightObjects = true; // QoL: brillo y pistas contextuales para objetos pasados por alto (Touchpad ON/OFF)
 
 static inline int getFpsTarget() {
     return 60;
@@ -183,8 +184,8 @@ static const char* getVideoScaleLabel() {
     return "4:3 Nitido";
 }
 
-// Escalador Nearest-Neighbor con caché de scanlines (escala 640x480 -> hasta 3840x2160 4K en < 1.5 ms)
-static void presentScaledCanvas(SDL_Window* window, SDL_Surface* gameSurf) {
+// Escalador Nearest-Neighbor con caché de scanlines (escala 640x480 -> hasta 3840x2160 4K sin re-limpiar bordes cada frame)
+static bool presentScaledCanvas(SDL_Window* window, SDL_Surface* gameSurf) {
     PS4_VideoData* vd = getPs4VideoData();
     if (!vd || !vd->buffers[0] || !vd->buffers[1]) {
         SDL_Surface* winSurf = SDL_GetWindowSurface(window);
@@ -192,7 +193,7 @@ static void presentScaledCanvas(SDL_Window* window, SDL_Surface* gameSurf) {
             SDL_BlitScaled(gameSurf, NULL, winSurf, NULL);
             SDL_UpdateWindowSurface(window);
         }
-        return;
+        return false;
     }
 
     if (g_videoClearNeeded) {
@@ -221,43 +222,48 @@ static void presentScaledCanvas(SDL_Window* window, SDL_Surface* gameSurf) {
 
     const int dstX = (outW - dstW) / 2;
     const int dstY = (outH - dstH) / 2;
-    uint32_t* dstBase = (uint32_t*)vd->buffers[vd->currentBuffer];
-    const uint32_t* srcBase = (const uint32_t*)gameSurf->pixels;
+    uint32_t* __restrict dstBase = (uint32_t*)vd->buffers[vd->currentBuffer];
+    const uint32_t* __restrict srcBase = (const uint32_t*)gameSurf->pixels;
     const int srcPitch = gameSurf->pitch / 4;
 
-    // Limpieza de bordes fuera del área de juego (barras negras superior e inferior si hay letterbox)
-    if (dstY > 0) {
-        memset(dstBase, 0, (size_t)dstY * outW * sizeof(uint32_t));
-        memset(dstBase + (size_t)(dstY + dstH) * outW, 0, (size_t)(outH - dstY - dstH) * outW * sizeof(uint32_t));
-    }
-
     static int s_cachedDstW = 0;
+    static int s_cachedDstH = 0;
     static int s_xMap[4096];
+    static int s_yMap[2160];
     if (s_cachedDstW != dstW) {
         for (int x = 0; x < dstW && x < 4096; x++) {
             s_xMap[x] = (x * GAME_W) / dstW;
         }
         s_cachedDstW = dstW;
     }
+    if (s_cachedDstH != dstH) {
+        for (int y = 0; y < dstH && y < 2160; y++) {
+            s_yMap[y] = (y * GAME_H) / dstH;
+        }
+        s_cachedDstH = dstH;
+    }
 
     int prevSy = -1;
-    uint32_t* prevDstRow = nullptr;
+    const uint32_t* prevDstRow = nullptr;
     const size_t rowBytes = (size_t)dstW * 4u;
+    const int* __restrict xmap = s_xMap;
 
     for (int y = 0; y < dstH; y++) {
-        int sy = (y * GAME_H) / dstH;
-        uint32_t* dstRow = dstBase + (size_t)(dstY + y) * outW + dstX;
-        // Limpieza de bordes laterales (barras negras 4:3 en 1080p/4K) para que no se vea nada fuera del mapa
-        if (dstX > 0) {
-            memset(dstRow - dstX, 0, (size_t)dstX * sizeof(uint32_t));
-            memset(dstRow + dstW, 0, (size_t)(outW - dstX - dstW) * sizeof(uint32_t));
-        }
+        int sy = (y < 2160) ? s_yMap[y] : ((y * GAME_H) / dstH);
+        uint32_t* __restrict dstRow = dstBase + (size_t)(dstY + y) * outW + dstX;
         if (sy == prevSy && prevDstRow) {
             memcpy(dstRow, prevDstRow, rowBytes);
         } else {
-            const uint32_t* srcRow = srcBase + (size_t)sy * srcPitch;
-            for (int x = 0; x < dstW; x++) {
-                dstRow[x] = srcRow[s_xMap[x]];
+            const uint32_t* __restrict srcRow = srcBase + (size_t)sy * srcPitch;
+            int x = 0;
+            for (; x + 3 < dstW; x += 4) {
+                dstRow[x]     = srcRow[xmap[x]];
+                dstRow[x + 1] = srcRow[xmap[x + 1]];
+                dstRow[x + 2] = srcRow[xmap[x + 2]];
+                dstRow[x + 3] = srcRow[xmap[x + 3]];
+            }
+            for (; x < dstW; x++) {
+                dstRow[x] = srcRow[xmap[x]];
             }
             prevSy = sy;
             prevDstRow = dstRow;
@@ -269,6 +275,7 @@ static void presentScaledCanvas(SDL_Window* window, SDL_Surface* gameSurf) {
     int outEv = 0;
     sceKernelWaitEqueue(vd->flipQueue, &ev, 1, &outEv, NULL);
     vd->currentBuffer = (vd->currentBuffer + 1) & 1;
+    return true;
 }
 
 // ==================== SISTEMA DE AUDIO PS4 (sceAudioOut 48kHz Stereo) ====================
@@ -755,16 +762,24 @@ static inline void applyToneRectFast(SDL_Surface* dst, int rx, int ry, int rw, i
     int x1 = std::min(dst->w, rx + rw), y1 = std::min(dst->h, ry + rh);
     if (x0 >= x1 || y0 >= y1) return;
 
-    // Sustracción/adición lineal exacta por canal (RGSS1 Tone: clamp(c + t, 0, 255))
+    // LUT de 256 entradas precalculada (solo se regenera al cambiar el tono de pantalla)
+    static int s_lastTr = 999999, s_lastTg = 999999, s_lastTb = 999999;
+    static uint8_t s_lutR[256], s_lutG[256], s_lutB[256];
+    if (s_lastTr != tr || s_lastTg != tg || s_lastTb != tb) {
+        for (int i = 0; i < 256; i++) {
+            s_lutR[i] = (uint8_t)std::max(0, std::min(255, i + tr));
+            s_lutG[i] = (uint8_t)std::max(0, std::min(255, i + tg));
+            s_lutB[i] = (uint8_t)std::max(0, std::min(255, i + tb));
+        }
+        s_lastTr = tr; s_lastTg = tg; s_lastTb = tb;
+    }
+
     for (int y = y0; y < y1; y++) {
         uint32_t* row = (uint32_t*)((uint8_t*)dst->pixels + y * dst->pitch);
         for (int x = x0; x < x1; x++) {
             uint8_t r, g, b;
             unpackWinPixel(row[x], r, g, b);
-            int nr = std::max(0, std::min(255, (int)r + tr));
-            int ng = std::max(0, std::min(255, (int)g + tg));
-            int nb = std::max(0, std::min(255, (int)b + tb));
-            row[x] = packWinPixel((uint8_t)nr, (uint8_t)ng, (uint8_t)nb);
+            row[x] = packWinPixel(s_lutR[r], s_lutG[g], s_lutB[b]);
         }
     }
 }
@@ -948,6 +963,85 @@ static void blitSurf(SDL_Surface* src, const SDL_Rect* sr, SDL_Surface* dst, SDL
     }
 }
 
+// Blitter con rotación/escala para PictureRotate (cmd 233, ej: fragmentos de cabeza en Map 021)
+static void blitSurfRotated(SDL_Surface* src, SDL_Surface* dst, float centerX, float centerY,
+                            float zoomX, float zoomY, float angleDeg, uint8_t alphaMul = 255) {
+    if (!src || !dst || !src->pixels || !dst->pixels || alphaMul == 0) return;
+    float zx = std::max(1.0f, zoomX) / 100.0f;
+    float zy = std::max(1.0f, zoomY) / 100.0f;
+    float dw = src->w * zx;
+    float dh = src->h * zy;
+    float rad = -angleDeg * (3.14159265f / 180.0f);
+    float c = std::cos(rad);
+    float s = std::sin(rad);
+    float halfDiag = 0.5f * std::sqrt(dw * dw + dh * dh) + 2.0f;
+
+    int x0 = std::max(0, (int)std::floor(centerX - halfDiag));
+    int y0 = std::max(0, (int)std::floor(centerY - halfDiag));
+    int x1 = std::min(dst->w, (int)std::ceil(centerX + halfDiag));
+    int y1 = std::min(dst->h, (int)std::ceil(centerY + halfDiag));
+    if (x0 >= x1 || y0 >= y1) return;
+
+    float invZx = 1.0f / zx;
+    float invZy = 1.0f / zy;
+    float hSrcW = src->w * 0.5f;
+    float hSrcH = src->h * 0.5f;
+
+    for (int py = y0; py < y1; py++) {
+        float dy = (py + 0.5f) - centerY;
+        uint32_t* drow = (uint32_t*)((uint8_t*)dst->pixels + py * dst->pitch);
+        for (int px = x0; px < x1; px++) {
+            float dx = (px + 0.5f) - centerX;
+            int sx = (int)std::floor((dx * c + dy * s) * invZx + hSrcW);
+            int sy = (int)std::floor((-dx * s + dy * c) * invZy + hSrcH);
+            if (sx < 0 || sx >= src->w || sy < 0 || sy >= src->h) continue;
+            const uint8_t* sp = (const uint8_t*)src->pixels + sy * src->pitch + sx * 4;
+            uint32_t sa = (alphaMul == 255) ? sp[3] : ((sp[3] * alphaMul) >> 8);
+            if (sa == 0) continue;
+            if (sa >= 254) {
+                drow[px] = packWinPixel(sp[0], sp[1], sp[2]);
+            } else {
+                uint8_t dr, dg, db;
+                unpackWinPixel(drow[px], dr, dg, db);
+                uint32_t inv = 255 - sa;
+                drow[px] = packWinPixel((uint8_t)((sp[0] * sa + dr * inv) >> 8),
+                                        (uint8_t)((sp[1] * sa + dg * inv) >> 8),
+                                        (uint8_t)((sp[2] * sa + db * inv) >> 8));
+            }
+        }
+    }
+}
+
+// Marco de ventana RPG Maker XP usando ws_wskin_n.png (con respaldo limpio para recuadros pequeños)
+static void drawWindowBox(SDL_Surface* dst, int x, int y, int w, int h, uint8_t fillAlpha = 220) {
+    if (!dst || w <= 4 || h <= 4) return;
+    fillRectFast(dst, x + 2, y + 2, w - 4, h - 4, 12, 16, 36, fillAlpha);
+    static SDL_Surface* s_ws = nullptr;
+    static bool s_wsInit = false;
+    if (!s_wsInit) {
+        s_wsInit = true;
+        s_ws = getSurf("/app0/assets/images/ws_wskin_n.png");
+    }
+    if (s_ws && w >= 32 && h >= 32) {
+        SDL_Rect tlS = { 128, 0, 16, 16 },  tlD = { x, y, 16, 16 };
+        SDL_Rect trS = { 176, 0, 16, 16 },  trD = { x + w - 16, y, 16, 16 };
+        SDL_Rect blS = { 128, 48, 16, 16 }, blD = { x, y + h - 16, 16, 16 };
+        SDL_Rect brS = { 176, 48, 16, 16 }, brD = { x + w - 16, y + h - 16, 16, 16 };
+        SDL_Rect tS  = { 144, 0, 32, 16 },  tD  = { x + 16, y, w - 32, 16 };
+        SDL_Rect bS  = { 144, 48, 32, 16 }, bD  = { x + 16, y + h - 16, w - 32, 16 };
+        SDL_Rect lS  = { 128, 16, 16, 32 }, lD  = { x, y + 16, 16, h - 32 };
+        SDL_Rect rS  = { 176, 16, 16, 32 }, rD  = { x + w - 16, y + 16, 16, h - 32 };
+        blitSurf(s_ws, &tlS, dst, &tlD);
+        blitSurf(s_ws, &trS, dst, &trD);
+        blitSurf(s_ws, &blS, dst, &blD);
+        blitSurf(s_ws, &brS, dst, &brD);
+        if (w > 32) { blitSurf(s_ws, &tS, dst, &tD); blitSurf(s_ws, &bS, dst, &bD); }
+        if (h > 32) { blitSurf(s_ws, &lS, dst, &lD); blitSurf(s_ws, &rS, dst, &rD); }
+    } else {
+        drawRectFast(dst, x, y, w, h, 225, 232, 255);
+    }
+}
+
 // Tabla oficial de RPG Maker XP para los 48 sub-patrones de Autotiles (4 cuadrantes de 16x16)
 static const uint8_t AUTOTILE_LUT[48][4] = {
     {26,27,32,33},{ 4,27,32,33},{26, 5,32,33},{ 4, 5,32,33},{26,27,32,11},{ 4,27,32,11},{26, 5,32,11},{ 4, 5,32,11},
@@ -1005,9 +1099,14 @@ struct MapEvent {
     int animTicks = 0;
     int dir = 2, pattern = 0, original_pattern = 0, opacity = 255, tile_id = 0;
     std::string char_name;
+    SDL_Surface* cachedSurf = nullptr;
     bool walk_anime = true, through = false, always_top = false, dir_fix = false, step_anime = false, erased = false;
     bool collisionAttack = false; // Activado por MoveCmd 45 "attack_on" (XAS_BA)
     bool isBattler = false;       // Identificado por página dummy con variable_id == 25 (XAS_BA::ENEMY_ID_VARIABLE_ID)
+    bool grantsItem = false;      // Página activa trigger==0 contiene cmd 126 (añadir objeto)
+    bool isTinyInteractive = false; // Interruptor/pista pequeña o contenedor visible QoL
+    bool isInteractable = false;  // Página activa trigger==0 con acción interactuable
+    int jumpTimer = 0, jumpTotal = 0;
     int move_type = 0;
     float move_speed = 3.0f;
     int move_freq = 3;
@@ -1028,9 +1127,11 @@ struct MapEvent {
 struct Picture {
     bool active = false;
     std::string name;
+    SDL_Surface* cachedSurf = nullptr;
     int origin = 0; // 0=upper-left, 1=center
     float x = 0, y = 0, zoomX = 100.0f, zoomY = 100.0f, opacity = 255.0f;
     float targetX = 0, targetY = 0, targetZoomX = 100.0f, targetZoomY = 100.0f, targetOpacity = 255.0f;
+    float angle = 0.0f, rotSpeed = 0.0f;
     int moveFrames = 0;
 };
 
@@ -1099,9 +1200,14 @@ struct GameRuntime {
     size_t playerRouteIdx = 0;
     uint32_t lastPlayerRouteTick = 0;
     int playerRouteWaitFrames = 0;
+    int playerJumpTimer = 0, playerJumpTotal = 0;
 
     bool timerWorking = false;
     int timerFrames = 0;
+
+    int weatherType = 0, weatherPower = 0; // cmd 236 (lluvia en exteriores/ánexo)
+    bool animActive = false;               // cmd 207 (ej: anim_bang.png en Map 021)
+    int animTargetId = 0, animFrame = 0, animTotalFrames = 15;
 
     int toneR = 0, toneG = 0, toneB = 0;
     float curToneR = 0.0f, curToneG = 0.0f, curToneB = 0.0f;
@@ -1157,12 +1263,14 @@ struct GameRuntime {
 } g_game;
 
 static inline bool isPlayerMoving() {
+    if (g_game.playerJumpTimer > 0) return true;
     float dx = std::fabs(g_game.playerRealX - g_game.playerX * (float)TILE_SZ);
     float dy = std::fabs(g_game.playerRealY - g_game.playerY * (float)TILE_SZ);
     return dx > 0.08f || dy > 0.08f;
 }
 
 static inline bool isEventMoving(const MapEvent& ev) {
+    if (ev.jumpTimer > 0) return true;
     return std::fabs(ev.realX - ev.x * (float)TILE_SZ) > 0.05f ||
            std::fabs(ev.realY - ev.y * (float)TILE_SZ) > 0.05f;
 }
@@ -1268,9 +1376,35 @@ static std::string resolveAoOniCharName(const std::string& rawName) {
     }
 }
 
+static bool isTinyInteractiveSheetName(const std::string& name) {
+    return name == "akari_switch2" || name == "179-Switch02" || name == "nejiana" ||
+           name == "waretagaku" || name == "hankati" || name == "saraware" ||
+           name == "ningyou_c" || name == "bou" || name == "oil" || name == "nawa" ||
+           name == "ochitagaku" || name == "jokoueki_tana" || name == "3f_kami" ||
+           name == "kinko_haikyo";
+}
+
+static bool pageGrantsItem(const EventPage& pg) {
+    if (pg.trigger != 0 || pg.list.a.size() <= 1) return false;
+    for (size_t i = 0; i < pg.list.a.size(); i++) {
+        const JVal& cmd = pg.list[i];
+        if (cmd.get("c").asInt(0) == 126 && cmd.get("p")[1].asInt(0) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void refreshEvents() {
     for (auto& ev : g_game.events) {
-        if (ev.erased) { ev.activePage = -1; continue; }
+        if (ev.erased) {
+            ev.activePage = -1;
+            ev.grantsItem = false;
+            ev.isTinyInteractive = false;
+            ev.isInteractable = false;
+            ev.cachedSurf = nullptr;
+            continue;
+        }
         int found = -1;
         for (int i = (int)ev.pages.size() - 1; i >= 0; i--) {
             if (checkPageCond(g_game.mapId, ev.id, ev.pages[i])) {
@@ -1286,10 +1420,17 @@ static void refreshEvents() {
             ev.routeIdx = 0;
             ev.routeWaitFrames = 0;
             ev.collisionAttack = false;
+            ev.grantsItem = false;
+            ev.isTinyInteractive = false;
+            ev.isInteractable = false;
+            ev.cachedSurf = nullptr;
             if (found >= 0) {
                 const auto& pg = ev.pages[found];
                 ev.animTicks = 0;
                 ev.char_name = resolveAoOniCharName(pg.char_name);
+                if (!ev.char_name.empty()) {
+                    ev.cachedSurf = getSurf(std::string("/app0/assets/images/char_") + ev.char_name + ".png");
+                }
                 ev.tile_id = pg.tile_id;
                 ev.dir = pg.dir;
                 ev.original_pattern = pg.pattern % 4;
@@ -1303,6 +1444,9 @@ static void refreshEvents() {
                 ev.move_type = pg.move_type;
                 ev.move_speed = (float)pg.move_speed;
                 ev.move_freq = pg.move_freq;
+                ev.isInteractable = (pg.trigger == 0 && pg.list.a.size() > 1);
+                ev.grantsItem = pageGrantsItem(pg);
+                ev.isTinyInteractive = isTinyInteractiveSheetName(ev.char_name) || (ev.grantsItem && ev.char_name.empty());
                 // Pre-aplicar modificadores iniciales de velocidad/ataque (code 45: @move_speed = 4.3, self.attack_on) al cambiar de página de IA (var[7])
                 if (pg.move_type == 3 && !pg.move_route.list.empty()) {
                     while (ev.routeIdx < pg.move_route.list.size()) {
@@ -1339,7 +1483,11 @@ static void refreshEvents() {
                 ev.tile_id = 0;
             }
         } else if (found >= 0 && ev.pages[found].char_name == "ao") {
-            ev.char_name = resolveAoOniCharName("ao");
+            std::string resolved = resolveAoOniCharName("ao");
+            if (resolved != ev.char_name) {
+                ev.char_name = resolved;
+                ev.cachedSurf = !ev.char_name.empty() ? getSurf(std::string("/app0/assets/images/char_") + ev.char_name + ".png") : nullptr;
+            }
         }
     }
 }
@@ -1563,11 +1711,19 @@ static bool applyMoveCmd(int targetId, const MoveCmd& mc) {
             *pdir = od;
             break;
         }
-        case 14:
+        case 14: { // Jump [dx, dy] con arco parabólico RMXP
             *px += mc.params[0].asInt(0);
             *py += mc.params[1].asInt(0);
+            if (targetId == -1) {
+                g_game.playerJumpTotal = 18;
+                g_game.playerJumpTimer = 18;
+            } else if (ev) {
+                ev->jumpTotal = 18;
+                ev->jumpTimer = 18;
+            }
             walked = true;
             break;
+        }
         case 15: { // Wait inside Move Route
             int wf = std::max(1, mc.params[0].asInt(1));
             wf = (wf * 3) / 2;
@@ -1607,6 +1763,10 @@ static bool applyMoveCmd(int targetId, const MoveCmd& mc) {
         case 40: if (ev) ev->always_top = false; consumesStep = false; break;
         case 41: // Change Graphic: [char_name, hue, dir, pattern]
             *pchar = resolveAoOniCharName(mc.params[0].asStr());
+            if (ev) {
+                ev->cachedSurf = !pchar->empty() ? getSurf(std::string("/app0/assets/images/char_") + *pchar + ".png") : nullptr;
+                ev->isTinyInteractive = isTinyInteractiveSheetName(*pchar) || (ev->grantsItem && pchar->empty());
+            }
             if (targetId == -1) g_game.playerTransparent = pchar->empty();
             if (mc.params.a.size() >= 3 && mc.params[2].asInt(0) > 0) *pdir = mc.params[2].asInt(2);
             if (mc.params.a.size() >= 4) {
@@ -2637,6 +2797,16 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                 ip++;
                 break;
             }
+            case 207: { // Show Animation (ej: [targetId, animId] en Map 021 Ev 2)
+                int tId = p[0].asInt(0);
+                if (tId == 0) tId = evId;
+                g_game.animActive = true;
+                g_game.animTargetId = tId;
+                g_game.animFrame = 0;
+                g_game.animTotalFrames = 15; // 5 frames x 3 ticks a 60 FPS
+                ip++;
+                break;
+            }
             case 208: // Change Transparent Flag
                 g_game.playerTransparent = (p[0].asInt(0) == 0);
                 ip++;
@@ -2724,6 +2894,7 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                     Picture& pic = g_game.pictures[picId];
                     pic.active = true;
                     pic.name = p[1].asStr();
+                    pic.cachedSurf = pic.name.empty() ? nullptr : getSurf(std::string("/app0/assets/images/pic_") + pic.name + ".png");
                     pic.origin = p[2].asInt(0);
                     float px = (p[3].asInt(0) == 0) ? (float)p[4].asNum(0) : (float)g_game.variables[p[4].asInt(0)];
                     float py = (p[3].asInt(0) == 0) ? (float)p[5].asNum(0) : (float)g_game.variables[p[5].asInt(0)];
@@ -2732,6 +2903,8 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                     pic.zoomX = pic.targetZoomX = (float)p[6].asNum(100.0);
                     pic.zoomY = pic.targetZoomY = (float)p[7].asNum(100.0);
                     pic.opacity = pic.targetOpacity = (float)p[8].asNum(255.0);
+                    pic.angle = 0.0f;
+                    pic.rotSpeed = 0.0f;
                     pic.moveFrames = 0;
                 }
                 ip++;
@@ -2753,9 +2926,26 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
                 ip++;
                 break;
             }
+            case 233: { // Rotate Picture
+                int picId = p[0].asInt(1);
+                if (picId >= 1 && picId <= 50 && g_game.pictures[picId].active) {
+                    g_game.pictures[picId].rotSpeed = (float)p[1].asNum(0.0);
+                }
+                ip++;
+                break;
+            }
             case 235: { // Erase Picture
                 int picId = p[0].asInt(1);
-                if (picId >= 1 && picId <= 50) g_game.pictures[picId].active = false;
+                if (picId >= 1 && picId <= 50) {
+                    g_game.pictures[picId].active = false;
+                    g_game.pictures[picId].cachedSurf = nullptr;
+                }
+                ip++;
+                break;
+            }
+            case 236: { // Set Weather Effects (0=Ninguno, 1=Lluvia)
+                g_game.weatherType = p[0].asInt(0);
+                g_game.weatherPower = p[1].asInt(0);
                 ip++;
                 break;
             }
@@ -2868,7 +3058,11 @@ static void runInterpreterSlice(const JVal& list, size_t& ip, int& waitFrames, i
 static void updatePictures() {
     for (int i = 1; i <= 50; i++) {
         Picture& pic = g_game.pictures[i];
-        if (!pic.active || pic.moveFrames <= 0) continue;
+        if (!pic.active) continue;
+        if (std::fabs(pic.rotSpeed) > 0.001f) {
+            pic.angle += pic.rotSpeed * 0.5f;
+        }
+        if (pic.moveFrames <= 0) continue;
         float d = (float)pic.moveFrames;
         pic.x = (pic.x * (d - 1.0f) + pic.targetX) / d;
         pic.y = (pic.y * (d - 1.0f) + pic.targetY) / d;
@@ -2876,6 +3070,12 @@ static void updatePictures() {
         pic.zoomY = (pic.zoomY * (d - 1.0f) + pic.targetZoomY) / d;
         pic.opacity = (pic.opacity * (d - 1.0f) + pic.targetOpacity) / d;
         pic.moveFrames--;
+    }
+    if (g_game.animActive) {
+        g_game.animFrame++;
+        if (g_game.animFrame >= g_game.animTotalFrames) {
+            g_game.animActive = false;
+        }
     }
     if (g_game.toneFrames > 0) {
         float d = (float)g_game.toneFrames;
@@ -2933,6 +3133,7 @@ static void applyCarryoverPlayerSubPixel(float remPx) {
 }
 
 static void updateWalkAndEventsSmooth(bool sprinting, bool holdingMoveInput) {
+    if (g_game.playerJumpTimer > 0) g_game.playerJumpTimer--;
     static int s_idleGraceFrames = 0;
     if (isPlayerMoving() || holdingMoveInput) {
         s_idleGraceFrames = 3;
@@ -2956,6 +3157,7 @@ static void updateWalkAndEventsSmooth(bool sprinting, bool holdingMoveInput) {
                            g_game.numInputActive || g_game.btnInputActive || g_game.nameInputActive || g_game.pendingTransfer;
     for (auto& ev : g_game.events) {
         if (ev.activePage < 0) continue;
+        if (ev.jumpTimer > 0) ev.jumpTimer--;
         bool isAoBattler = isAoOniBattlerEvent(ev);
         if (!nonPreemptPause || ev.routeActive || !isAoBattler) {
             float etx = (float)(ev.x * TILE_SZ);
@@ -3314,8 +3516,15 @@ static bool restoreFromSnapshot(const SaveSnapshot& snap) {
     g_game.pendingTransfer = g_game.nextNoFade = g_game.gameOverTriggered = g_game.returnToTitleTriggered = false;
     g_game.parBtnJustPressedMask = 0;
     g_game.timerWorking = false;
+    g_game.weatherType = 0;
+    g_game.weatherPower = 0;
+    g_game.animActive = false;
+    g_game.playerJumpTimer = g_game.playerJumpTotal = 0;
     g_game.menuDisabled = false; // Restablecer acceso al inventario tras continuar/cargar partida
-    for (int i = 0; i < 52; i++) g_game.pictures[i].active = false;
+    for (int i = 0; i < 52; i++) {
+        g_game.pictures[i].active = false;
+        g_game.pictures[i].cachedSurf = nullptr;
+    }
     loadMap(snap.mapId);
     g_game.playerX = snap.playerX;
     g_game.playerY = snap.playerY;
@@ -3341,7 +3550,14 @@ static void resetNewGame() {
     memset(g_game.variables, 0, sizeof(g_game.variables));
     g_game.selfSwitches.clear();
     g_game.inventory.clear();
-    for (int i = 0; i < 52; i++) g_game.pictures[i].active = false;
+    for (int i = 0; i < 52; i++) {
+        g_game.pictures[i].active = false;
+        g_game.pictures[i].cachedSurf = nullptr;
+    }
+    g_game.weatherType = 0;
+    g_game.weatherPower = 0;
+    g_game.animActive = false;
+    g_game.playerJumpTimer = g_game.playerJumpTotal = 0;
     g_game.partyActors = g_game.startingParty;
     g_game.playerChar = resolveLeaderPartyChar();
     g_game.actorNames[2] = "Hiroshi";
@@ -3552,6 +3768,170 @@ static void drawSparkleStarGlow(SDL_Surface* gameSurf, int offX, int offY, int c
     }
 }
 
+// Brillo sutil y estrella viva para TODOS los objetos recogibles (incluyendo cajones/mesas) e ítems pequeños QoL
+static void drawLivingItemGlint(SDL_Surface* gameSurf, int offX, int offY, int camX, int camY,
+                                const MapEvent& mev, int evPxX, int evPxY) {
+    if (!g_highlightObjects || isSparkleSheetName(mev.char_name)) return;
+    if (!mev.grantsItem && !mev.isTinyInteractive) return;
+
+    int cx = offX + (evPxX - camX) + TILE_SZ / 2;
+    int cy = offY + (evPxY - camY) + TILE_SZ / 2 - 2;
+    if (!mev.char_name.empty() && mev.cachedSurf && mev.cachedSurf->w >= 4 && mev.cachedSurf->h >= 4) {
+        int cw = mev.cachedSurf->w / 4;
+        int ch = mev.cachedSurf->h / 4;
+        int ex = offX + (evPxX - camX) - (cw - TILE_SZ) / 2;
+        int ey = offY + (evPxY - camY) - (ch - TILE_SZ);
+        cx = ex + cw / 2;
+        cy = ey + std::max(8, ch / 2);
+    }
+
+    int phase = (int)((g_game.frameCount + (uint32_t)mev.id * 19u) % 90u);
+    int op = std::min(255, std::max(0, mev.opacity));
+    uint8_t cr = mev.grantsItem ? 255 : 190;
+    uint8_t cg = mev.grantsItem ? 242 : 232;
+    uint8_t cb = mev.grantsItem ? 150 : 255;
+
+    // Núcleo suave constante para que ítems muy pequeños/oscuros no pasen desapercibidos
+    int baseGlow = mev.grantsItem ? 115 : 85;
+    blendSparklePixel(gameSurf, offX, offY, camX, camY, mev.always_top, cx, cy, cr, cg, cb, (baseGlow * op) >> 8);
+    if (phase < 36) {
+        int env = (phase < 18) ? phase : (36 - phase); // 0..18..0
+        int centerI = ((baseGlow + env * 7) * op) >> 8;
+        int arm1I   = ((35 + env * 9) * op) >> 8;
+        int arm2I   = ((env * 5) * op) >> 8;
+        int arm3I   = ((env * 2) * op) >> 8;
+        blendSparklePixel(gameSurf, offX, offY, camX, camY, mev.always_top, cx, cy, 255, 255, 235, std::min(255, centerI));
+        blendSparklePixel(gameSurf, offX, offY, camX, camY, mev.always_top, cx - 1, cy, cr, cg, cb, arm1I);
+        blendSparklePixel(gameSurf, offX, offY, camX, camY, mev.always_top, cx + 1, cy, cr, cg, cb, arm1I);
+        blendSparklePixel(gameSurf, offX, offY, camX, camY, mev.always_top, cx, cy - 1, cr, cg, cb, arm1I);
+        blendSparklePixel(gameSurf, offX, offY, camX, camY, mev.always_top, cx, cy + 1, cr, cg, cb, arm1I);
+        if (env >= 5) {
+            blendSparklePixel(gameSurf, offX, offY, camX, camY, mev.always_top, cx - 2, cy, cr, cg, cb, arm2I);
+            blendSparklePixel(gameSurf, offX, offY, camX, camY, mev.always_top, cx + 2, cy, cr, cg, cb, arm2I);
+            blendSparklePixel(gameSurf, offX, offY, camX, camY, mev.always_top, cx, cy - 2, cr, cg, cb, arm2I);
+            blendSparklePixel(gameSurf, offX, offY, camX, camY, mev.always_top, cx, cy + 2, cr, cg, cb, arm2I);
+        }
+        if (env >= 6) {
+            int diagI = ((env * 4) * op) >> 8;
+            blendSparklePixel(gameSurf, offX, offY, camX, camY, mev.always_top, cx - 1, cy - 1, cr, cg, cb, diagI);
+            blendSparklePixel(gameSurf, offX, offY, camX, camY, mev.always_top, cx + 1, cy - 1, cr, cg, cb, diagI);
+            blendSparklePixel(gameSurf, offX, offY, camX, camY, mev.always_top, cx - 1, cy + 1, cr, cg, cb, diagI);
+            blendSparklePixel(gameSurf, offX, offY, camX, camY, mev.always_top, cx + 1, cy + 1, cr, cg, cb, diagI);
+        }
+        if (env >= 11) {
+            blendSparklePixel(gameSurf, offX, offY, camX, camY, mev.always_top, cx - 3, cy, cr, cg, cb, arm3I);
+            blendSparklePixel(gameSurf, offX, offY, camX, camY, mev.always_top, cx + 3, cy, cr, cg, cb, arm3I);
+            blendSparklePixel(gameSurf, offX, offY, camX, camY, mev.always_top, cx, cy - 3, cr, cg, cb, arm3I);
+            blendSparklePixel(gameSurf, offX, offY, camX, camY, mev.always_top, cx, cy + 3, cr, cg, cb, arm3I);
+        }
+    }
+}
+
+// Clima RMXP (cmd 236): trazos diagonales de lluvia y pequeñas gotas sin asignaciones
+static void drawRainWeather(SDL_Surface* gameSurf, int offX, int offY, uint32_t frame) {
+    if (!gameSurf || !gameSurf->pixels || g_game.weatherType <= 0 || g_game.weatherPower <= 0) return;
+    int drops = std::min(72, g_game.weatherPower * 8);
+    int vx = -2;
+    int vy = 6;
+    for (int i = 0; i < drops; i++) {
+        uint32_t seed = (uint32_t)i * 2654435761u;
+        int startX = (int)((seed ^ (seed >> 13)) % (uint32_t)GAME_W);
+        int startY = (int)(((seed >> 7) ^ (seed >> 19)) % (uint32_t)GAME_H);
+        int t = (int)((frame * 3u + (seed & 63u)) % 120u);
+        int x = offX + ((startX + t * vx + GAME_W * 4) % GAME_W);
+        int y = offY + ((startY + t * vy) % GAME_H);
+        for (int s = 0; s < 11; s++) {
+            int px = x - s / 3;
+            int py = y + s;
+            if (px < offX || px >= offX + GAME_W || py < offY || py >= offY + GAME_H) continue;
+            uint32_t* row = (uint32_t*)((uint8_t*)gameSurf->pixels + py * gameSurf->pitch);
+            uint8_t dr, dg, db;
+            unpackWinPixel(row[px], dr, dg, db);
+            int boost = (s > 7) ? 95 : 68;
+            row[px] = packWinPixel((uint8_t)std::min(255, (int)dr + boost - 14),
+                                   (uint8_t)std::min(255, (int)dg + boost - 4),
+                                   (uint8_t)std::min(255, (int)db + boost + 18));
+        }
+    }
+}
+
+// Animación de batalla/impacto (cmd 207, ej: anim_bang.png en Map 021 Ev 2)
+static void drawActiveAnimation(SDL_Surface* gameSurf, int offX, int offY, int camX, int camY) {
+    if (!g_game.animActive) return;
+    static SDL_Surface* s_animBang = nullptr;
+    static bool s_animTried = false;
+    if (!s_animTried) {
+        s_animTried = true;
+        s_animBang = getSurf("/app0/assets/images/anim_bang.png");
+    }
+    if (!s_animBang) return;
+    int px = (int)std::round(g_game.playerRealX);
+    int py = (int)std::round(g_game.playerRealY);
+    if (g_game.animTargetId > 0) {
+        MapEvent* tev = findEvent(g_game.animTargetId);
+        if (tev) {
+            px = (int)std::round(tev->realX);
+            py = (int)std::round(tev->realY);
+        }
+    }
+    int maxCells = std::max(1, s_animBang->w / 192);
+    int cel = std::min(maxCells - 1, g_game.animFrame / 3);
+    SDL_Rect src = { cel * 192, 0, 192, std::min(192, s_animBang->h) };
+    SDL_Rect dst = { offX + (px - camX) + TILE_SZ / 2 - 96, offY + (py - camY) + TILE_SZ / 2 - 96, 192, std::min(192, s_animBang->h) };
+    blitSurf(s_animBang, &src, gameSurf, &dst);
+}
+
+// Indicador contextual discreto [X] frente a objetos, puertas o pistas interactuables
+static void drawInteractPrompt(SDL_Surface* gameSurf, int offX, int offY, int camX, int camY, uint32_t frame) {
+    if (!g_highlightObjects || g_game.playerTransparent || g_game.screenBlackout || g_game.fadeAlpha >= 128) return;
+    if (!g_game.fgStack.empty() || g_game.msgActive || g_game.choiceActive ||
+        g_game.numInputActive || g_game.btnInputActive || g_game.nameInputActive ||
+        g_game.pendingTransfer || g_game.transPhase != 0) return;
+
+    const MapEvent* hit = nullptr;
+    auto isMasked = [&](const MapEvent& ev) {
+        return ev.x >= 0 && ev.x < g_game.mapW && ev.y >= 0 && ev.y < g_game.mapH &&
+               (size_t)(ev.y * g_game.mapW + ev.x) < g_game.maskedPenTiles.size() &&
+               g_game.maskedPenTiles[ev.y * g_game.mapW + ev.x] != 0;
+    };
+    for (const auto& mev : g_game.events) {
+        if (mev.activePage >= 0 && mev.isInteractable && !isMasked(mev) &&
+            mev.x == g_game.playerX && mev.y == g_game.playerY) {
+            hit = &mev; break;
+        }
+    }
+    int fx = g_game.playerX + (g_game.playerDir == 4 ? -1 : (g_game.playerDir == 6 ? 1 : 0));
+    int fy = g_game.playerY + (g_game.playerDir == 8 ? -1 : (g_game.playerDir == 2 ? 1 : 0));
+    if (!hit) {
+        for (const auto& mev : g_game.events) {
+            if (mev.activePage >= 0 && mev.isInteractable && !isMasked(mev) && mev.x == fx && mev.y == fy) {
+                hit = &mev; break;
+            }
+        }
+    }
+    if (!hit && isMapTileCounter(fx, fy)) {
+        int f2x = fx + (g_game.playerDir == 4 ? -1 : (g_game.playerDir == 6 ? 1 : 0));
+        int f2y = fy + (g_game.playerDir == 8 ? -1 : (g_game.playerDir == 2 ? 1 : 0));
+        for (const auto& mev : g_game.events) {
+            if (mev.activePage >= 0 && mev.isInteractable && !isMasked(mev) && mev.x == f2x && mev.y == f2y) {
+                hit = &mev; break;
+            }
+        }
+    }
+    if (!hit) return;
+
+    int bob = (int)std::round(std::sin((float)frame * 0.14f) * 1.5f);
+    int tx = offX + ((int)std::round(hit->realX) - camX) + TILE_SZ / 2;
+    int ty = offY + ((int)std::round(hit->realY) - camY) - 22 + bob;
+    int bw = hit->grantsItem ? 36 : 26;
+    int bh = 18;
+    int bx = std::max(offX + 6, std::min(offX + GAME_W - bw - 6, tx - bw / 2));
+    int by = std::max(offY + 6, std::min(offY + GAME_H - bh - 6, ty));
+    fillRectFast(gameSurf, bx, by, bw, bh, 12, 16, 38, 225);
+    drawRectFast(gameSurf, bx, by, bw, bh, hit->grantsItem ? 255 : 220, hit->grantsItem ? 232 : 228, hit->grantsItem ? 130 : 255);
+    drawText(gameSurf, bx + 5, by + 3, hit->grantsItem ? "X *" : "X", 2, hit->grantsItem ? 255 : 240, hit->grantsItem ? 235 : 245, hit->grantsItem ? 120 : 255);
+}
+
 enum AppState { STATE_TITLE = 0, STATE_MAP = 1, STATE_INVENTORY = 2, STATE_GAMEOVER = 3 };
 
 int main(int argc, char* argv[]) {
@@ -3618,7 +3998,6 @@ int main(int argc, char* argv[]) {
     uint32_t prevPadMask = 0;
     int lastPressedDir = 2; // Última dirección pulsada por el usuario (2=Abajo, 4=Izq, 6=Der, 8=Arriba)
     int dpadRepeatHoldFrames = 0;
-    uint32_t lastStepTick = 0;
     uint32_t autoSaveBannerFrames = 0;
     uint32_t videoBannerFrames = 0;
     std::string videoBannerText;
@@ -3654,8 +4033,9 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // Construir lista de items actuales para el inventario
-        std::vector<int> ownedItems;
+        // Construir lista reutilizable de items actuales para el inventario
+        static std::vector<int> ownedItems;
+        ownedItems.clear();
         for (const auto& kv : g_game.inventory)
             if (kv.second > 0) ownedItems.push_back(kv.first);
 
@@ -3676,6 +4056,7 @@ int main(int argc, char* argv[]) {
                 else if (sc == SDL_SCANCODE_C) eventPressedMask |= (1u << PAD_SQUARE);
                 else if (sc == SDL_SCANCODE_V) eventPressedMask |= (1u << PAD_TRIANGLE);
                 else if (sc == SDL_SCANCODE_LSHIFT || sc == SDL_SCANCODE_RSHIFT) eventPressedMask |= (1u << PAD_L1);
+                else if (sc == SDL_SCANCODE_F) eventPressedMask |= (1u << PAD_TOUCHPAD);
                 else if (sc == SDL_SCANCODE_TAB) eventPressedMask |= (1u << PAD_OPTIONS);
             }
         }
@@ -3695,6 +4076,7 @@ int main(int argc, char* argv[]) {
             if (kstate[SDL_SCANCODE_C]) curPadMask |= (1u << PAD_SQUARE);
             if (kstate[SDL_SCANCODE_V]) curPadMask |= (1u << PAD_TRIANGLE);
             if (kstate[SDL_SCANCODE_LSHIFT] || kstate[SDL_SCANCODE_RSHIFT]) curPadMask |= (1u << PAD_L1);
+            if (kstate[SDL_SCANCODE_F]) curPadMask |= (1u << PAD_TOUCHPAD);
             if (kstate[SDL_SCANCODE_TAB]) curPadMask |= (1u << PAD_OPTIONS);
         }
 
@@ -3819,6 +4201,12 @@ int main(int argc, char* argv[]) {
                 g_videoClearNeeded = true;
                 playSe("001-System01", 80, 100);
                 videoBannerText = std::string("ESCALADO: ") + getVideoScaleLabel();
+                videoBannerFrames = 110;
+                continue;
+            } else if (b == PAD_TOUCHPAD) {
+                g_highlightObjects = !g_highlightObjects;
+                playSe("001-System01", 80, 100);
+                videoBannerText = g_highlightObjects ? "BRILLO OBJETOS: ACTIVADO" : "BRILLO OBJETOS: CLASICO";
                 videoBannerFrames = 110;
                 continue;
             }
@@ -4198,7 +4586,6 @@ int main(int argc, char* argv[]) {
                     if (canPass) {
                         g_game.playerX = nx;
                         g_game.playerY = ny;
-                        lastStepTick = now;
 
                         // Contacto al entrar a la casilla destino (Player Touch / Event Touch)
                         for (const auto& mev : g_game.events) {
@@ -4380,8 +4767,7 @@ int main(int argc, char* argv[]) {
             drawText(gameSurf, offX + 92, offY + 90, "Edicion 1:1 PS4 / PS4 Pro 4K  (60 FPS)", 2, 160, 195, 255);
             drawText(gameSurf, offX + 200, offY + 114, "Port by Outbreak2012", 2, 255, 225, 130);
 
-            fillRectFast(gameSurf, offX + 130, offY + 146, 395, 186, 20, 30, 80, 235);
-            drawRectFast(gameSurf, offX + 130, offY + 146, 395, 186, 220, 220, 255);
+            drawWindowBox(gameSurf, offX + 130, offY + 146, 395, 186, 230);
 
             std::string opt2 = std::string("VIDEO: ") + getVideoResLabel();
             std::string opt3 = std::string("ASPECTO: ") + getVideoScaleLabel();
@@ -4389,10 +4775,10 @@ int main(int argc, char* argv[]) {
             bool hasSave = g_memorySave.valid || g_autoSave.valid;
             for (int i = 0; i < 4; i++) {
                 if (i == menuIndex) {
-                    fillRectFast(gameSurf, offX + 138, offY + 154 + i * 42, 379, 34, 60, 90, 160);
+                    fillRectFast(gameSurf, offX + 140, offY + 156 + i * 42, 375, 32, 60, 90, 160, 210);
                 }
                 uint8_t tc = (i == 1 && !hasSave) ? 120 : 255;
-                drawText(gameSurf, offX + 148, offY + 162 + i * 42, opts[i], 2, tc, tc, tc);
+                drawText(gameSurf, offX + 150, offY + 164 + i * 42, opts[i], 2, tc, tc, tc);
             }
             if (aooniSurf) {
                 int cw = aooniSurf->w / 4, ch = aooniSurf->h / 4;
@@ -4400,8 +4786,8 @@ int main(int argc, char* argv[]) {
                 SDL_Rect dst = { offX + 24, offY + 188, cw * 2, ch * 2 };
                 blitSurf(aooniSurf, &src, gameSurf, &dst);
             }
-            drawText(gameSurf, offX + 20, offY + 412, "X: Aceptar | R2: Resolucion | L2: Aspecto | 60 FPS", 2, 190, 205, 235);
-            drawText(gameSurf, offX + 26, offY + 438, "L1/R1: Correr | Cuadrado: Guardar | OPTIONS: Menu", 2, 165, 175, 205);
+            drawText(gameSurf, offX + 16, offY + 412, "X: Aceptar | R2: Resolucion | L2: Aspecto | 60 FPS", 2, 190, 205, 235);
+            drawText(gameSurf, offX + 16, offY + 438, "L1/R1: Correr | []: Guardar | TOUCHPAD: Brillo ON/OFF", 2, 165, 180, 215);
         } else if (state == STATE_GAMEOVER) {
             if (goSurf) {
                 SDL_Rect dst = { offX, offY, GAME_W, GAME_H };
@@ -4415,24 +4801,27 @@ int main(int argc, char* argv[]) {
                 drawText(gameSurf, offX + 140, offY + 424, "Pulsa X para volver al titulo", 2, 220, 220, 220);
             }
         } else if (state == STATE_INVENTORY) {
-            fillRectFast(gameSurf, offX + 24, offY + 24, GAME_W - 48, GAME_H - 48, 18, 26, 70);
-            drawRectFast(gameSurf, offX + 24, offY + 24, GAME_W - 48, GAME_H - 48, 220, 220, 255);
-            drawText(gameSurf, offX + 38, offY + 38, "OBJETOS | X: Usar | [] Guardar | O/OPT: Volver", 2, 255, 235, 140);
+            drawWindowBox(gameSurf, offX + 24, offY + 24, GAME_W - 48, GAME_H - 48, 230);
+            drawText(gameSurf, offX + 40, offY + 38, "OBJETOS | X: Usar | [] Guardar | O/OPT: Volver", 2, 255, 235, 140);
             int totalSec = (int)(g_game.frameCount / 60);
-            char hdrInfo[64];
-            snprintf(hdrInfo, sizeof(hdrInfo), "Tiempo: %02d:%02d  |  60 FPS  |  Port: Outbreak2012",
-                     totalSec / 60, totalSec % 60);
+            char hdrInfo[80];
+            snprintf(hdrInfo, sizeof(hdrInfo), "Tiempo: %02d:%02d  |  Brillo: %s  |  Outbreak2012",
+                     totalSec / 60, totalSec % 60, g_highlightObjects ? "ON" : "OFF");
             drawText(gameSurf, offX + 44, offY + 60, hdrInfo, 2, 170, 210, 245);
-            drawText(gameSurf, offX + 44, offY + GAME_H - 54, "L1 + R1 + OPTIONS: Salir a la pantalla de titulo", 2, 160, 175, 210);
+            drawText(gameSurf, offX + 44, offY + GAME_H - 54, "TOUCHPAD: Brillo | L1+R1+OPT: Salir al titulo", 2, 160, 175, 210);
 
-            int iy = offY + 86;
+            int iy = offY + 88;
             if (ownedItems.empty()) {
                 drawText(gameSurf, offX + 48, iy, "(No tienes objetos todavia)", 2, 180, 180, 180);
             } else {
-                for (size_t idx = 0; idx < ownedItems.size(); idx++) {
+                const int maxVisible = 9;
+                if (invCursor >= (int)ownedItems.size()) invCursor = (int)ownedItems.size() - 1;
+                int invScroll = std::max(0, invCursor - (maxVisible - 1));
+                size_t endIdx = std::min(ownedItems.size(), (size_t)(invScroll + maxVisible));
+                for (size_t idx = (size_t)invScroll; idx < endIdx; idx++) {
                     int id = ownedItems[idx];
                     if ((int)idx == invCursor) {
-                        fillRectFast(gameSurf, offX + 36, iy - 4, GAME_W - 72, 28, 60, 90, 165);
+                        fillRectFast(gameSurf, offX + 38, iy - 4, GAME_W - 76, 28, 60, 90, 165, 215);
                     }
                     std::string iname = g_game.itemDefs.count(id) ? g_game.itemDefs[id].name : ("Item #" + std::to_string(id));
                     std::string iicon = g_game.itemDefs.count(id) ? g_game.itemDefs[id].icon : "";
@@ -4451,13 +4840,12 @@ int main(int argc, char* argv[]) {
                 if (invCursor >= 0 && invCursor < (int)ownedItems.size()) {
                     int selId = ownedItems[invCursor];
                     std::string desc = g_game.itemDefs.count(selId) ? g_game.itemDefs[selId].desc : "";
-                    fillRectFast(gameSurf, offX + 36, offY + GAME_H - 96, GAME_W - 72, 56, 12, 18, 48);
-                    drawRectFast(gameSurf, offX + 36, offY + GAME_H - 96, GAME_W - 72, 56, 160, 170, 220);
-                    drawText(gameSurf, offX + 46, offY + GAME_H - 84, desc, 2, 210, 220, 255);
+                    drawWindowBox(gameSurf, offX + 36, offY + GAME_H - 102, GAME_W - 72, 46, 225);
+                    drawText(gameSurf, offX + 48, offY + GAME_H - 86, desc, 2, 210, 220, 255);
                 }
             }
             if (!invStatusMsg.empty()) {
-                drawText(gameSurf, offX + 46, offY + GAME_H - 122, invStatusMsg, 2, 140, 255, 160);
+                drawText(gameSurf, offX + 46, offY + GAME_H - 126, invStatusMsg, 2, 140, 255, 160);
             }
         } else if (state == STATE_MAP) {
             int pPxX = (int)std::round(g_game.playerRealX);
@@ -4480,8 +4868,8 @@ int main(int argc, char* argv[]) {
 
             // 2) Ordenar por coordenada Y sub-píxel y dibujar eventos + jugador (screen_z 1:1 RPG Maker XP)
             struct SpriteDraw { float ry; int order; bool isPlayer; const MapEvent* ev; };
-            std::vector<SpriteDraw> drawList;
-            drawList.reserve(g_game.events.size() + 1);
+            static std::vector<SpriteDraw> drawList;
+            drawList.clear();
             for (const auto& mev : g_game.events) {
                 if (mev.activePage < 0 || (mev.char_name.empty() && mev.tile_id <= 0)) continue;
                 if (mev.x >= 0 && mev.x < g_game.mapW && mev.y >= 0 && mev.y < g_game.mapH &&
@@ -4500,37 +4888,51 @@ int main(int argc, char* argv[]) {
                 return (a.isPlayer ? 1 : 0) < (b.isPlayer ? 1 : 0);
             });
 
-            SDL_Surface* tsSurf = nullptr;
+            static std::string s_cachedPlayerChar;
+            static SDL_Surface* s_cachedPlayerSurf = nullptr;
+            if (s_cachedPlayerChar != g_game.playerChar) {
+                s_cachedPlayerChar = g_game.playerChar;
+                s_cachedPlayerSurf = !s_cachedPlayerChar.empty() ? getSurf(std::string("/app0/assets/images/char_") + s_cachedPlayerChar + ".png") : nullptr;
+            }
+            static std::string s_cachedTsName;
+            static SDL_Surface* s_cachedTsSurf = nullptr;
+            if (s_cachedTsName != g_game.tilesetFile) {
+                s_cachedTsName = g_game.tilesetFile;
+                s_cachedTsSurf = g_game.tilesetFile[0] ? getSurf(std::string("/app0/assets/images/ts_") + s_cachedTsName + ".png") : nullptr;
+            }
+
             auto drawSpriteEntry = [&](const SpriteDraw& sd) {
                 if (sd.isPlayer) {
-                    SDL_Surface* ps = getSurf(std::string("/app0/assets/images/char_") + g_game.playerChar + ".png");
+                    SDL_Surface* ps = s_cachedPlayerSurf;
                     if (!ps) return;
                     int cw = ps->w / 4, ch = ps->h / 4;
+                    int jumpOff = (g_game.playerJumpTimer > 0 && g_game.playerJumpTotal > 0)
+                        ? (int)(56.0f * ((float)g_game.playerJumpTimer / g_game.playerJumpTotal) * (1.0f - (float)g_game.playerJumpTimer / g_game.playerJumpTotal)) : 0;
                     SDL_Rect src = { g_game.playerPattern * cw, rmDirToRow(g_game.playerDir) * ch, cw, ch };
                     int px = offX + (pPxX - camX) - (cw - TILE_SZ) / 2;
-                    int py = offY + (pPxY - camY) - (ch - TILE_SZ);
+                    int py = offY + (pPxY - camY) - (ch - TILE_SZ) - jumpOff;
                     SDL_Rect dst = { px, py, cw, ch };
                     blitSurf(ps, &src, gameSurf, &dst);
                 } else if (sd.ev) {
                     int evPxX = (int)std::round(sd.ev->realX);
                     int evPxY = (int)std::round(sd.ev->realY);
+                    int jumpOff = (sd.ev->jumpTimer > 0 && sd.ev->jumpTotal > 0)
+                        ? (int)(56.0f * ((float)sd.ev->jumpTimer / sd.ev->jumpTotal) * (1.0f - (float)sd.ev->jumpTimer / sd.ev->jumpTotal)) : 0;
                     if (!sd.ev->char_name.empty()) {
-                        SDL_Surface* es = getSurf(std::string("/app0/assets/images/char_") + sd.ev->char_name + ".png");
+                        SDL_Surface* es = sd.ev->cachedSurf;
                         if (!es) return;
                         int cw = es->w / 4, ch = es->h / 4;
                         SDL_Rect src = { sd.ev->pattern * cw, rmDirToRow(sd.ev->dir) * ch, cw, ch };
                         int ex = offX + (evPxX - camX) - (cw - TILE_SZ) / 2;
-                        int ey = offY + (evPxY - camY) - (ch - TILE_SZ);
+                        int ey = offY + (evPxY - camY) - (ch - TILE_SZ) - jumpOff;
                         SDL_Rect dst = { ex, ey, cw, ch };
                         blitSurf(es, &src, gameSurf, &dst, (uint8_t)sd.ev->opacity);
                     } else if (sd.ev->tile_id >= 384) {
-                        if (!tsSurf && g_game.tilesetFile[0])
-                            tsSurf = getSurf(std::string("/app0/assets/images/ts_") + g_game.tilesetFile + ".png");
-                        if (tsSurf) {
+                        if (s_cachedTsSurf) {
                             int tIndex = sd.ev->tile_id - 384;
                             SDL_Rect src = { (tIndex % 8) * TILE_SZ, (tIndex / 8) * TILE_SZ, TILE_SZ, TILE_SZ };
-                            SDL_Rect dst = { offX + (evPxX - camX), offY + (evPxY - camY), TILE_SZ, TILE_SZ };
-                            blitSurf(tsSurf, &src, gameSurf, &dst, (uint8_t)sd.ev->opacity);
+                            SDL_Rect dst = { offX + (evPxX - camX), offY + (evPxY - camY) - jumpOff, TILE_SZ, TILE_SZ };
+                            blitSurf(s_cachedTsSurf, &src, gameSurf, &dst, (uint8_t)sd.ev->opacity);
                         }
                     }
                 }
@@ -4560,29 +4962,47 @@ int main(int argc, char* argv[]) {
                 applyToneRectFast(gameSurf, offX, offY, GAME_W, GAME_H, tr, tg, tb);
             }
 
-            // 4.5) Brillo resplandeciente post-tono para objetos recogibles activos
+            // 4.5) Brillo resplandeciente post-tono para llaves, ítems recogibles y pistas pequeñas
             if (!g_game.screenBlackout && g_game.fadeAlpha < 254) {
                 for (const auto& mev : g_game.events) {
-                    if (mev.activePage >= 0 && mev.step_anime && isSparkleSheetName(mev.char_name)) {
-                        int evPxX = (int)std::round(mev.realX);
-                        int evPxY = (int)std::round(mev.realY);
+                    if (mev.activePage < 0) continue;
+                    if (mev.x >= 0 && mev.x < g_game.mapW && mev.y >= 0 && mev.y < g_game.mapH &&
+                        (size_t)(mev.y * g_game.mapW + mev.x) < g_game.maskedPenTiles.size() &&
+                        g_game.maskedPenTiles[mev.y * g_game.mapW + mev.x] != 0) {
+                        continue;
+                    }
+                    int evPxX = (int)std::round(mev.realX);
+                    int evPxY = (int)std::round(mev.realY);
+                    if (mev.step_anime && isSparkleSheetName(mev.char_name)) {
                         drawSparkleStarGlow(gameSurf, offX, offY, camX, camY, mev, evPxX, evPxY);
+                    } else if (g_highlightObjects && (mev.grantsItem || mev.isTinyInteractive)) {
+                        drawLivingItemGlint(gameSurf, offX, offY, camX, camY, mev, evPxX, evPxY);
                     }
                 }
+                drawActiveAnimation(gameSurf, offX, offY, camX, camY);
+                drawRainWeather(gameSurf, offX, offY, frame);
+                drawInteractPrompt(gameSurf, offX, offY, camX, camY, frame);
             }
 
-            // 5) Dibujar Pictures activas (1..50, con soporte de origin y zoom)
+            // 5) Dibujar Pictures activas (1..50, con soporte de origin, zoom y rotación cmd 233)
             for (int i = 1; i <= 50; i++) {
                 const Picture& pic = g_game.pictures[i];
                 if (!pic.active || pic.name.empty() || pic.opacity <= 0.5f) continue;
-                SDL_Surface* ps = getSurf(std::string("/app0/assets/images/pic_") + pic.name + ".png");
+                SDL_Surface* ps = pic.cachedSurf ? pic.cachedSurf : getSurf(std::string("/app0/assets/images/pic_") + pic.name + ".png");
                 if (!ps) continue;
+                uint8_t picAlpha = (uint8_t)std::min(255.0f, pic.opacity);
                 int dw = std::max(1, (int)(ps->w * pic.zoomX / 100.0f));
                 int dh = std::max(1, (int)(ps->h * pic.zoomY / 100.0f));
-                int dx = offX + (int)pic.x - (pic.origin == 1 ? dw / 2 : 0);
-                int dy = offY + (int)pic.y - (pic.origin == 1 ? dh / 2 : 0);
-                SDL_Rect dst = { dx, dy, dw, dh };
-                blitSurf(ps, NULL, gameSurf, &dst, (uint8_t)std::min(255.0f, pic.opacity));
+                if (std::fabs(pic.angle) >= 0.1f) {
+                    float cx = offX + pic.x + (pic.origin == 1 ? 0.0f : dw * 0.5f);
+                    float cy = offY + pic.y + (pic.origin == 1 ? 0.0f : dh * 0.5f);
+                    blitSurfRotated(ps, gameSurf, cx, cy, pic.zoomX, pic.zoomY, pic.angle, picAlpha);
+                } else {
+                    int dx = offX + (int)pic.x - (pic.origin == 1 ? dw / 2 : 0);
+                    int dy = offY + (int)pic.y - (pic.origin == 1 ? dh / 2 : 0);
+                    SDL_Rect dst = { dx, dy, dw, dh };
+                    blitSurf(ps, NULL, gameSurf, &dst, picAlpha);
+                }
             }
 
             // 5.5) Aplicar fundido a negro de transición entre habitaciones o cmd 221/222
@@ -4623,16 +5043,14 @@ int main(int argc, char* argv[]) {
             }
 
             if (autoSaveBannerFrames > 0) {
-                fillRectFast(gameSurf, offX + GAME_W - 210, offY + 12, 198, 28, 18, 30, 82, 220);
-                drawRectFast(gameSurf, offX + GAME_W - 210, offY + 12, 198, 28, 180, 220, 255);
-                drawText(gameSurf, offX + GAME_W - 198, offY + 19, "PARTIDA GUARDADA", 2, 140, 255, 160);
+                drawWindowBox(gameSurf, offX + GAME_W - 216, offY + 10, 204, 32, 230);
+                drawText(gameSurf, offX + GAME_W - 202, offY + 19, "PARTIDA GUARDADA", 2, 140, 255, 160);
             }
 
-            // 6) Cuadro de diálogo
+            // 6) Cuadro de diálogo con Windowskin auténtica de Ao Oni
             if (g_game.msgActive) {
                 int boxY = (g_game.msgPos == 0) ? (offY + 12) : ((g_game.msgPos == 1) ? (offY + 170) : (offY + GAME_H - 132));
-                fillRectFast(gameSurf, offX + 16, boxY, GAME_W - 32, 120, 15, 22, 68, 235);
-                drawRectFast(gameSurf, offX + 16, boxY, GAME_W - 32, 120, 230, 230, 255);
+                drawWindowBox(gameSurf, offX + 16, boxY, GAME_W - 32, 120, 228);
 
                 int textX = offX + 32;
                 if (!g_game.msgFace.empty()) {
@@ -4655,6 +5073,13 @@ int main(int argc, char* argv[]) {
                     if (lastB == 0xC2 || lastB == 0xC3) revLen++;
                 }
                 drawText(gameSurf, textX, textY, g_game.msgText.substr(0, revLen), 2, 255, 255, 255);
+                if (revLen >= g_game.msgText.size() && !g_game.choiceActive && ((frame / 18) % 2 == 0)) {
+                    int ax = offX + GAME_W / 2;
+                    int ay = boxY + 109;
+                    fillRectFast(gameSurf, ax - 4, ay, 9, 2, 255, 255, 255);
+                    fillRectFast(gameSurf, ax - 3, ay + 2, 7, 2, 255, 255, 255);
+                    fillRectFast(gameSurf, ax - 1, ay + 4, 3, 2, 255, 255, 255);
+                }
             }
 
             // 7) Cuadro de elecciones (cmd 102)
@@ -4662,11 +5087,10 @@ int main(int argc, char* argv[]) {
                 int chH = (int)g_game.choices.size() * 28 + 20;
                 int cx = offX + GAME_W - 220;
                 int cy = offY + GAME_H - 132 - chH - 8;
-                fillRectFast(gameSurf, cx, cy, 204, chH, 18, 28, 78, 240);
-                drawRectFast(gameSurf, cx, cy, 204, chH, 230, 230, 255);
+                drawWindowBox(gameSurf, cx, cy, 204, chH, 235);
                 for (size_t i = 0; i < g_game.choices.size(); i++) {
                     if ((int)i == g_game.choiceIndex) {
-                        fillRectFast(gameSurf, cx + 6, cy + 8 + (int)i * 28, 192, 24, 65, 95, 175);
+                        fillRectFast(gameSurf, cx + 6, cy + 8 + (int)i * 28, 192, 24, 65, 95, 175, 210);
                     }
                     drawText(gameSurf, cx + 14, cy + 12 + (int)i * 28, g_game.choices[i], 2, 255, 255, 255);
                 }
@@ -4682,8 +5106,7 @@ int main(int argc, char* argv[]) {
                 int by = (g_game.msgPos == 0) ? (offY + 24)
                        : ((g_game.msgPos == 1) ? (offY + (GAME_H - bh) / 2)
                        : (offY + GAME_H - bh - 24));
-                fillRectFast(gameSurf, bx, by, bw, bh, 18, 28, 78, 240);
-                drawRectFast(gameSurf, bx, by, bw, bh, 225, 232, 255);
+                drawWindowBox(gameSurf, bx, by, bw, bh, 235);
                 for (int d = 0; d < g_game.numInputDigits; d++) {
                     int slotX = bx + padX + d * cellW;
                     int dx = slotX + 4;
@@ -4706,14 +5129,12 @@ int main(int argc, char* argv[]) {
 
             // 9) Pantalla interactiva de Nombre del Personaje (cmd 303 + Easter Eggs Oficiales)
             if (g_game.nameInputActive) {
-                fillRectFast(gameSurf, 28, 22, GAME_W - 56, GAME_H - 44, 15, 22, 66, 248);
-                drawRectFast(gameSurf, 28, 22, GAME_W - 56, GAME_H - 44, 225, 230, 255);
+                drawWindowBox(gameSurf, 28, 22, GAME_W - 56, GAME_H - 44, 244);
 
                 drawText(gameSurf, 48, 36, "NOMBRE DEL PROTAGONISTA (X: Elegir | Cuadrado: Borrar | OPTIONS: OK)", 2, 255, 235, 130);
 
                 // Caja del nombre actual con sprite de Hiroshi
-                fillRectFast(gameSurf, 48, 66, GAME_W - 96, 52, 10, 15, 44, 255);
-                drawRectFast(gameSurf, 48, 66, GAME_W - 96, 52, 180, 195, 255);
+                drawWindowBox(gameSurf, 48, 66, GAME_W - 96, 52, 240);
                 SDL_Surface* hSurf = getSurf("/app0/assets/images/char_hirosi.png");
                 if (hSurf) {
                     int cw = hSurf->w / 4, ch = hSurf->h / 4;
@@ -4774,21 +5195,21 @@ int main(int argc, char* argv[]) {
         }
 
         if (videoBannerFrames > 0 && !videoBannerText.empty()) {
-            int bw = (int)videoBannerText.size() * 12 + 24;
+            int bw = (int)videoBannerText.size() * 12 + 28;
             int bx = std::max(8, (GAME_W - bw) / 2);
-            fillRectFast(gameSurf, bx, 10, bw, 28, 16, 26, 78, 235);
-            drawRectFast(gameSurf, bx, 10, bw, 28, 220, 230, 255);
-            drawText(gameSurf, bx + 12, 17, videoBannerText, 2, 255, 240, 140);
+            drawWindowBox(gameSurf, bx, 8, bw, 32, 230);
+            drawText(gameSurf, bx + 14, 17, videoBannerText, 2, 255, 240, 140);
         }
 
-        // Limitador fijo a 60 FPS (16.67 ms por frame)
+        // Presentación con VSync hardware (sceVideoOut); evita doble espera de VSync que provocaría 30 FPS
+        bool usedVsync = presentScaledCanvas(window, gameSurf);
         uint32_t elapsed = SDL_GetTicks() - frameStart;
         uint32_t targetMs = (frame % 3 == 0) ? 16 : 17;
-        if (elapsed < targetMs) {
+        if (!usedVsync) {
+            if (elapsed < targetMs) SDL_Delay(targetMs - elapsed);
+        } else if (elapsed + 5 < targetMs) {
             SDL_Delay(targetMs - elapsed);
         }
-
-        presentScaledCanvas(window, gameSurf);
     }
 
     g_audioRunning = false;

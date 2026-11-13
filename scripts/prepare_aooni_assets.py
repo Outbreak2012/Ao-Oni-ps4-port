@@ -476,73 +476,209 @@ def make_storekeeper02_charset(path):
     write_rgba_png(path, w, h, cv.buf)
 
 def patch_tileset_floor_holes(out_img):
-    """Rellena pixeles alpha==0 en losetas interiores de piso de room-01-* que dejan huecos negros."""
+    """Rellena pixeles alpha==0 en losetas interiores de room-01-* y Forest01 que dejan huecos negros."""
+    from collections import deque
     floor_hole_tiles = {
-        "ts_room-01-ud.png":    [586, 587],
-        "ts_room-01-udw.png":   [492, 493, 494, 495, 500, 508, 509, 510],
+        "ts_room-01-ud.png":    [563, 586, 587],
+        "ts_room-01-udw.png":   [492, 493, 494, 495, 500, 508, 509, 510, 1298, 1304],
         "ts_room-01-udw2.png":  [492, 493, 494, 495, 500, 508, 509],
         "ts_room-01-udw2a.png": [407, 459, 520],
-        "ts_room-01-udy.png":   [572, 574, 575, 581, 582, 583, 604, 606, 644, 645, 646, 647],
+        "ts_room-01-udy.png":   [572, 574, 575, 581, 582, 583, 604, 606, 644, 645, 646, 647, 755],
     }
     patched_tiles = 0
     patched_pixels = 0
-    for fn, tids in floor_hole_tiles.items():
+
+    def fill_holes_in_tile(buf, w, tx, ty, holes, dim_factor):
+        fills = []
+        for dx, dy, off in holes:
+            best = None
+            for r in range(1, 10):
+                for oy in range(max(0, dy - r), min(32, dy + r + 1)):
+                    for ox in range(max(0, dx - r), min(32, dx + r + 1)):
+                        so = ((ty + oy) * w + (tx + ox)) * 4
+                        if buf[so + 3] >= 200:
+                            d2 = (ox - dx) * (ox - dx) + (oy - dy) * (oy - dy)
+                            if best is None or d2 < best[0]:
+                                best = (d2, buf[so], buf[so + 1], buf[so + 2])
+                if best is not None:
+                    break
+            if best is not None:
+                _, cr, cg, cb = best
+                fills.append((off, int(cr * dim_factor), int(cg * dim_factor), int(cb * dim_factor)))
+        for off, cr, cg, cb in fills:
+            buf[off] = cr
+            buf[off + 1] = cg
+            buf[off + 2] = cb
+            buf[off + 3] = 255
+        return len(fills)
+
+    for fn in sorted(os.listdir(out_img)):
+        if not (fn.startswith("ts_room-01-") or fn == "ts_003-Forest01.png") or not fn.endswith(".png"):
+            continue
+        p = os.path.join(out_img, fn)
+        w, h, raw = read_png_rgba(p)
+        buf = bytearray(raw)
+        modified = False
+        explicit_set = set(floor_hole_tiles.get(fn, []))
+        cols, rows = w // 32, h // 32
+        for row in range(rows):
+            for col in range(cols):
+                tid = 384 + row * 8 + col
+                tx, ty = col * 32, row * 32
+                transp = 0
+                for dy in range(32):
+                    for dx in range(32):
+                        a = buf[((ty + dy) * w + (tx + dx)) * 4 + 3]
+                        if a < 128:
+                            transp += 1
+                if tid in explicit_set and 0 < transp <= 80:
+                    holes = []
+                    for dy in range(32):
+                        for dx in range(32):
+                            off = ((ty + dy) * w + (tx + dx)) * 4
+                            if buf[off + 3] == 0:
+                                holes.append((dx, dy, off))
+                    nfill = fill_holes_in_tile(buf, w, tx, ty, holes, 0.58)
+                    if nfill > 0:
+                        patched_tiles += 1
+                        patched_pixels += nfill
+                        modified = True
+                elif (1024 - transp) >= 650 and transp > 0:
+                    # Escaneo automático seguro de microporos interiores (sin tocar rejas/celosías ni transparencia de bordes)
+                    vis = bytearray(1024)
+                    interior_comps = []
+                    for dy in range(32):
+                        for dx in range(32):
+                            if vis[dy * 32 + dx]:
+                                continue
+                            off = ((ty + dy) * w + (tx + dx)) * 4
+                            if buf[off + 3] != 0:
+                                continue
+                            q = deque([(dx, dy)])
+                            vis[dy * 32 + dx] = 1
+                            comp = []
+                            touches_edge = False
+                            while q:
+                                cx, cy = q.popleft()
+                                comp.append((cx, cy, ((ty + cy) * w + (tx + cx)) * 4))
+                                if cx == 0 or cy == 0 or cx == 31 or cy == 31:
+                                    touches_edge = True
+                                for nx, ny in ((cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)):
+                                    if 0 <= nx < 32 and 0 <= ny < 32 and not vis[ny * 32 + nx]:
+                                        if buf[((ty + ny) * w + (tx + nx)) * 4 + 3] == 0:
+                                            vis[ny * 32 + nx] = 1
+                                            q.append((nx, ny))
+                            if not touches_edge and 1 <= len(comp) <= 18:
+                                interior_comps.append(comp)
+                    if 1 <= len(interior_comps) <= 6:
+                        holes = [pt for comp in interior_comps for pt in comp]
+                        nfill = fill_holes_in_tile(buf, w, tx, ty, holes, 0.78)
+                        if nfill > 0:
+                            patched_tiles += 1
+                            patched_pixels += nfill
+                            modified = True
+        if modified:
+            write_rgba_png(p, w, h, buf)
+    print(f"Parcheados {patched_pixels} pixeles en {patched_tiles} losetas (room-01-* / Forest01).")
+
+def make_missing_icons(out_img):
+    """Genera los iconos RTP faltantes (031-Key03 para llaves y 023-Potion03 para Vinagre) 24x24 RGBA."""
+    # 1) icon_031-Key03.png basado en la geometría exacta de icon_031-Key03_red.png en tono latón/oro viejo
+    key_out = os.path.join(out_img, "icon_031-Key03.png")
+    key_src = os.path.join(out_img, "icon_031-Key03_red.png")
+    if not os.path.exists(key_out):
+        if os.path.exists(key_src):
+            kw, kh, kbuf = read_png_rgba(key_src)
+            out = bytearray(kbuf)
+            for i in range(0, len(out), 4):
+                r, g, b, a = out[i], out[i + 1], out[i + 2], out[i + 3]
+                if a == 0:
+                    continue
+                # Convertir pigmento rojo/carmesí de la llave a latón dorado brillante
+                if r > g + 16 and r > b + 16:
+                    lum = (r * 299 + g * 587 + b * 114) // 1000
+                    nr = min(255, int(lum * 1.35 + 48))
+                    ng = min(245, int(lum * 1.15 + 32))
+                    nb = min(195, int(lum * 0.55 + 16))
+                    out[i], out[i + 1], out[i + 2] = nr, ng, nb
+                else:
+                    out[i] = min(255, r + 14)
+                    out[i + 1] = min(255, g + 14)
+                    out[i + 2] = min(255, b + 12)
+            write_rgba_png(key_out, kw, kh, out)
+        else:
+            cv = PixelCanvas(24, 24)
+            ol = (28, 22, 16, 255)
+            gold = (224, 184, 72, 255)
+            hi = (252, 232, 148, 255)
+            cv.disc(7, 16, 5, ol)
+            cv.disc(7, 16, 4, gold)
+            cv.disc(7, 16, 2, (0, 0, 0, 0))
+            cv.pset(5, 13, hi)
+            for k in range(10, 20):
+                cv.pset(k, 23 - k, ol)
+                cv.pset(k + 1, 24 - k, gold)
+                cv.pset(k, 22 - k, hi)
+            cv.rect(17, 7, 3, 2, gold)
+            cv.rect(15, 9, 3, 2, gold)
+            write_rgba_png(key_out, 24, 24, cv.buf)
+
+    # 2) icon_023-Potion03.png (Frasco con corcho para Vinagre, estilo RMXP 24x24)
+    pot_out = os.path.join(out_img, "icon_023-Potion03.png")
+    if not os.path.exists(pot_out):
+        cv = PixelCanvas(24, 24)
+        ol = (26, 28, 38, 255)
+        cork_dk = (128, 86, 48, 255)
+        cork_lt = (182, 132, 82, 255)
+        glass = (206, 226, 242, 255)
+        glass_hi = (246, 252, 255, 255)
+        glass_sh = (132, 160, 188, 255)
+        liq = (224, 206, 118, 255)
+        liq_hi = (250, 238, 168, 255)
+        liq_dk = (176, 154, 74, 255)
+        # Corcho
+        cv.rect(10, 2, 4, 3, ol)
+        cv.rect(10, 3, 4, 2, cork_dk)
+        cv.rect(11, 2, 2, 2, cork_lt)
+        # Cuello de vidrio
+        cv.rect(9, 5, 6, 2, ol)
+        cv.rect(10, 5, 4, 1, glass_hi)
+        cv.rect(10, 6, 4, 4, ol)
+        cv.rect(11, 6, 2, 4, glass)
+        # Cuerpo redondeado de la botella
+        cv.oval(12, 15, 6, 6, ol)
+        cv.oval(12, 15, 5, 5, glass)
+        cv.oval(12, 16, 4, 4, liq)
+        cv.rect(9, 13, 6, 2, liq_hi)
+        cv.rect(9, 18, 6, 2, liq_dk)
+        cv.rect(10, 12, 4, 1, glass_sh)
+        # Brillo cristalino izquierdo
+        cv.rect(8, 13, 1, 4, glass_hi)
+        cv.pset(9, 12, glass_hi)
+        write_rgba_png(pot_out, 24, 24, cv.buf)
+
+def enhance_tiny_object_sprites(out_img):
+    """Mejora sutilmente contraste/visibilidad en sprites tiny/oscuros sin perder su estilo original."""
+    targets = {
+        "char_nejiana.png": 1.65,
+        "char_oil.png": 1.32,
+        "char_bou.png": 1.25,
+    }
+    for fn, gain in targets.items():
         p = os.path.join(out_img, fn)
         if not os.path.exists(p):
             continue
         w, h, raw = read_png_rgba(p)
         buf = bytearray(raw)
-        modified = False
-        for tid in tids:
-            idx = tid - 384
-            tx = (idx % 8) * 32
-            ty = (idx // 8) * 32
-            if tx + 32 > w or ty + 32 > h:
+        for i in range(0, len(buf), 4):
+            a = buf[i + 3]
+            if a < 20:
                 continue
-            transp = 0
-            semi = 0
-            for dy in range(32):
-                for dx in range(32):
-                    a = buf[((ty + dy) * w + (tx + dx)) * 4 + 3]
-                    if a == 0:
-                        transp += 1
-                    elif a < 255:
-                        semi += 1
-            if not (0 < transp <= 80 and semi == 0):
-                continue
-            holes = []
-            for dy in range(32):
-                for dx in range(32):
-                    off = ((ty + dy) * w + (tx + dx)) * 4
-                    if buf[off + 3] == 0:
-                        holes.append((dx, dy, off))
-            fills = []
-            for dx, dy, off in holes:
-                best = None
-                for r in range(1, 10):
-                    for oy in range(max(0, dy - r), min(32, dy + r + 1)):
-                        for ox in range(max(0, dx - r), min(32, dx + r + 1)):
-                            so = ((ty + oy) * w + (tx + ox)) * 4
-                            if buf[so + 3] == 255:
-                                d2 = (ox - dx) * (ox - dx) + (oy - dy) * (oy - dy)
-                                if best is None or d2 < best[0]:
-                                    best = (d2, buf[so], buf[so + 1], buf[so + 2])
-                    if best is not None:
-                        break
-                if best is not None:
-                    _, cr, cg, cb = best
-                    fills.append((off, int(cr * 0.58), int(cg * 0.58), int(cb * 0.58)))
-            for off, cr, cg, cb in fills:
-                buf[off] = cr
-                buf[off + 1] = cg
-                buf[off + 2] = cb
-                buf[off + 3] = 255
-            patched_tiles += 1
-            patched_pixels += len(fills)
-            modified = True
-        if modified:
-            write_rgba_png(p, w, h, buf)
-    print(f"Parcheados {patched_pixels} pixeles en {patched_tiles} losetas de piso room-01-*.")
+            r, g, b = buf[i], buf[i + 1], buf[i + 2]
+            buf[i] = min(245, int(r * gain + 18))
+            buf[i + 1] = min(245, int(g * gain + 18))
+            buf[i + 2] = min(245, int(b * gain + 18))
+        write_rgba_png(p, w, h, buf)
 
 def make_bird_charset_legacy_unused(path):
     """Genera el sprite de cuervos (165-Small07) para la intro exterior de Map003."""
@@ -586,6 +722,8 @@ def make_fallback_rtp_images(out_img):
     make_switch02_charset(os.path.join(out_img, "char_179-Switch02.png"))
     make_storekeeper02_charset(os.path.join(out_img, "char_148-Storekeeper02.png"))
     patch_tileset_floor_holes(out_img)
+    make_missing_icons(out_img)
+    enhance_tiny_object_sprites(out_img)
 
     # Equivalente de tileset cueva si falta RTP
     ts_src = os.path.join(out_img, "ts_room-03-ud.png")
@@ -847,6 +985,7 @@ def main():
     # 3) Copiar todos los Graphics a assets/images/ y generar RTP faltantes
     out_img = os.path.join(out_assets, "images")
     cats = (
+        ("Animations", "anim_"),
         ("Titles", "title_"),
         ("Characters", "char_"),
         ("Tilesets", "ts_"),
