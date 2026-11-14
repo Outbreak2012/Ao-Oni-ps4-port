@@ -1235,21 +1235,32 @@ static const uint8_t AUTOTILE_LUT[48][4] = {
     {36,37,42,43},{36, 5,42,43},{12,17,18,23},{12,13,42,43},{36,41,42,47},{16,17,46,47},{12,17,42,47},{ 0, 1, 6, 7}
 };
 
-static void blitAutotileToCache(SDL_Surface* atSurf, int pattern, SDL_Surface* dstSurf, int dx, int dy) {
+static void blitAutotileToCache(SDL_Surface* atSurf, int pattern, SDL_Surface* dstSurf, int dx, int dy, bool dstIsWindow = false) {
     if (!atSurf || !dstSurf) return;
     if (pattern < 0 || pattern >= 48) pattern = 0;
     if (atSurf->w < 96 || atSurf->h < 128) {
         SDL_Rect sr = { 0, 0, std::min(32, atSurf->w), std::min(32, atSurf->h) };
         SDL_Rect dr = { dx, dy, 32, 32 };
-        blitSurf(atSurf, &sr, dstSurf, &dr, 255, false);
+        blitSurf(atSurf, &sr, dstSurf, &dr, 255, dstIsWindow);
         return;
     }
     for (int q = 0; q < 4; q++) {
         uint8_t sub = AUTOTILE_LUT[pattern][q];
         SDL_Rect sr = { (sub % 6) * 16, (sub / 6) * 16, 16, 16 };
         SDL_Rect dr = { dx + (q % 2) * 16, dy + (q / 2) * 16, 16, 16 };
-        blitSurf(atSurf, &sr, dstSurf, &dr, 255, false);
+        blitSurf(atSurf, &sr, dstSurf, &dr, 255, dstIsWindow);
     }
+}
+
+static inline int calcTileScreenZ(int ty, uint8_t prio) {
+    return (ty + (int)prio + 1) * TILE_SZ;
+}
+
+static inline int calcSpriteScreenZ(float realY, int spriteH, int tileId, uint8_t tilePrio, bool alwaysTop) {
+    if (alwaysTop) return 999999;
+    int py = (int)std::round(realY);
+    if (tileId >= 384) return py + TILE_SZ + (int)tilePrio * TILE_SZ;
+    return py + TILE_SZ + ((spriteH > TILE_SZ) ? (TILE_SZ - 1) : 0);
 }
 
 // ==================== ESTRUCTURAS DEL MOTOR RPG MAKER XP ====================
@@ -1367,6 +1378,8 @@ struct GameRuntime {
 
     SDL_Surface* mapLowerSurf = nullptr;
     SDL_Surface* mapUpperSurf = nullptr;
+    struct PrioTile { int tx, ty; int16_t tid; int z; };
+    std::vector<PrioTile> prioTiles;
 
     int playerX = 9, playerY = 8, playerDir = 2, playerPattern = 0;
     float playerRealX = 9.0f * TILE_SZ, playerRealY = 8.0f * TILE_SZ;
@@ -2194,6 +2207,7 @@ static void maskIsolatedHoldingPens() {
 static void buildMapCacheSurfaces() {
     if (g_game.mapLowerSurf) { SDL_FreeSurface(g_game.mapLowerSurf); g_game.mapLowerSurf = nullptr; }
     if (g_game.mapUpperSurf) { SDL_FreeSurface(g_game.mapUpperSurf); g_game.mapUpperSurf = nullptr; }
+    g_game.prioTiles.clear();
 
     maskIsolatedHoldingPens();
 
@@ -2219,6 +2233,9 @@ static void buildMapCacheSurfaces() {
                 if (tid <= 0) continue;
                 uint8_t prio = ((size_t)tid < g_game.priorities.size()) ? g_game.priorities[tid] : 0;
                 SDL_Surface* target = (prio > 0) ? g_game.mapUpperSurf : g_game.mapLowerSurf;
+                if (prio > 0) {
+                    g_game.prioTiles.push_back({ tx, ty, tid, calcTileScreenZ(ty, prio) });
+                }
                 int dx = tx * TILE_SZ, dy = ty * TILE_SZ;
 
                 if (tid >= 384 && tsSurf) {
@@ -2235,6 +2252,9 @@ static void buildMapCacheSurfaces() {
             }
         }
     }
+    std::stable_sort(g_game.prioTiles.begin(), g_game.prioTiles.end(), [](const GameRuntime::PrioTile& a, const GameRuntime::PrioTile& b) {
+        return a.z < b.z;
+    });
 }
 
 static bool loadMap(int mapId) {
@@ -5134,27 +5154,10 @@ int main(int argc, char* argv[]) {
                 blitSurf(g_game.mapLowerSurf, &src, gameSurf, &dst);
             }
 
-            // 2) Ordenar por coordenada Y sub-píxel y dibujar eventos + jugador (screen_z 1:1 RPG Maker XP)
-            struct SpriteDraw { float ry; int order; bool isPlayer; const MapEvent* ev; };
+            // 2) Ordenar por screen_z 1:1 RPG Maker XP e intercalar tiles con prioridad > 0 y sprites
+            struct SpriteDraw { int z; int order; bool isPlayer; const MapEvent* ev; };
             static std::vector<SpriteDraw> drawList;
             drawList.clear();
-            for (const auto& mev : g_game.events) {
-                if (mev.activePage < 0 || (mev.char_name.empty() && mev.tile_id <= 0)) continue;
-                if (mev.x >= 0 && mev.x < g_game.mapW && mev.y >= 0 && mev.y < g_game.mapH &&
-                    (size_t)(mev.y * g_game.mapW + mev.x) < g_game.maskedPenTiles.size() &&
-                    g_game.maskedPenTiles[mev.y * g_game.mapW + mev.x] != 0) {
-                    continue;
-                }
-                drawList.push_back({ mev.realY, mev.always_top ? 1 : 0, false, &mev });
-            }
-            if (!g_game.playerTransparent && !g_game.playerChar.empty()) {
-                drawList.push_back({ g_game.playerRealY, 0, true, nullptr });
-            }
-            std::stable_sort(drawList.begin(), drawList.end(), [](const SpriteDraw& a, const SpriteDraw& b) {
-                if (a.order != b.order) return a.order < b.order;
-                if (std::fabs(a.ry - b.ry) > 0.5f) return a.ry < b.ry;
-                return (a.isPlayer ? 1 : 0) < (b.isPlayer ? 1 : 0);
-            });
 
             static std::string s_cachedPlayerChar;
             static SDL_Surface* s_cachedPlayerSurf = nullptr;
@@ -5168,6 +5171,39 @@ int main(int argc, char* argv[]) {
                 s_cachedTsName = g_game.tilesetFile;
                 s_cachedTsSurf = g_game.tilesetFile[0] ? getSurf(std::string("/app0/assets/images/ts_") + s_cachedTsName + ".png") : nullptr;
             }
+            static std::string s_cachedAtNames[7];
+            static SDL_Surface* s_cachedAtSurfs[7] = {nullptr};
+            for (int i = 0; i < 7; i++) {
+                if (s_cachedAtNames[i] != g_game.autotileFiles[i]) {
+                    s_cachedAtNames[i] = g_game.autotileFiles[i];
+                    s_cachedAtSurfs[i] = g_game.autotileFiles[i][0]
+                        ? getSurf(std::string("/app0/assets/images/at_") + s_cachedAtNames[i] + ".png")
+                        : nullptr;
+                }
+            }
+
+            for (const auto& mev : g_game.events) {
+                if (mev.activePage < 0 || (mev.char_name.empty() && mev.tile_id <= 0)) continue;
+                if (mev.x >= 0 && mev.x < g_game.mapW && mev.y >= 0 && mev.y < g_game.mapH &&
+                    (size_t)(mev.y * g_game.mapW + mev.x) < g_game.maskedPenTiles.size() &&
+                    g_game.maskedPenTiles[mev.y * g_game.mapW + mev.x] != 0) {
+                    continue;
+                }
+                int sh = (!mev.char_name.empty() && mev.cachedSurf) ? (mev.cachedSurf->h / 4) : TILE_SZ;
+                uint8_t tPrio = (mev.tile_id >= 384 && (size_t)mev.tile_id < g_game.priorities.size()) ? g_game.priorities[mev.tile_id] : 0;
+                int sz = calcSpriteScreenZ(mev.realY, sh, mev.tile_id, tPrio, mev.always_top);
+                drawList.push_back({ sz, mev.always_top ? 1 : 0, false, &mev });
+            }
+            if (!g_game.playerTransparent && !g_game.playerChar.empty()) {
+                int psh = s_cachedPlayerSurf ? (s_cachedPlayerSurf->h / 4) : 48;
+                int pz = calcSpriteScreenZ(g_game.playerRealY, psh, 0, 0, false);
+                drawList.push_back({ pz, 0, true, nullptr });
+            }
+            std::stable_sort(drawList.begin(), drawList.end(), [](const SpriteDraw& a, const SpriteDraw& b) {
+                if (a.order != b.order) return a.order < b.order;
+                if (a.z != b.z) return a.z < b.z;
+                return (a.isPlayer ? 1 : 0) < (b.isPlayer ? 1 : 0);
+            });
 
             auto drawSpriteEntry = [&](const SpriteDraw& sd) {
                 if (sd.isPlayer) {
@@ -5206,15 +5242,37 @@ int main(int argc, char* argv[]) {
                 }
             };
 
-            for (const auto& sd : drawList) {
-                if (sd.order == 0) drawSpriteEntry(sd);
-            }
+            auto drawPrioTile = [&](const GameRuntime::PrioTile& pt) {
+                int dx = offX + pt.tx * TILE_SZ - camX;
+                int dy = offY + pt.ty * TILE_SZ - camY;
+                if (dx + TILE_SZ <= 0 || dx >= gameSurf->w || dy + TILE_SZ <= 0 || dy >= gameSurf->h) return;
+                if (pt.tid >= 384) {
+                    if (s_cachedTsSurf) {
+                        int tIndex = pt.tid - 384;
+                        SDL_Rect src = { (tIndex % 8) * TILE_SZ, (tIndex / 8) * TILE_SZ, TILE_SZ, TILE_SZ };
+                        SDL_Rect dst = { dx, dy, TILE_SZ, TILE_SZ };
+                        blitSurf(s_cachedTsSurf, &src, gameSurf, &dst);
+                    }
+                } else if (pt.tid >= 48) {
+                    int atIdx = (pt.tid / 48) - 1;
+                    int pat = pt.tid % 48;
+                    if (atIdx >= 0 && atIdx < 7 && s_cachedAtSurfs[atIdx])
+                        blitAutotileToCache(s_cachedAtSurfs[atIdx], pat, gameSurf, dx, dy, true);
+                }
+            };
 
-            // 3) Dibujar capa superior pre-renderizada (techos, bordes de pared con prioridad > 0)
-            if (g_game.mapUpperSurf) {
-                SDL_Rect src = { camX, camY, GAME_W, GAME_H };
-                SDL_Rect dst = { offX, offY, GAME_W, GAME_H };
-                blitSurf(g_game.mapUpperSurf, &src, gameSurf, &dst);
+            // 3) Dibujar en orden Z unificado: tiles con prioridad > 0 intercalados con eventos y jugador
+            size_t ptIdx = 0;
+            const size_t ptCount = g_game.prioTiles.size();
+            for (const auto& sd : drawList) {
+                if (sd.order > 0) break;
+                while (ptIdx < ptCount && g_game.prioTiles[ptIdx].z <= sd.z) {
+                    drawPrioTile(g_game.prioTiles[ptIdx++]);
+                }
+                drawSpriteEntry(sd);
+            }
+            while (ptIdx < ptCount) {
+                drawPrioTile(g_game.prioTiles[ptIdx++]);
             }
 
             // 3.5) Eventos con always_on_top == true (RGSS1 screen_z = 999, por encima de prio > 0, ej. Map 25 Ev 6 oil, Map 60 puzzle_parts)
