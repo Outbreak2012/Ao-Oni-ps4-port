@@ -515,7 +515,7 @@ static void playSe(const std::string& name, int volume = 100, int pitch = 100) {
     } else if (name == "025-Door02" && pitch >= 140) {
         triggerRumble(255, 255, 45);
     } else if (name == "027-Door04" && pitch >= 130) {
-        triggerRumble(180, 140, 10);
+        triggerRumble(255, 230, 14);
     }
     pthread_mutex_lock(&g_audioMutex);
     const PcmBuffer* pb = getPcm("se_", name);
