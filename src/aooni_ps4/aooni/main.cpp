@@ -382,6 +382,37 @@ static void triggerRumble(uint8_t largeMotor, uint8_t smallMotor, int frames) {
     }
 }
 
+static inline bool calcHeartbeatRumble(int minDist, bool hidden, uint32_t frame,
+                                         uint8_t& outLarge, uint8_t& outSmall, int& outFrames) {
+    if (minDist < 0 || minDist > 7) return false;
+    if (hidden) {
+        if (minDist <= 4 && (frame % 44 == 0)) {
+            outLarge = 60; outSmall = 25; outFrames = 5;
+            return true;
+        }
+        return false;
+    }
+    if (minDist <= 2) {
+        uint32_t ph = frame % 20;
+        if (ph == 0) { outLarge = 220; outSmall = 130; outFrames = 5; return true; }
+        if (ph == 7) { outLarge = 155; outSmall = 90;  outFrames = 4; return true; }
+        return false;
+    }
+    if (minDist <= 4) {
+        uint32_t ph = frame % 28;
+        if (ph == 0) { outLarge = 160; outSmall = 85; outFrames = 5; return true; }
+        if (ph == 8) { outLarge = 105; outSmall = 55; outFrames = 4; return true; }
+        return false;
+    }
+    if (frame % 40 == 0) {
+        outLarge = (uint8_t)(45 + (7 - minDist) * 20);
+        outSmall = (uint8_t)(outLarge / 3);
+        outFrames = 5;
+        return true;
+    }
+    return false;
+}
+
 static void setPadLightbar(uint8_t r, uint8_t g, uint8_t b) {
     if (r == g_lastLightR && g == g_lastLightG && b == g_lastLightB) return;
     if (g_padHandle < 0) initPadHandle();
@@ -4289,17 +4320,18 @@ int main(int argc, char* argv[]) {
             } else if (g_game.switches[49]) {
                 uint8_t pulse = (uint8_t)(120 + (int)(110.0f * std::sin(frame * 0.22f)));
                 setPadLightbar(pulse, 0, 220);
-                // Latido háptico en el mando cuando Ao Oni está a <= 4 casillas de Hiroshi
-                if (frame % 26 == 0 && g_rumbleFrames <= 0) {
+                // Latido háptico dinámico por proximidad (doble golpe "tum-tum" acelerándose al acercarse)
+                if (g_rumbleFrames <= 0) {
+                    int minDist = 999;
                     for (const auto& mev : g_game.events) {
                         if (isAoOniLethalEvent(mev)) {
                             int dist = std::abs(mev.x - g_game.playerX) + std::abs(mev.y - g_game.playerY);
-                            if (dist <= 4) {
-                                uint8_t str = (uint8_t)std::min(190, (5 - dist) * 45);
-                                triggerRumble(str, (uint8_t)(str / 2), 6);
-                                break;
-                            }
+                            if (dist < minDist) minDist = dist;
                         }
+                    }
+                    uint8_t lg = 0, sm = 0; int dur = 0;
+                    if (calcHeartbeatRumble(minDist, g_game.playerTransparent, frame, lg, sm, dur)) {
+                        triggerRumble(lg, sm, dur);
                     }
                 }
             } else if (frame % 60 == 0) {
